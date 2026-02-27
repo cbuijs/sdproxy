@@ -1,8 +1,9 @@
 /*
 File: main.go
-Version: 1.13.0
-Last Updated: 2026-02-27 21:25 CET
+Version: 1.14.0
+Last Updated: 2026-02-27 21:45 CET
 Description: Application entry point, Configuration loading, and TLS generation.
+             Added DomainRoutes initialization for zero-allocation domain routing.
 */
 
 package main
@@ -30,11 +31,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// RouteConfig maps a MAC address to a specific upstream and client identity
 type RouteConfig struct {
 	Upstream   string `yaml:"upstream"`
 	ClientName string `yaml:"client_name"`
 }
 
+// Config represents the structured configuration of sdproxy
 type Config struct {
 	Server struct {
 		ListenUDP  []string `yaml:"listen_udp"`
@@ -69,8 +72,9 @@ type Config struct {
 		DnsmasqLeases []string `yaml:"dnsmasq_leases"`
 	} `yaml:"identity"`
 
-	Upstreams map[string][]string    `yaml:"upstreams"`
-	Routes    map[string]RouteConfig `yaml:"routes"`
+	Upstreams    map[string][]string    `yaml:"upstreams"`
+	Routes       map[string]RouteConfig `yaml:"routes"`
+	DomainRoutes map[string]string      `yaml:"domain_routes"` // Maps domain suffixes to upstreams
 }
 
 var cfg Config
@@ -80,12 +84,15 @@ type ParsedRoute struct {
 	ClientName string
 }
 
+// Global state structures (Read-Only after Init, inherently thread-safe)
 var macRoutes map[string]ParsedRoute
+var domainRoutes map[string]string
 var routeUpstreams map[string][]*Upstream
 var ddrHostnames map[string]bool
 var ddrIPv4 net.IP
 var ddrIPv6 net.IP
 
+// High-performance byte buffer pool to minimize garbage collection latency
 var bufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 65536) 
@@ -94,12 +101,13 @@ var bufPool = sync.Pool{
 }
 
 func main() {
+	// Aggressive GC tuning: optimize for throughput and CPU utilization in network apps
 	debug.SetGCPercent(20)
 
 	configFile := flag.String("config", "config.yaml", "Path to configuration file (YAML)")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.13.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.14.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -119,6 +127,7 @@ func main() {
 		cfg.Server.UDPWorkers = 10
 	}
 
+	// 1. Initialize MAC-based routes
 	macRoutes = make(map[string]ParsedRoute)
 	for macStr, route := range cfg.Routes {
 		parsedMAC, err := net.ParseMAC(macStr)
@@ -132,6 +141,16 @@ func main() {
 		}
 	}
 
+	// 2. Initialize Domain-based routes (O(1) lookup maps)
+	domainRoutes = make(map[string]string)
+	for domain, upstream := range cfg.DomainRoutes {
+		// Clean the input to ensure reliable suffix matching
+		cleanDomain := strings.ToLower(strings.TrimSuffix(domain, "."))
+		domainRoutes[cleanDomain] = upstream
+		log.Printf("[INIT] Domain Route configured: *.%s -> Upstream: %s", cleanDomain, upstream)
+	}
+
+	// 3. Initialize DDR Spoofing configurations
 	if cfg.Server.DDR.Enabled {
 		ddrHostnames = make(map[string]bool)
 		for _, h := range cfg.Server.DDR.Hostnames {
@@ -146,6 +165,7 @@ func main() {
 		log.Printf("[INIT] DDR Spoofing enabled for %d hostnames", len(ddrHostnames))
 	}
 
+	// 4. Initialize Upstream connections
 	routeUpstreams = make(map[string][]*Upstream)
 	for groupName, urls := range cfg.Upstreams {
 		var group []*Upstream
@@ -165,11 +185,12 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
-	// Initialize subsystems
+	// 5. Initialize supporting subsystems
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	InitARP() 
 	InitIdentity() // Background poller for /etc/hosts and leases
 
+	// 6. Setup Crypto/TLS layer
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
 	var tlsConfig *tls.Config
 	if needsTLS {
@@ -178,8 +199,10 @@ func main() {
 		log.Println("[TLS] No encrypted listeners configured. Skipping TLS allocation.")
 	}
 
+	// 7. Ignite network listeners
 	StartServers(tlsConfig)
 
+	// Await termination signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
@@ -187,6 +210,7 @@ func main() {
 	log.Println("[BOOT] Shutting down sdproxy...")
 }
 
+// getHardenedTLSConfig provides a highly secure cipher configuration
 func getHardenedTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -206,6 +230,7 @@ func getHardenedTLSConfig() *tls.Config {
 	}
 }
 
+// setupTLS loads specified certs or generates an ephemeral one
 func setupTLS() *tls.Config {
 	var cert tls.Certificate
 	var err error
@@ -226,10 +251,12 @@ func setupTLS() *tls.Config {
 
 	conf := getHardenedTLSConfig()
 	conf.Certificates = []tls.Certificate{cert}
+	// ALPN negotiation support
 	conf.NextProtos = []string{"h3", "h2", "doq", "dot", "http/1.1"} 
 	return conf
 }
 
+// generateSelfSignedCert creates a safe temporary ECDSA certificate
 func generateSelfSignedCert() (tls.Certificate, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

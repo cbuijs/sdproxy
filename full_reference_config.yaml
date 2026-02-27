@@ -1,7 +1,8 @@
 # File: config.yaml
-# Version: 1.13.0
-# Last Updated: 2026-02-27 21:25 CET
+# Version: 1.14.0
+# Last Updated: 2026-02-27 21:45 CET
 # Description: sdproxy Simple DNS Proxy Configuration (Ultra-Low Memory Profile)
+# Added: domain_routes for high-performance suffix-based routing to specific upstreams.
 
 server:
   listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
@@ -45,10 +46,21 @@ upstreams:
   secure:
     - "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
     - "doh3://security.cloudflare-dns.com/dns-query#1.1.1.2,1.0.0.2"
+  # Define your local upstream here (e.g., your router or local AD controller)
+  local_network:
+    - "udp://192.168.1.1:53"
 
 routes:
-  # Explicit mapping overrides dynamic identity resolution
+  # Explicit mapping overrides dynamic identity resolution based on MAC Address
   "00:11:22:33:44:55":
     upstream: "kids"
     client_name: "kids-ipad-override"
+
+domain_routes:
+  # High-performance suffix matching. 
+  # If the requested domain ends in any of these, it forcefully overrides the client upstream.
+  "lan": "local_network"
+  "local": "local_network"
+  "home.arpa": "local_network"
+  "corp.internal": "local_network"
 
