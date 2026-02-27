@@ -1,0 +1,53 @@
+# File: config.yaml
+# Version: 1.9.0
+# Last Updated: 2026-02-27 20:32 CET
+# Description: sdproxy Simple DNS Proxy Configuration (Low Memory Profile)
+
+server:
+  # Listeners now support multiple addresses/ports via arrays
+  listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
+  listen_tcp: ["0.0.0.0:53"]
+  listen_dot: ["0.0.0.0:853"]
+  listen_doh: ["0.0.0.0:443"]   # Also used for DoH3 (HTTP/3)
+  listen_doq: ["0.0.0.0:853"]   # DNS-over-QUIC
+  
+  # GOROUTINE OPTIMIZATION: Bounded UDP worker pool.
+  # Hard-caps the number of concurrent UDP processing threads.
+  udp_workers: 10
+  
+  tls_cert: ""
+  tls_key: ""
+
+  ddr:
+    enabled: true
+    hostnames: ["dns.local.net", "doh.local.net"]
+    ipv4: "192.168.1.100"
+    ipv6: ""
+
+logging:
+  strip_time: false
+
+cache:
+  enabled: true
+  size: 1024         
+  min_ttl: 60         
+
+upstreams:
+  default:
+    - "udp://1.1.1.1:53"
+    - "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
+  kids:
+    - "tcp://1.1.1.3:53"
+    - "doh://doh.controld.com/{client-name}"
+  secure:
+    - "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
+    - "doh3://security.cloudflare-dns.com/dns-query#1.1.1.2,1.0.0.2"
+
+routes:
+  "00:11:22:33:44:55":
+    upstream: "kids"
+    client_name: "kids-ipad"
+  "aa:bb:cc:dd:ee:ff":
+    upstream: "secure"
+    client_name: "work-laptop"
+
