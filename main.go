@@ -1,10 +1,8 @@
 /*
 File: main.go
-Version: 1.11.0
-Last Updated: 2026-02-27 20:55 CET
+Version: 1.13.0
+Last Updated: 2026-02-27 21:25 CET
 Description: Application entry point, Configuration loading, and TLS generation.
-             MEMORY OPTIMIZATION: Conditionally allocates TLS configurations and 
-             certificates ONLY if encrypted listeners are active.
 */
 
 package main
@@ -66,6 +64,11 @@ type Config struct {
 		MinTTL  int  `yaml:"min_ttl"`
 	} `yaml:"cache"`
 
+	Identity struct {
+		HostsFiles    []string `yaml:"hosts_files"`
+		DnsmasqLeases []string `yaml:"dnsmasq_leases"`
+	} `yaml:"identity"`
+
 	Upstreams map[string][]string    `yaml:"upstreams"`
 	Routes    map[string]RouteConfig `yaml:"routes"`
 }
@@ -96,7 +99,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to configuration file (YAML)")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - Ultra-Low Memory Profile")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.13.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -162,11 +165,11 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
+	// Initialize subsystems
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	InitARP() 
+	InitIdentity() // Background poller for /etc/hosts and leases
 
-	// CONDITIONAL ALLOCATION: Only allocate TLS configurations and generate
-	// certificates if the user actually configured an encrypted listener.
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
 	var tlsConfig *tls.Config
 	if needsTLS {

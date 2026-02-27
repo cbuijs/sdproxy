@@ -1,18 +1,15 @@
 # File: config.yaml
-# Version: 1.9.0
-# Last Updated: 2026-02-27 20:32 CET
-# Description: sdproxy Simple DNS Proxy Configuration (Low Memory Profile)
+# Version: 1.13.0
+# Last Updated: 2026-02-27 21:25 CET
+# Description: sdproxy Simple DNS Proxy Configuration (Ultra-Low Memory Profile)
 
 server:
-  # Listeners now support multiple addresses/ports via arrays
   listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
   listen_tcp: ["0.0.0.0:53"]
   listen_dot: ["0.0.0.0:853"]
-  listen_doh: ["0.0.0.0:443"]   # Also used for DoH3 (HTTP/3)
-  listen_doq: ["0.0.0.0:853"]   # DNS-over-QUIC
+  listen_doh: ["0.0.0.0:443"]   
+  listen_doq: ["0.0.0.0:853"]   
   
-  # GOROUTINE OPTIMIZATION: Bounded UDP worker pool.
-  # Hard-caps the number of concurrent UDP processing threads.
   udp_workers: 10
   
   tls_cert: ""
@@ -32,6 +29,12 @@ cache:
   size: 1024         
   min_ttl: 60         
 
+# IDENTITY RESOLUTION: Automatically extract names for {client-name} substitution
+identity:
+  hosts_files: ["/etc/hosts"]
+  # Point to your dnsmasq lease file (e.g., OpenWrt, Pi-hole, generic Linux)
+  dnsmasq_leases: ["/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases"]
+
 upstreams:
   default:
     - "udp://1.1.1.1:53"
@@ -44,10 +47,8 @@ upstreams:
     - "doh3://security.cloudflare-dns.com/dns-query#1.1.1.2,1.0.0.2"
 
 routes:
+  # Explicit mapping overrides dynamic identity resolution
   "00:11:22:33:44:55":
     upstream: "kids"
-    client_name: "kids-ipad"
-  "aa:bb:cc:dd:ee:ff":
-    upstream: "secure"
-    client_name: "work-laptop"
+    client_name: "kids-ipad-override"
 

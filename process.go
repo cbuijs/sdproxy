@@ -1,12 +1,11 @@
 /*
 File: process.go
-Version: 1.12.0
-Last Updated: 2026-02-27 21:10 CET
+Version: 1.13.0
+Last Updated: 2026-02-27 21:25 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR Discovery queries unconditionally (with port hints), 
-             resolves {client-name}, checks the cache, forwards to upstream, 
-             and caches the reply.
-             FIXED: Logs now output the correctly resolved target URL.
+             resolves {client-name} dynamically via Hosts/Leases, checks the cache, 
+             forwards to upstream, and caches the reply.
 */
 
 package main
@@ -22,7 +21,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ProcessDNS is the central hub for all incoming queries across all protocols.
 func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol string) {
 	if len(r.Question) == 0 {
 		dns.HandleFailed(w, r)
@@ -35,6 +33,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	qNameLower := strings.ToLower(q.Name)
 	qNameTrimmed := strings.TrimSuffix(qNameLower, ".")
 	
+	// --- 1. DDR Spoofing & Interception ---
 	if q.Qtype == dns.TypeSVCB && qNameTrimmed == "_dns.resolver.arpa" {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
@@ -123,11 +122,14 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
+	// --- 2. Identity Extraction ---
 	mac := LookupMAC(clientIP)
 
 	routeName := "default"
-	clientName := "unknown"
+	clientName := ""
 
+	// Waterfall Logic for Identity Resolution
+	// 1. Check explicit configuration overrides first
 	if mac != "" {
 		if routeInfo, exists := macRoutes[mac]; exists {
 			if routeInfo.Upstream != "" {
@@ -135,31 +137,51 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			}
 			if routeInfo.ClientName != "" {
 				clientName = routeInfo.ClientName
-			} else {
-				clientName = strings.ReplaceAll(mac, ":", "-")
 			}
-		} else {
-			clientName = strings.ReplaceAll(mac, ":", "-")
 		}
-	} else {
-		clientName = strings.ReplaceAll(clientIP, ".", "-")
-		clientName = strings.ReplaceAll(clientName, ":", "-")
 	}
 
+	// 2. Dynamic Discovery: Try to resolve name via MAC from Dnsmasq Leases
+	if clientName == "" && mac != "" {
+		if name, ok := LookupNameByMAC(mac); ok {
+			clientName = name
+		}
+	}
+
+	// 3. Dynamic Discovery: Try to resolve name via IP from Hosts files / Leases
+	if clientName == "" {
+		if name, ok := LookupNameByIP(clientIP); ok {
+			clientName = name
+		}
+	}
+
+	// 4. Fallback: Hyphenated MAC or IP Address
+	if clientName == "" {
+		if mac != "" {
+			clientName = strings.ReplaceAll(mac, ":", "-")
+		} else {
+			clientName = strings.ReplaceAll(clientIP, ".", "-")
+			clientName = strings.ReplaceAll(clientName, ":", "-")
+		}
+	}
+
+	// --- 4. Cache Lookup ---
 	cacheKey := fmt.Sprintf("%s|%d|%d|%s", q.Name, q.Qtype, q.Qclass, routeName)
 	
 	if cachedResp := CacheGet(cacheKey); cachedResp != nil {
 		cachedResp.Id = originalID 
 		w.WriteMsg(cachedResp)
-		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE: %s | UPSTREAM: CACHE | OK", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeName)
+		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE: %s (Client: %s) | CACHE HIT", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeName, clientName)
 		return
 	}
 
+	// --- 5. Upstream Retrieval ---
 	upstreams, exists := routeUpstreams[routeName]
 	if !exists || len(upstreams) == 0 {
 		upstreams = routeUpstreams["default"]
 	}
 
+	// --- 6. Upstream Forwarding ---
 	var finalResp *dns.Msg
 	var lastErr error
 	var upstreamUsed string
@@ -171,7 +193,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	fwdReq.Id = dns.Id()
 
 	for _, up := range upstreams {
-		// up.Exchange now returns (response, actualTargetUrl, error)
 		resp, actualURL, err := up.Exchange(ctx, fwdReq, clientName)
 		if err == nil && resp != nil {
 			finalResp = resp
@@ -181,14 +202,17 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		lastErr = err
 	}
 
+	// --- 7. Handle Error or Response ---
 	if finalResp == nil {
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE: %s | FAILED: %v", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeName, lastErr)
 		dns.HandleFailed(w, r)
 		return
 	}
 
+	// --- 8. Cache Insertion ---
 	CacheSet(cacheKey, finalResp)
 
+	// --- 9. Reply to Client ---
 	finalResp.Id = originalID 
 	w.WriteMsg(finalResp)
 
