@@ -104,6 +104,10 @@ func main() {
 	// Aggressive GC tuning: optimize for throughput and CPU utilization in network apps
 	debug.SetGCPercent(20)
 
+	// 20MB hard cap; tune per device
+	debug.SetMemoryLimit(20 * 1024 * 1024)
+
+
 	configFile := flag.String("config", "config.yaml", "Path to configuration file (YAML)")
 	flag.Parse()
 
