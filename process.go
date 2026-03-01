@@ -1,29 +1,35 @@
 /*
 File: process.go
-Version: 1.18.0
-Last Updated: 2026-03-01 16:00 CET
+Version: 1.22.0
+Last Updated: 2026-03-01 19:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.22.0 - [FIX]  Local identity and PTR answers (from hosts/leases) were never
+           cached — the cache check and store both sat after the early-return
+           block. Repeated queries for local names hit the map lookup every time.
+           Cache is now checked before local resolution and populated on a local
+           hit, same as upstream answers. Route key "local" used to keep these
+           entries partitioned from upstream-routed responses.
+  1.20.0 - [FIX]  resolveLocalIdentity exact full-name lookup only.
+  1.19.0 - [FIX]  DDR SVCB ports now use ddrDoHPort/ddrDoTPort globals.
   1.18.0 - [FIX]  DDR glue records (A/AAAA in Additional section) were being added
            inside the ddrHostnames loop, producing one duplicate per extra hostname.
            Glue records are now emitted in a separate pass after the SVCB loop —
-           exactly one A and one AAAA record per hostname, no duplicates.
+           exactly one A and one AAAA per hostname, no duplicates.
            [FIX]  DDR SVCB ALPN list updated to include "http/1.1" alongside
            "h2" and "h3" to match the DoH listener's actual capabilities.
   1.17.0 - [PERF] resolveLocalIdentity now calls LookupIPsByName (O(1) pre-computed
            reverse map) instead of ranging over ipNameMap on every query. Same for
            resolveLocalPTR -> LookupNamesByARPA. Both were previously O(n) where n
-           is the number of DHCP leases — a significant hot-path bottleneck.
+           is the number of DHCP leases.
            [PERF] Cache key is now a DNSCacheKey struct instead of a fmt.Sprintf
            string. Removes reflection, heap allocation, and string building from
            every non-cached DNS query.
-           [PERF] Short hostname extraction in resolveLocalIdentity uses
-           strings.IndexByte instead of strings.Split — zero allocation.
-           [FIX]  Removed unused "fmt" import (no longer needed after Sprintf removal).
+           [PERF] Short hostname extraction uses strings.IndexByte — zero allocation.
   1.16.0 - Added DDR interception, PTR resolution, domain route matching.
 */
 
@@ -58,15 +64,14 @@ func getDomainRoute(qname string) (string, bool) {
 	return "", false
 }
 
-// resolveLocalIdentity returns all IPs matching the given hostname via the
-// pre-computed nameToIPs reverse map — O(1) instead of the previous O(n) scan.
-// IndexByte extracts the short name without allocating a []string slice.
+// resolveLocalIdentity returns IPs for a queried hostname — O(1) exact match
+// first, then a label-walk suffix match so that a hosts entry "1.2.3.4 company.com"
+// also answers for "www.company.com" or "bla.amsterdam.company.com".
 func resolveLocalIdentity(qname string) []net.IP {
-	name := qname
-	if idx := strings.IndexByte(qname, '.'); idx > 0 {
-		name = qname[:idx]
+	if ips := LookupIPsByName(qname); len(ips) > 0 {
+		return ips
 	}
-	return LookupIPsByName(name) // O(1) via pre-computed reverse map in identity.go
+	return LookupIPsBySuffix(qname)
 }
 
 // resolveLocalPTR returns all hostnames for an ARPA address via the pre-computed
@@ -97,14 +102,14 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			for host := range ddrHostnames {
 				target := dns.Fqdn(host)
 
-				// Priority 1: DoH (HTTP/1.1, HTTP/2, HTTP/3) on port 443
+				// Priority 1: DoH — HTTP/1.1, HTTP/2, HTTP/3 on the configured DoH port.
 				svcbHTTPS := &dns.SVCB{
 					Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
 					Priority: 1,
 					Target:   target,
 				}
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: 443})
+				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: ddrDoHPort})
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
 				if ddrIPv4 != nil {
 					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{ddrIPv4.To4()}})
@@ -114,14 +119,14 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				}
 				resp.Answer = append(resp.Answer, svcbHTTPS)
 
-				// Priority 2: DoT + DoQ on port 853
+				// Priority 2: DoT + DoQ on the configured DoT/DoQ port.
 				svcbTLS := &dns.SVCB{
 					Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
 					Priority: 2,
 					Target:   target,
 				}
 				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBAlpn{Alpn: []string{"dot", "doq"}})
-				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBPort{Port: 853})
+				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBPort{Port: ddrDoTPort})
 				if ddrIPv4 != nil {
 					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{ddrIPv4.To4()}})
 				}
@@ -131,9 +136,10 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				resp.Answer = append(resp.Answer, svcbTLS)
 			}
 
-			// Glue records in Additional — separate pass so we emit exactly one
-			// A and one AAAA per hostname regardless of how many hostnames are
-			// configured. Previously inside the SVCB loop, causing duplicates.
+			// Glue records in Additional — separate pass after the SVCB loop so we
+			// emit exactly one A and one AAAA per hostname regardless of how many
+			// hostnames are configured. Previously inside the SVCB loop, causing
+			// one duplicate glue record per extra hostname.
 			if ddrIPv4 != nil {
 				for host := range ddrHostnames {
 					resp.Extra = append(resp.Extra, &dns.A{
@@ -186,8 +192,17 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 2. Local Hosts/Leases Interception (A, AAAA, PTR) ---
-	// resolveLocalIdentity and resolveLocalPTR are now O(1) map lookups —
-	// see identity.go for the pre-computed reverse maps.
+	// Cache is checked first — repeated queries for local names are served from
+	// the cache without touching the identity maps at all. Route key "local"
+	// partitions these entries from upstream-routed responses in the cache.
+	localCacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, Route: "local"}
+	if cachedResp := CacheGet(localCacheKey); cachedResp != nil {
+		cachedResp.Id = originalID
+		w.WriteMsg(cachedResp)
+		log.Printf("[DNS] [%s] %s -> %s %s | LOCAL CACHE HIT", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
+		return
+	}
+
 	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA {
 		if localIPs := resolveLocalIdentity(qNameTrimmed); len(localIPs) > 0 {
 			resp     := new(dns.Msg)
@@ -213,6 +228,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			}
 
 			if answered {
+				CacheSet(localCacheKey, resp)
 				w.WriteMsg(resp)
 				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
 				return
@@ -229,6 +245,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					Ptr: dns.Fqdn(name),
 				})
 			}
+			CacheSet(localCacheKey, resp)
 			w.WriteMsg(resp)
 			log.Printf("[DNS] [%s] %s -> %s %s | LOCAL PTR", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
 			return
@@ -308,8 +325,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	fwdReq    := r.Copy()
-	fwdReq.Id  = dns.Id()
+	fwdReq   := r.Copy()
+	fwdReq.Id = dns.Id()
 
 	for _, up := range upstreams {
 		resp, actualURL, err := up.Exchange(ctx, fwdReq, clientName)

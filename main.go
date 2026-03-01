@@ -1,23 +1,21 @@
 /*
 File: main.go
-Version: 1.15.0
-Last Updated: 2026-03-01 14:00 CET
+Version: 1.16.0
+Last Updated: 2026-03-01 17:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
-  1.15.0 - [PERF] Replaced single 64KB bufPool with two tiered pools:
-             smallBufPool (4KB) for DNS message packing/writing — the hot path.
-             largeBufPool (64KB) for HTTP/stream body reads where size is unknown.
-           On a router with 10 UDP workers + DoH/DoQ connections, the old pool
-           could hold 1.2MB just in idle buffers. The tiered approach cuts typical
-           idle buffer memory by ~75% while keeping correctness for large reads.
-           [FEAT] Added memory_limit_mb config option. Uses debug.SetMemoryLimit
-           (Go 1.19+) to give the runtime a hard memory ceiling. Without this, Go's
-           GC has no idea how much RAM the device has and may allocate aggressively.
-           Set to (device_total_ram_mb - 10) as a starting point.
-           [FIX]  Calls Shutdown() on SIGTERM to signal UDP workers to exit cleanly.
+  1.16.0 - [FIX]  DDR SVCB port numbers were hardcoded to 443 (DoH) and 853
+           (DoT/DoQ). Ports are now derived from the first configured listener
+           address for each protocol at startup and stored as ddrDoHPort and
+           ddrDoTPort globals. process.go uses these instead of literals, so
+           DDR advertisements always match the actual listening ports.
+           Defaults of 443/853 apply when the respective listener is not configured
+           but DDR is still enabled (edge case — DDR is effectively advisory then).
+  1.15.0 - [PERF] Replaced single 64KB bufPool with tiered smallBufPool (4KB) and
+           largeBufPool (64KB). Added memory_limit_mb config option.
   1.14.0 - Added DomainRoutes initialisation, DDR spoofing, TLS auto-generation.
 */
 
@@ -38,6 +36,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -107,12 +106,18 @@ type ParsedRoute struct {
 
 // Global read-only state (set during init, never written after — inherently thread-safe)
 var (
-	macRoutes    map[string]ParsedRoute
-	domainRoutes map[string]string
+	macRoutes      map[string]ParsedRoute
+	domainRoutes   map[string]string
 	routeUpstreams map[string][]*Upstream
-	ddrHostnames map[string]bool
-	ddrIPv4      net.IP
-	ddrIPv6      net.IP
+	ddrHostnames   map[string]bool
+	ddrIPv4        net.IP
+	ddrIPv6        net.IP
+
+	// DDR SVCB ports — derived from the first configured listener address for each
+	// protocol so the advertised ports always match what we're actually listening on.
+	// Defaults: 443 for DoH, 853 for DoT/DoQ (RFC standard ports).
+	ddrDoHPort uint16 = 443
+	ddrDoTPort uint16 = 853
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
@@ -137,7 +142,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.15.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.16.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -154,8 +159,6 @@ func main() {
 	}
 
 	// Hard memory ceiling — critical on routers with 32–128 MB RAM.
-	// Without this, the Go runtime has no idea how constrained the device is
-	// and may allocate well beyond what the device can sustain.
 	if cfg.Server.MemoryLimitMB > 0 {
 		limit := int64(cfg.Server.MemoryLimitMB) * 1024 * 1024
 		debug.SetMemoryLimit(limit)
@@ -199,7 +202,23 @@ func main() {
 		if cfg.Server.DDR.IPv6 != "" {
 			ddrIPv6 = net.ParseIP(cfg.Server.DDR.IPv6)
 		}
-		log.Printf("[INIT] DDR enabled for %d hostnames", len(ddrHostnames))
+
+		// Derive DDR SVCB ports from the first configured listener address for each
+		// protocol. Falls back to RFC standard ports (443, 853) if the respective
+		// listener type isn't configured — DDR is advisory in that case.
+		if len(cfg.Server.ListenDoH) > 0 {
+			ddrDoHPort = extractPort(cfg.Server.ListenDoH[0], 443)
+		}
+		// DoT and DoQ share the priority-2 SVCB record — use DoT port if available,
+		// else fall back to DoQ since they typically share port 853 anyway.
+		if len(cfg.Server.ListenDoT) > 0 {
+			ddrDoTPort = extractPort(cfg.Server.ListenDoT[0], 853)
+		} else if len(cfg.Server.ListenDoQ) > 0 {
+			ddrDoTPort = extractPort(cfg.Server.ListenDoQ[0], 853)
+		}
+
+		log.Printf("[INIT] DDR enabled for %d hostnames (DoH port: %d, DoT/DoQ port: %d)",
+			len(ddrHostnames), ddrDoHPort, ddrDoTPort)
 	}
 
 	// 4. Upstream connections
@@ -246,6 +265,20 @@ func main() {
 
 	log.Println("[BOOT] Shutting down sdproxy...")
 	Shutdown() // Signal UDP workers to exit cleanly before process exits
+}
+
+// extractPort parses the port number from a "host:port" listener address string.
+// Returns the fallback value if the address is malformed or the port is out of range.
+func extractPort(addr string, fallback uint16) uint16 {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fallback
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return fallback
+	}
+	return uint16(p)
 }
 
 func getHardenedTLSConfig() *tls.Config {
@@ -311,9 +344,9 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	certPEM  := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	certPEM   := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	privBytes, _ := x509.MarshalECPrivateKey(priv)
-	keyPEM   := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
+	keyPEM    := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
