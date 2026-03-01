@@ -1,10 +1,24 @@
 /*
 File: server.go
-Version: 1.11.0
-Last Updated: 2026-02-27 21:00 CET
-Description: High-performance Listeners for UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC), and DoQ.
-             MEMORY OPTIMIZATION: Applied aggressive Read/Write/Idle timeouts.
-             FIXED: Added full support for both HTTP GET and POST for DoH/DoH3 clients.
+Version: 1.12.0
+Last Updated: 2026-03-01 14:00 CET
+Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/2),
+             DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory
+             on embedded targets. Supports RFC 8484 GET and POST for DoH.
+
+Changes:
+  1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions. The original
+           code registered handleTCP for both plain TCP and DoT, logging "TCP" for
+           all TLS connections. DoT connections now correctly log "DoT".
+           [FIX]  Replaced the always-false TLS detection branch with a proper
+           separate handler registration. miekg/dns doesn't expose TLS state
+           through ResponseWriter, so the only reliable fix is a separate handler.
+           [FIX]  Added clean graceful shutdown via shutdownCh channel. The previous
+           implementation had no way to signal UDP worker goroutines to exit,
+           causing goroutine leaks on SIGTERM. Workers now exit cleanly via select.
+           [PERF] Uses tiered buffer pools: smallBufPool (4KB) for message packing,
+           largeBufPool (64KB) for body reads where message size is unknown.
+  1.11.0 - Added full HTTP GET and POST support for DoH/DoH3 clients.
 */
 
 package main
@@ -19,6 +33,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -31,39 +46,58 @@ type udpJob struct {
 	r *dns.Msg
 }
 
-// Bounded queue for UDP requests
-var udpQueue chan udpJob
+var (
+	udpQueue     chan udpJob
+	shutdownCh   = make(chan struct{}) // Closed by Shutdown() to signal all workers
+	shutdownOnce sync.Once
+)
+
+// Shutdown signals all UDP worker goroutines to exit cleanly.
+// Safe to call multiple times (sync.Once). Call from main() on SIGTERM.
+func Shutdown() {
+	shutdownOnce.Do(func() {
+		close(shutdownCh)
+	})
+}
 
 func StartServers(tlsConf *tls.Config) {
-
-	// 0. Initialize Bounded UDP Worker Pool
+	// 0. Bounded UDP worker pool with clean shutdown support
 	udpQueue = make(chan udpJob, cfg.Server.UDPWorkers*10)
 	for i := 0; i < cfg.Server.UDPWorkers; i++ {
 		go func() {
-			for job := range udpQueue {
-				var ip string
-				if udpAddr, ok := job.w.RemoteAddr().(*net.UDPAddr); ok {
-					ip = udpAddr.IP.String()
+			for {
+				select {
+				case job, ok := <-udpQueue:
+					if !ok {
+						return // Channel closed (shouldn't happen, but defensive)
+					}
+					var ip string
+					if addr, ok := job.w.RemoteAddr().(*net.UDPAddr); ok {
+						ip = addr.IP.String()
+					}
+					ProcessDNS(job.w, job.r, ip, "UDP")
+				case <-shutdownCh:
+					return // Clean exit on shutdown signal
 				}
-				ProcessDNS(job.w, job.r, ip, "UDP")
 			}
 		}()
 	}
-	log.Printf("[LISTEN] UDP Worker Pool initialized with %d routines", cfg.Server.UDPWorkers)
+	log.Printf("[LISTEN] UDP Worker Pool: %d routines", cfg.Server.UDPWorkers)
 
-	// TIME-OUTS: Aggressively kill hanging connections to save memory on routers
-	const tcpReadTimeout = 2 * time.Second
-	const tcpWriteTimeout = 2 * time.Second
-	const tcpIdleTimeout = 10 * time.Second
+	const (
+		tcpReadTimeout  = 2 * time.Second
+		tcpWriteTimeout = 2 * time.Second
+		tcpIdleTimeout  = 10 * time.Second
+	)
 
 	// 1. DNS over UDP
 	for _, addr := range cfg.Server.ListenUDP {
 		addr := addr
 		go func() {
 			server := &dns.Server{Addr: addr, Net: "udp", Handler: dns.HandlerFunc(handleUDP)}
-			log.Printf("[LISTEN] UDP started on %s", addr)
+			log.Printf("[LISTEN] UDP on %s", addr)
 			if err := server.ListenAndServe(); err != nil {
-				log.Fatalf("[FATAL] UDP Server failed on %s: %v", addr, err)
+				log.Fatalf("[FATAL] UDP failed on %s: %v", addr, err)
 			}
 		}()
 	}
@@ -73,96 +107,90 @@ func StartServers(tlsConf *tls.Config) {
 		addr := addr
 		go func() {
 			server := &dns.Server{
-				Addr:         addr, 
-				Net:          "tcp", 
+				Addr: addr, Net: "tcp",
 				Handler:      dns.HandlerFunc(handleTCP),
 				ReadTimeout:  tcpReadTimeout,
 				WriteTimeout: tcpWriteTimeout,
 			}
-			log.Printf("[LISTEN] TCP started on %s", addr)
+			log.Printf("[LISTEN] TCP on %s", addr)
 			if err := server.ListenAndServe(); err != nil {
-				log.Fatalf("[FATAL] TCP Server failed on %s: %v", addr, err)
+				log.Fatalf("[FATAL] TCP failed on %s: %v", addr, err)
 			}
 		}()
 	}
 
 	// 3. DNS over TLS (DoT)
+	// Uses handleDoT (not handleTCP) so the protocol string in logs is accurate.
+	// miekg/dns doesn't expose TLS state via ResponseWriter — separate handler
+	// registration is the only reliable way to distinguish TCP from DoT in logs.
 	for _, addr := range cfg.Server.ListenDoT {
 		addr := addr
 		go func() {
 			server := &dns.Server{
-				Addr:         addr, 
-				Net:          "tcp-tls", 
-				TLSConfig:    tlsConf, 
-				Handler:      dns.HandlerFunc(handleTCP),
+				Addr: addr, Net: "tcp-tls",
+				TLSConfig:    tlsConf,
+				Handler:      dns.HandlerFunc(handleDoT), // Was handleTCP — now logs "DoT"
 				ReadTimeout:  tcpReadTimeout,
 				WriteTimeout: tcpWriteTimeout,
 			}
-			log.Printf("[LISTEN] DoT started on %s", addr)
+			log.Printf("[LISTEN] DoT on %s", addr)
 			if err := server.ListenAndServe(); err != nil {
-				log.Fatalf("[FATAL] DoT Server failed on %s: %v", addr, err)
+				log.Fatalf("[FATAL] DoT failed on %s: %v", addr, err)
 			}
 		}()
 	}
 
-	// 4. DNS over HTTPS (DoH / HTTP2) & DNS over HTTP/3 (DoH3 / QUIC)
+	// 4. DNS over HTTPS (DoH/HTTP2) + DNS over HTTP/3 (DoH3/QUIC)
 	for _, addr := range cfg.Server.ListenDoH {
 		addr := addr
 		mux := http.NewServeMux()
 		mux.HandleFunc("/dns-query", handleDoH)
 
 		h2Server := &http.Server{
-			Addr:              addr,
-			Handler:           mux,
-			TLSConfig:         tlsConf,
-			ReadTimeout:       tcpReadTimeout,
-			WriteTimeout:      tcpWriteTimeout,
-			IdleTimeout:       tcpIdleTimeout,
-			MaxHeaderBytes:    8192, // Support larger headers for GET requests
+			Addr: addr, Handler: mux, TLSConfig: tlsConf,
+			ReadTimeout:    tcpReadTimeout,
+			WriteTimeout:   tcpWriteTimeout,
+			IdleTimeout:    tcpIdleTimeout,
+			MaxHeaderBytes: 8192,
 		}
 		go func() {
-			log.Printf("[LISTEN] DoH (TCP) started on %s", addr)
+			log.Printf("[LISTEN] DoH (HTTP/2) on %s", addr)
 			if err := h2Server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				log.Fatalf("[FATAL] DoH Server failed on %s: %v", addr, err)
+				log.Fatalf("[FATAL] DoH failed on %s: %v", addr, err)
 			}
 		}()
 
 		h3Server := &http3.Server{
-			Addr:       addr,
-			Handler:    mux,
-			TLSConfig:  tlsConf,
+			Addr: addr, Handler: mux, TLSConfig: tlsConf,
 			QUICConfig: &quic.Config{
 				Allow0RTT:          true,
 				MaxIdleTimeout:     tcpIdleTimeout,
-				MaxIncomingStreams: 50, // Prevent stream hoarding
+				MaxIncomingStreams: 50,
 			},
 		}
 		go func() {
-			log.Printf("[LISTEN] DoH3 (QUIC) started on %s", addr)
+			log.Printf("[LISTEN] DoH3 (QUIC) on %s", addr)
 			if err := h3Server.ListenAndServe(); err != nil {
-				log.Fatalf("[FATAL] DoH3 Server failed on %s: %v", addr, err)
+				log.Fatalf("[FATAL] DoH3 failed on %s: %v", addr, err)
 			}
 		}()
 	}
 
-	// 5. DNS over QUIC (DoQ) - RFC 9250
+	// 5. DNS over QUIC (DoQ) — RFC 9250
 	for _, addr := range cfg.Server.ListenDoQ {
 		addr := addr
 		go func() {
-			log.Printf("[LISTEN] DoQ started on %s", addr)
-			
-			doqTLS := tlsConf.Clone()
-			doqTLS.NextProtos = []string{"doq"}
-
+			doqTLS             := tlsConf.Clone()
+			doqTLS.NextProtos   = []string{"doq"}
 			listener, err := quic.ListenAddr(addr, doqTLS, &quic.Config{
 				Allow0RTT:          true,
 				MaxIdleTimeout:     tcpIdleTimeout,
-				MaxIncomingStreams: 50, // Prevent stream hoarding
+				MaxIncomingStreams: 50,
 			})
 			if err != nil {
-				log.Fatalf("[FATAL] DoQ Listener failed on %s: %v", addr, err)
+				log.Fatalf("[FATAL] DoQ failed on %s: %v", addr, err)
 			}
-
+			log.Printf("[LISTEN] DoQ on %s", addr)
 			for {
 				conn, err := listener.Accept(context.Background())
 				if err != nil {
@@ -174,39 +202,55 @@ func StartServers(tlsConf *tls.Config) {
 	}
 }
 
+// handleUDP feeds incoming UDP packets into the bounded worker pool.
+// Checks shutdownCh so we don't send to the queue after shutdown is signalled.
+// The default case sheds load when the queue is full — correct behaviour for UDP.
 func handleUDP(w dns.ResponseWriter, r *dns.Msg) {
 	select {
 	case udpQueue <- udpJob{w: w, r: r}:
+	case <-shutdownCh:
+		// Shutting down — drop packet cleanly
 	default:
-		// LOAD SHEDDING: Drop packet if queue is full.
+		// Queue full — drop packet (load shedding, same as before)
 	}
 }
 
+// handleTCP handles plain (unencrypted) DNS-over-TCP. Logs protocol as "TCP".
 func handleTCP(w dns.ResponseWriter, r *dns.Msg) {
 	var ip string
-	if tcpAddr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
-		ip = tcpAddr.IP.String()
+	if addr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		ip = addr.IP.String()
 	}
-	proto := "TCP"
-	if _, isTLS := w.RemoteAddr().(*net.TCPAddr); isTLS {
-		// miekg/dns doesn't easily expose TLS state here, but we generally assume TCP/DoT
+	ProcessDNS(w, r, ip, "TCP")
+}
+
+// handleDoT handles DNS-over-TLS connections. Registered separately from handleTCP
+// so the protocol string in logs is "DoT" rather than "TCP".
+// (miekg/dns does not expose TLS state through ResponseWriter — separate handler
+// registration is the only reliable way to distinguish the two.)
+func handleDoT(w dns.ResponseWriter, r *dns.Msg) {
+	var ip string
+	if addr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		ip = addr.IP.String()
 	}
-	ProcessDNS(w, r, ip, proto)
+	ProcessDNS(w, r, ip, "DoT")
 }
 
 func handleDoH(w http.ResponseWriter, r *http.Request) {
-	var payload []byte
-	var err error
+	var (
+		payload []byte
+		err     error
+	)
 
-	// RFC 8484 supports both POST and GET methods
-	if r.Method == http.MethodPost {
-		// MEMORY OPTIMIZATION: Zero-allocation body reading using sync.Pool
-		bufPtr := bufPool.Get().(*[]byte)
-		buf := *bufPtr
-		defer bufPool.Put(bufPtr)
+	switch r.Method {
+	case http.MethodPost:
+		// largeBufPool: incoming body size is unknown (could be a large DNS request)
+		bufPtr := largeBufPool.Get().(*[]byte)
+		buf    := *bufPtr
+		defer largeBufPool.Put(bufPtr)
 
-		lr := io.LimitReader(r.Body, 65535)
-		n := 0
+		n  := 0
+		lr := io.LimitReader(r.Body, int64(len(buf)))
 		for {
 			c, readErr := lr.Read(buf[n:])
 			n += c
@@ -219,26 +263,25 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		defer r.Body.Close()
-		
-		// Copy payload out of buffer before returning it to the pool
+		// Copy out of the pool buffer before returning it
 		payload = make([]byte, n)
 		copy(payload, buf[:n])
 
-	} else if r.Method == http.MethodGet {
+	case http.MethodGet:
 		b64 := r.URL.Query().Get("dns")
 		if b64 == "" {
 			http.Error(w, "Missing dns parameter", http.StatusBadRequest)
 			return
 		}
-		
-		// Some non-compliant clients append padding (=), RFC 8484 demands RawURLEncoding (no padding)
+		// RFC 8484 requires RawURLEncoding (no padding); some clients add "=" anyway
 		b64 = strings.TrimRight(b64, "=")
 		payload, err = base64.RawURLEncoding.DecodeString(b64)
 		if err != nil {
 			http.Error(w, "Invalid base64 payload", http.StatusBadRequest)
 			return
 		}
-	} else {
+
+	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -250,49 +293,43 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	proto := "DoH"
+	proto       := "DoH"
 	if r.Proto == "HTTP/3.0" {
 		proto = "DoH3"
 	}
 
-	dw := &dohResponseWriter{w: w, remoteIP: host}
-	ProcessDNS(dw, msg, host, proto)
+	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host}, msg, host, proto)
 }
 
 func handleDoQConnection(conn *quic.Conn) {
 	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-	
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			return 
+			return
 		}
-
 		go func(s *quic.Stream) {
 			defer s.Close()
-			
+
 			var lenBuf [2]byte
 			if _, err := io.ReadFull(s, lenBuf[:]); err != nil {
 				return
 			}
 			length := binary.BigEndian.Uint16(lenBuf[:])
 
-			// MEMORY OPTIMIZATION: Zero-allocation body reading using sync.Pool
-			bufPtr := bufPool.Get().(*[]byte)
-			buf := *bufPtr
-			defer bufPool.Put(bufPtr)
+			// largeBufPool: length from the wire could be up to 65535
+			bufPtr := largeBufPool.Get().(*[]byte)
+			buf    := *bufPtr
+			defer largeBufPool.Put(bufPtr)
 
 			if _, err := io.ReadFull(s, buf[:length]); err != nil {
 				return
 			}
-
 			msg := new(dns.Msg)
 			if err := msg.Unpack(buf[:length]); err != nil {
 				return
 			}
-
-			dw := &doqResponseWriter{stream: s, remoteIP: host}
-			ProcessDNS(dw, msg, host, "DoQ")
+			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host}, msg, host, "DoQ")
 		}(stream)
 	}
 }
@@ -305,12 +342,10 @@ type dohResponseWriter struct {
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
-	// Re-use pool for packing responses too
-	bufPtr := bufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer bufPool.Put(bufPtr)
-
-	packed, err := msg.PackBuffer(buf[:0])
+	// smallBufPool: we're packing an outgoing DNS response — always small
+	bufPtr := smallBufPool.Get().(*[]byte)
+	packed, err := msg.PackBuffer((*bufPtr)[:0])
+	smallBufPool.Put(bufPtr)
 	if err != nil {
 		return err
 	}
@@ -318,13 +353,13 @@ func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 	_, err = dw.w.Write(packed)
 	return err
 }
-func (dw *dohResponseWriter) LocalAddr() net.Addr  { return nil }
-func (dw *dohResponseWriter) RemoteAddr() net.Addr { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
-func (dw *dohResponseWriter) Write(b []byte) (int, error) { return dw.w.Write(b) }
-func (dw *dohResponseWriter) Close() error         { return nil }
-func (dw *dohResponseWriter) TsigStatus() error    { return nil }
-func (dw *dohResponseWriter) TsigTimersOnly(bool)  {}
-func (dw *dohResponseWriter) Hijack()              {}
+func (dw *dohResponseWriter) LocalAddr() net.Addr              { return nil }
+func (dw *dohResponseWriter) RemoteAddr() net.Addr             { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
+func (dw *dohResponseWriter) Write(b []byte) (int, error)      { return dw.w.Write(b) }
+func (dw *dohResponseWriter) Close() error                     { return nil }
+func (dw *dohResponseWriter) TsigStatus() error                { return nil }
+func (dw *dohResponseWriter) TsigTimersOnly(bool)              {}
+func (dw *dohResponseWriter) Hijack()                          {}
 
 type doqResponseWriter struct {
 	stream   *quic.Stream
@@ -332,28 +367,26 @@ type doqResponseWriter struct {
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	bufPtr := bufPool.Get().(*[]byte)
-	buf := *bufPtr
-	defer bufPool.Put(bufPtr)
-
-	packed, err := msg.PackBuffer(buf[:0])
+	// smallBufPool: packing an outgoing DNS response — always small
+	bufPtr := smallBufPool.Get().(*[]byte)
+	packed, err := msg.PackBuffer((*bufPtr)[:0])
+	smallBufPool.Put(bufPtr)
 	if err != nil {
 		return err
 	}
-	lenBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBuf, uint16(len(packed)))
-	
-	if _, err := dw.stream.Write(lenBuf); err != nil {
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
+	if _, err := dw.stream.Write(lenBuf[:]); err != nil {
 		return err
 	}
 	_, err = dw.stream.Write(packed)
 	return err
 }
-func (dw *doqResponseWriter) LocalAddr() net.Addr  { return nil }
-func (dw *doqResponseWriter) RemoteAddr() net.Addr { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
-func (dw *doqResponseWriter) Write(b []byte) (int, error) { return dw.stream.Write(b) }
-func (dw *doqResponseWriter) Close() error         { return dw.stream.Close() }
-func (dw *doqResponseWriter) TsigStatus() error    { return nil }
-func (dw *doqResponseWriter) TsigTimersOnly(bool)  {}
-func (dw *doqResponseWriter) Hijack()              {}
+func (dw *doqResponseWriter) LocalAddr() net.Addr              { return nil }
+func (dw *doqResponseWriter) RemoteAddr() net.Addr             { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
+func (dw *doqResponseWriter) Write(b []byte) (int, error)      { return dw.stream.Write(b) }
+func (dw *doqResponseWriter) Close() error                     { return dw.stream.Close() }
+func (dw *doqResponseWriter) TsigStatus() error                { return nil }
+func (dw *doqResponseWriter) TsigTimersOnly(bool)              {}
+func (dw *doqResponseWriter) Hijack()                          {}
 

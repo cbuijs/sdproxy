@@ -1,20 +1,34 @@
 # File: config.yaml
-# Version: 1.14.0
-# Last Updated: 2026-02-27 21:45 CET
-# Description: sdproxy Simple DNS Proxy Configuration (Ultra-Low Memory Profile)
-# Added: domain_routes for high-performance suffix-based routing to specific upstreams.
+# Version: 1.15.0
+# Last Updated: 2026-03-01 14:00 CET
+# Description: sdproxy configuration — Simple DNS Proxy (Ultra-Low Memory Profile).
+#              All options are documented inline; no separate manual needed.
+#
+# Changes:
+#   1.15.0 - Added memory_limit_mb under server. Sets a hard RSS ceiling via
+#            Go's runtime/debug.SetMemoryLimit. Critical on routers with 32–128 MB
+#            RAM where the Go GC has no visibility into total available memory.
+#            0 = disabled (safe default). Start with (device_ram_mb - 10).
+#   1.14.0 - Added domain_routes for suffix-based upstream override.
 
 server:
-  listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
+  listen_udp: ["0.0.0.0:53"]
   listen_tcp: ["0.0.0.0:53"]
   listen_dot: ["0.0.0.0:853"]
-  listen_doh: ["0.0.0.0:443"]   
-  listen_doq: ["0.0.0.0:853"]   
-  
+  listen_doh: ["0.0.0.0:443"]
+  listen_doq: ["0.0.0.0:853"]
+
   udp_workers: 10
-  
+
   tls_cert: ""
   tls_key: ""
+
+  # Hard memory ceiling for the Go runtime. Without this, the GC has no knowledge
+  # of how much RAM the device has and may allocate too aggressively.
+  # Recommended: set to (total_device_ram_mb - 10).
+  # Examples: 22 for a 32 MB router, 54 for a 64 MB router, 118 for 128 MB.
+  # 0 = disabled (default — fine for full-size machines, tune for embedded targets).
+  memory_limit_mb: 32
 
   ddr:
     enabled: true
@@ -27,13 +41,15 @@ logging:
 
 cache:
   enabled: true
-  size: 1024         
-  min_ttl: 60         
+  size: 1024
+  min_ttl: 60
 
-# IDENTITY RESOLUTION: Automatically extract names for {client-name} substitution
+# IDENTITY RESOLUTION: Extracts short hostnames for {client-name} substitution
+# and local A/AAAA/PTR resolution. Polled every 30 seconds.
+# Maps are fully rebuilt each cycle — stale entries (devices that left or changed IP)
+# are automatically evicted rather than accumulating indefinitely.
 identity:
   hosts_files: ["/etc/hosts"]
-  # Point to your dnsmasq lease file (e.g., OpenWrt, Pi-hole, generic Linux)
   dnsmasq_leases: ["/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases"]
 
 upstreams:
@@ -42,25 +58,24 @@ upstreams:
     - "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
   kids:
     - "tcp://1.1.1.3:53"
-    - "doh://doh.controld.com/{client-name}"
+    - "doh://doh.controld.com/{client-name}"  # {client-name} resolved per-client at query time
   secure:
     - "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
     - "doh3://security.cloudflare-dns.com/dns-query#1.1.1.2,1.0.0.2"
-  # Define your local upstream here (e.g., your router or local AD controller)
   local_network:
     - "udp://192.168.1.1:53"
 
 routes:
-  # Explicit mapping overrides dynamic identity resolution based on MAC Address
+  # Explicit MAC overrides take priority over dynamic identity resolution.
   "00:11:22:33:44:55":
     upstream: "kids"
     client_name: "kids-ipad-override"
 
 domain_routes:
-  # High-performance suffix matching. 
-  # If the requested domain ends in any of these, it forcefully overrides the client upstream.
-  "lan": "local_network"
-  "local": "local_network"
-  "home.arpa": "local_network"
+  # Suffix-based routing — matched before the cache lookup, overrides client route.
+  # Zero-allocation label-by-label walk: O(labels) lookup, no string allocation.
+  "lan":           "local_network"
+  "local":         "local_network"
+  "home.arpa":     "local_network"
   "corp.internal": "local_network"
 
