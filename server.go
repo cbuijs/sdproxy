@@ -1,12 +1,18 @@
 /*
 File: server.go
-Version: 1.12.0
-Last Updated: 2026-03-01 14:00 CET
-Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/2),
+Version: 1.13.0
+Last Updated: 2026-03-01 15:00 CET
+Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory
              on embedded targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.13.0 - [FIX]  DoH listener now correctly supports HTTP/1.1 alongside HTTP/2.
+           The shared tlsConf carries non-HTTP ALPN tokens ("doq", "dot") which
+           cause strict HTTP/1.1 clients to reject the TLS handshake. The DoH
+           HTTP server now uses a cloned TLS config with NextProtos restricted
+           to ["h2", "http/1.1"]. Go's net/http stack negotiates between the
+           two automatically — no handler changes required.
   1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions. The original
            code registered handleTCP for both plain TCP and DoT, logging "TCP" for
            all TLS connections. DoT connections now correctly log "DoT".
@@ -140,26 +146,37 @@ func StartServers(tlsConf *tls.Config) {
 		}()
 	}
 
-	// 4. DNS over HTTPS (DoH/HTTP2) + DNS over HTTP/3 (DoH3/QUIC)
+	// 4. DNS over HTTPS (DoH/HTTP1.1 + HTTP/2) + DNS over HTTP/3 (DoH3/QUIC)
 	for _, addr := range cfg.Server.ListenDoH {
 		addr := addr
 		mux := http.NewServeMux()
 		mux.HandleFunc("/dns-query", handleDoH)
 
+		// Clone TLS config and restrict ALPN to HTTP-only tokens.
+		// The shared tlsConf also carries "doq" and "dot" which are not HTTP
+		// protocols — strict HTTP/1.1 clients that do ALPN negotiation will
+		// reject the handshake if they see unexpected tokens in the list.
+		// "h2" enables HTTP/2, "http/1.1" enables plain HTTP/1.1 fallback;
+		// Go's net/http stack negotiates between the two automatically.
+		dohTLS           := tlsConf.Clone()
+		dohTLS.NextProtos = []string{"h2", "http/1.1"}
+
 		h2Server := &http.Server{
-			Addr: addr, Handler: mux, TLSConfig: tlsConf,
+			Addr: addr, Handler: mux, TLSConfig: dohTLS,
 			ReadTimeout:    tcpReadTimeout,
 			WriteTimeout:   tcpWriteTimeout,
 			IdleTimeout:    tcpIdleTimeout,
 			MaxHeaderBytes: 8192,
 		}
 		go func() {
-			log.Printf("[LISTEN] DoH (HTTP/2) on %s", addr)
+			log.Printf("[LISTEN] DoH (HTTP/1.1 + HTTP/2) on %s", addr)
 			if err := h2Server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("[FATAL] DoH failed on %s: %v", addr, err)
 			}
 		}()
 
+		// h3Server uses the original tlsConf directly — QUIC/HTTP3 has its own
+		// ALPN negotiation path entirely separate from the TCP stack above.
 		h3Server := &http3.Server{
 			Addr: addr, Handler: mux, TLSConfig: tlsConf,
 			QUICConfig: &quic.Config{
@@ -180,8 +197,8 @@ func StartServers(tlsConf *tls.Config) {
 	for _, addr := range cfg.Server.ListenDoQ {
 		addr := addr
 		go func() {
-			doqTLS             := tlsConf.Clone()
-			doqTLS.NextProtos   = []string{"doq"}
+			doqTLS            := tlsConf.Clone()
+			doqTLS.NextProtos  = []string{"doq"}
 			listener, err := quic.ListenAddr(addr, doqTLS, &quic.Config{
 				Allow0RTT:          true,
 				MaxIdleTimeout:     tcpIdleTimeout,
@@ -211,7 +228,7 @@ func handleUDP(w dns.ResponseWriter, r *dns.Msg) {
 	case <-shutdownCh:
 		// Shutting down — drop packet cleanly
 	default:
-		// Queue full — drop packet (load shedding, same as before)
+		// Queue full — drop packet (load shedding)
 	}
 }
 

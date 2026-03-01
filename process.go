@@ -1,13 +1,19 @@
 /*
 File: process.go
-Version: 1.17.0
-Last Updated: 2026-03-01 14:00 CET
+Version: 1.18.0
+Last Updated: 2026-03-01 16:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.18.0 - [FIX]  DDR glue records (A/AAAA in Additional section) were being added
+           inside the ddrHostnames loop, producing one duplicate per extra hostname.
+           Glue records are now emitted in a separate pass after the SVCB loop —
+           exactly one A and one AAAA record per hostname, no duplicates.
+           [FIX]  DDR SVCB ALPN list updated to include "http/1.1" alongside
+           "h2" and "h3" to match the DoH listener's actual capabilities.
   1.17.0 - [PERF] resolveLocalIdentity now calls LookupIPsByName (O(1) pre-computed
            reverse map) instead of ranging over ipNameMap on every query. Same for
            resolveLocalPTR -> LookupNamesByARPA. Both were previously O(n) where n
@@ -75,8 +81,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
-	q          := r.Question[0]
-	originalID := r.Id
+	q            := r.Question[0]
+	originalID   := r.Id
 	qNameLower   := strings.ToLower(q.Name)
 	qNameTrimmed := strings.TrimSuffix(qNameLower, ".")
 
@@ -87,15 +93,17 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		resp.Authoritative = true
 
 		if cfg.Server.DDR.Enabled {
+			// SVCB answer records — one DoH record and one DoT/DoQ record per hostname.
 			for host := range ddrHostnames {
 				target := dns.Fqdn(host)
 
+				// Priority 1: DoH (HTTP/1.1, HTTP/2, HTTP/3) on port 443
 				svcbHTTPS := &dns.SVCB{
 					Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
 					Priority: 1,
 					Target:   target,
 				}
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3"}})
+				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: 443})
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
 				if ddrIPv4 != nil {
@@ -106,6 +114,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				}
 				resp.Answer = append(resp.Answer, svcbHTTPS)
 
+				// Priority 2: DoT + DoQ on port 853
 				svcbTLS := &dns.SVCB{
 					Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
 					Priority: 2,
@@ -120,16 +129,23 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv6Hint{Hint: []net.IP{ddrIPv6.To16()}})
 				}
 				resp.Answer = append(resp.Answer, svcbTLS)
+			}
 
-				if ddrIPv4 != nil {
+			// Glue records in Additional — separate pass so we emit exactly one
+			// A and one AAAA per hostname regardless of how many hostnames are
+			// configured. Previously inside the SVCB loop, causing duplicates.
+			if ddrIPv4 != nil {
+				for host := range ddrHostnames {
 					resp.Extra = append(resp.Extra, &dns.A{
-						Hdr: dns.RR_Header{Name: target, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+						Hdr: dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 						A:   ddrIPv4.To4(),
 					})
 				}
-				if ddrIPv6 != nil {
+			}
+			if ddrIPv6 != nil {
+				for host := range ddrHostnames {
 					resp.Extra = append(resp.Extra, &dns.AAAA{
-						Hdr:  dns.RR_Header{Name: target, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+						Hdr:  dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
 						AAAA: ddrIPv6.To16(),
 					})
 				}
@@ -141,24 +157,24 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
+	// DDR hostname A/AAAA spoof — answers direct lookups for the DDR hostnames
+	// themselves so clients can resolve them without hitting an upstream.
 	if cfg.Server.DDR.Enabled && ddrHostnames[qNameTrimmed] {
 		resp    := new(dns.Msg)
 		handled := false
 		resp.SetReply(r)
 
 		if q.Qtype == dns.TypeA && ddrIPv4 != nil {
-			rr := &dns.A{
+			resp.Answer = append(resp.Answer, &dns.A{
 				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 				A:   ddrIPv4.To4(),
-			}
-			resp.Answer = append(resp.Answer, rr)
+			})
 			handled = true
 		} else if q.Qtype == dns.TypeAAAA && ddrIPv6 != nil {
-			rr := &dns.AAAA{
+			resp.Answer = append(resp.Answer, &dns.AAAA{
 				Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
 				AAAA: ddrIPv6.To16(),
-			}
-			resp.Answer = append(resp.Answer, rr)
+			})
 			handled = true
 		}
 
@@ -260,8 +276,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	// Overrides the client route if the queried domain matches a configured suffix.
 	routeOriginType := "CLIENT"
 	if domainUpstream, matched := getDomainRoute(qNameTrimmed); matched {
-		routeName        = domainUpstream
-		routeOriginType  = "DOMAIN"
+		routeName       = domainUpstream
+		routeOriginType = "DOMAIN"
 	}
 
 	// --- 5. Cache Lookup ---
@@ -283,9 +299,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 7. Upstream Forwarding ---
-	var finalResp  *dns.Msg
-	var lastErr    error
-	var upstreamUsed string
+	var (
+		finalResp    *dns.Msg
+		lastErr      error
+		upstreamUsed string
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
