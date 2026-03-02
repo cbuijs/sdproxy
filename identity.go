@@ -1,7 +1,7 @@
 /*
 File: identity.go
-Version: 1.19.0
-Last Updated: 2026-03-02 16:00 CET
+Version: 1.20.0
+Last Updated: 2026-03-02 17:00 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
@@ -15,29 +15,19 @@ Description: Parses /etc/hosts and dnsmasq lease files to extract short hostname
                Each file's mtime is stored after a successful parse. On the next
                poll tick the file is stat()'d first — if the mtime is unchanged
                the cached partial result is reused directly, skipping the open(),
-               read(), and parse() entirely. /etc/hosts almost never changes;
-               the dnsmasq lease file changes on every DHCP event. This means
-               most poll ticks are two stat() calls and a map merge, nothing more.
-               Files are read into a single []byte buffer and parsed with
-               bytes.IndexByte — no bufio.Scanner overhead, no per-line string
-               allocation beyond the fields we actually keep.
+               read(), and parse() entirely.
 
 Changes:
+  1.20.0 - [PERF] LookupIPsBySuffix: previously acquired and released identMu
+           RLock on every label iteration (one lock cycle per dot in the name).
+           For a name like "a.b.c.d.example.com" that was 4 lock/unlock cycles.
+           A single RLock held for the entire walk eliminates the overhead — the
+           lock is read-only so it never blocks concurrent readers.
   1.19.0 - [FEAT] Poll interval is now configurable via identity.poll_interval in
            config.yaml. Defaults to 30 seconds when omitted or set to 0.
-           Log line at startup now includes the effective poll interval so it's
-           always visible without reading the config.
-  1.18.0 - [FEAT] Added LookupIPsBySuffix for subdomain matching. A hosts entry
-           "1.2.3.4 company.com" now also matches "www.company.com" and any
-           deeper subdomain. Exact match is always tried first via LookupIPsByName;
-           suffix walk is the fallback. resolveLocalIdentity in process.go drives
-           both lookups in order.
-  1.17.0 - [PERF] pollIdentity skips map rebuild when no files changed. Short names
-           are only used for {client-name} resolution (ipToName / macToName)
-           and must not influence DNS resolution — resolveLocalIdentity in
-           process.go now does exact full-name lookup only, no fallback.
-           Sink IPs (0.0.0.0, ::, 127.x, ::1) excluded from ipToName so they
-           never appear in client routing or {client-name} substitution.
+  1.18.0 - [FEAT] Added LookupIPsBySuffix for subdomain matching.
+  1.17.0 - [PERF] pollIdentity skips map rebuild when no files changed.
+           Short names are only used for {client-name} resolution.
   1.15.0 - Added per-file mtime tracking, bytes-based parsing, pre-sized maps.
 */
 
@@ -56,18 +46,16 @@ import (
 )
 
 // parsedFile holds the per-file cached parse result and the mtime that produced it.
-// If the file's current mtime matches cachedAt, the partial maps are reused as-is.
 type parsedFile struct {
 	cachedAt    time.Time
-	ipToName    map[string]string     // IP  -> short hostname
-	macToName   map[string]string     // MAC -> short hostname (leases only)
-	nameToIPs   map[string][]net.IP   // short hostname -> IPs
-	arpaToNames map[string][]string   // ARPA -> hostnames
-	seen        map[string]bool       // dedup set: "lowername|ip" keys
+	ipToName    map[string]string
+	macToName   map[string]string
+	nameToIPs   map[string][]net.IP
+	arpaToNames map[string][]string
+	seen        map[string]bool
 }
 
 var (
-	// identMu guards all four global maps as a unit.
 	identMu sync.RWMutex
 
 	_ipToName    = make(map[string]string)
@@ -80,13 +68,10 @@ var (
 	fileCache = make(map[string]*parsedFile)
 )
 
-// identityPollInterval returns the configured poll interval, falling back to
-// 30 seconds when the config value is missing or zero. The lower bound of 5s
-// prevents accidental hammering of the filesystem on constrained hardware.
 func identityPollInterval() time.Duration {
 	s := cfg.Identity.PollInterval
 	if s <= 0 {
-		return 30 * time.Second // Sensible default — leases rarely change faster
+		return 30 * time.Second
 	}
 	if s < 5 {
 		s = 5 // Floor: < 5s is pointless and wasteful on a router
@@ -105,7 +90,7 @@ func InitIdentity() {
 		len(cfg.Identity.HostsFiles), len(cfg.Identity.DnsmasqLeases), interval)
 
 	go func() {
-		pollIdentity() // Immediate first run so identity is available before the first tick
+		pollIdentity()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -142,32 +127,31 @@ func LookupIPsByName(name string) []net.IP {
 // LookupIPsBySuffix walks the query name label by label and returns the IPs of
 // the first matching parent domain found in nameToIPs.
 // e.g. "bla.company.com" tries "company.com", then "com".
-// The exact name itself is intentionally skipped here — callers try that first
-// via LookupIPsByName so we never duplicate the exact-match lookup.
-// Zero allocation: reslices the input string, no copies.
+//
+// A single RLock covers the entire walk — previously the lock was acquired and
+// released on every iteration, which was wasteful for deeply nested names.
+// The lock is read-only so it never blocks concurrent readers.
 func LookupIPsBySuffix(qname string) []net.IP {
+	identMu.RLock()
+	defer identMu.RUnlock()
 	search := qname
 	for {
 		idx := strings.IndexByte(search, '.')
 		if idx < 0 {
 			break
 		}
-		search = search[idx+1:] // strip one label, e.g. "bla.company.com" -> "company.com"
+		search = search[idx+1:] // strip one label — zero allocation, no copy
 		if len(search) == 0 {
 			break
 		}
-		identMu.RLock()
-		ips := _nameToIPs[search]
-		identMu.RUnlock()
-		if len(ips) > 0 {
+		if ips := _nameToIPs[search]; len(ips) > 0 {
 			return ips
 		}
 	}
 	return nil
 }
 
-// LookupNamesByARPA returns all hostnames for an ARPA string (lowercase, no trailing
-// dot, e.g. "42.1.168.192.in-addr.arpa"). O(1).
+// LookupNamesByARPA returns all hostnames for an ARPA string. O(1).
 func LookupNamesByARPA(arpa string) []string {
 	identMu.RLock()
 	names := _arpaToNames[arpa]
@@ -176,11 +160,10 @@ func LookupNamesByARPA(arpa string) []string {
 }
 
 // pollIdentity checks each configured file for mtime changes. If no file has
-// changed since the last poll the function returns immediately — no map rebuild,
-// no lock contention, no allocations. Only when at least one file is new or
-// modified are the four global maps rebuilt and atomically swapped.
+// changed since the last poll the function returns immediately. Only when at
+// least one file is new or modified are the four global maps rebuilt and
+// atomically swapped.
 func pollIdentity() {
-	// Count current total entries to pre-size fresh maps and avoid rehashing.
 	identMu.RLock()
 	hint := len(_ipToName) + 8
 	identMu.RUnlock()
@@ -211,7 +194,6 @@ func pollIdentity() {
 		}
 	}
 
-	// Nothing changed — skip the rebuild entirely, no lock, no allocation swap.
 	if !anyChanged {
 		return
 	}
@@ -227,9 +209,6 @@ func pollIdentity() {
 		len(freshIP), len(freshMAC), len(freshName), len(freshARPA))
 }
 
-// getOrParse returns the cached parsedFile for path if the file's mtime is
-// unchanged (changed=false), otherwise reads, parses, caches, and returns it
-// (changed=true). Returns (nil, false) if the file cannot be stat'd or read.
 func getOrParse(path string, isLeases bool) (*parsedFile, bool) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -238,14 +217,12 @@ func getOrParse(path string, isLeases bool) (*parsedFile, bool) {
 	}
 	mtime := info.ModTime()
 
-	// Cache hit: mtime unchanged — reuse, no I/O, signal no change.
 	if cached, ok := fileCache[path]; ok && cached.cachedAt.Equal(mtime) {
 		log.Printf("[IDENTITY] %s unchanged (mtime %s) — using cached %d entries",
 			path, mtime.Format(time.RFC3339), len(cached.ipToName))
 		return cached, false
 	}
 
-	// Cache miss or file changed — read and parse.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Printf("[IDENTITY] Cannot read %s: %v — skipping", path, err)
@@ -268,10 +245,9 @@ func getOrParse(path string, isLeases bool) (*parsedFile, bool) {
 
 	log.Printf("[IDENTITY] Parsed %s file %s: %d IPs, %d MACs, %d hostnames",
 		fileType, path, len(pf.ipToName), len(pf.macToName), len(pf.nameToIPs))
-	return pf, true // signal that this file changed
+	return pf, true
 }
 
-// mergePartial copies one file's partial maps into the global fresh maps.
 func mergePartial(
 	pf       *parsedFile,
 	freshIP   map[string]string,
@@ -294,32 +270,25 @@ func mergePartial(
 }
 
 // parseHostsBytes parses a /etc/hosts file from a raw byte slice.
-//
 // Format:  IP  Hostname  [Aliases...]
-//
-// Uses bytes.IndexByte for line splitting and field scanning — no per-line
-// string allocation until we've confirmed the line has the fields we need.
 func parseHostsBytes(data []byte) *parsedFile {
 	pf := &parsedFile{
 		ipToName:    make(map[string]string),
-		macToName:   make(map[string]string), // always empty for hosts files
+		macToName:   make(map[string]string),
 		nameToIPs:   make(map[string][]net.IP),
 		arpaToNames: make(map[string][]string),
 		seen:        make(map[string]bool),
 	}
 
 	for len(data) > 0 {
-		// Slice off one line
 		line, rest := splitLine(data)
 		data = rest
 
-		// Trim leading whitespace and skip comments/blanks
 		line = bytes.TrimLeft(line, " \t")
 		if len(line) == 0 || line[0] == '#' {
 			continue
 		}
 
-		// Extract IP field (up to first whitespace)
 		ipEnd := bytes.IndexAny(line, " \t")
 		if ipEnd < 0 {
 			continue
@@ -327,7 +296,6 @@ func parseHostsBytes(data []byte) *parsedFile {
 		ipBytes := line[:ipEnd]
 		line     = bytes.TrimLeft(line[ipEnd:], " \t")
 
-		// Extract hostname field (up to next whitespace or end)
 		nameEnd := bytes.IndexAny(line, " \t")
 		var nameBytes []byte
 		if nameEnd < 0 {
@@ -339,19 +307,13 @@ func parseHostsBytes(data []byte) *parsedFile {
 			continue
 		}
 
-		ip       := string(ipBytes)
-		fullName := string(nameBytes) // full name — storeEntry handles short-name logic
-		storeEntry(ip, fullName, pf)
+		storeEntry(string(ipBytes), string(nameBytes), pf)
 	}
 	return pf
 }
 
 // parseLeasesBytes parses a dnsmasq leases file from a raw byte slice.
-//
 // Format:  ExpiryTime  MAC  IP  Hostname  ClientID
-//
-// Same zero-allocation approach as parseHostsBytes — bytes only until we
-// have confirmed the line is a valid lease with a real hostname.
 func parseLeasesBytes(data []byte) *parsedFile {
 	pf := &parsedFile{
 		ipToName:    make(map[string]string),
@@ -370,7 +332,6 @@ func parseLeasesBytes(data []byte) *parsedFile {
 			continue
 		}
 
-		// Need at least 4 fields: expiry MAC IP hostname
 		fields := bytes.Fields(line)
 		if len(fields) < 4 {
 			continue
@@ -380,16 +341,13 @@ func parseLeasesBytes(data []byte) *parsedFile {
 		ipBytes   := fields[2]
 		nameBytes := fields[3]
 
-		// Skip placeholder hostnames
 		if len(nameBytes) == 0 || bytes.Equal(nameBytes, []byte("*")) {
 			continue
 		}
 
-		ip       := string(ipBytes)
-		fullName := string(nameBytes) // full name — storeEntry handles short-name logic
-		storeEntry(ip, fullName, pf)
+		fullName := string(nameBytes)
+		storeEntry(string(ipBytes), fullName, pf)
 
-		// MAC -> name (leases only) — use short name for clean device labels
 		shortName := fullName
 		if idx := strings.IndexByte(fullName, '.'); idx > 0 {
 			shortName = fullName[:idx]
@@ -403,8 +361,6 @@ func parseLeasesBytes(data []byte) *parsedFile {
 
 // isSinkIP returns true for addresses used as blocklist targets rather than
 // real device addresses — 0.0.0.0, ::, 127.x.x.x, and ::1.
-// Sink IPs must not pollute ipToName (client routing) or short-name reverse
-// lookups (device name resolution).
 func isSinkIP(ip net.IP) bool {
 	return ip.IsUnspecified() || ip.IsLoopback()
 }
@@ -413,14 +369,7 @@ func isSinkIP(ip net.IP) bool {
 //
 // nameToIPs and arpaToNames use the full name as key — exact-match only.
 // Short names (first label) are ONLY stored in ipToName for {client-name}
-// resolution and must never appear in nameToIPs or arpaToNames, to prevent
-// blocklist entries (e.g. "0.0.0.0 ads.example.com" stored as "ads") from
-// intercepting unrelated queries.
-//
-// Sink IPs (0.0.0.0, ::, 127.x, ::1) are excluded from ipToName entirely —
-// they are blocklist targets, not real devices.
-//
-// Deduplication is keyed on (lowername|ip) to handle repeated lines.
+// resolution. Sink IPs (0.0.0.0, ::, 127.x, ::1) are excluded from ipToName.
 func storeEntry(ip, rawName string, pf *parsedFile) {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
@@ -430,7 +379,6 @@ func storeEntry(ip, rawName string, pf *parsedFile) {
 	sink    := isSinkIP(parsedIP)
 	fullKey := strings.ToLower(rawName)
 
-	// --- Full-name reverse maps (always, sink or not) ---
 	dedupKey := fullKey + "|" + ip
 	if !pf.seen[dedupKey] {
 		pf.seen[dedupKey] = true
@@ -442,15 +390,10 @@ func storeEntry(ip, rawName string, pf *parsedFile) {
 		}
 	}
 
-	// Sink IPs stop here — no ipToName entry, no client routing influence.
 	if sink {
 		return
 	}
 
-	// --- Forward map: short name only, real IPs only ---
-	// ipToName is exclusively for {client-name} substitution and client routing.
-	// Store the short hostname (first label) so device labels are clean —
-	// "my-laptop" rather than "my-laptop.lan".
 	shortName := rawName
 	if idx := strings.IndexByte(rawName, '.'); idx > 0 {
 		shortName = rawName[:idx]
