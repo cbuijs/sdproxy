@@ -69,6 +69,19 @@ type Config struct {
 		// 0 = disabled (default — safe to omit from config).
 		MemoryLimitMB int `yaml:"memory_limit_mb"`
 
+		// FilterAAAA drops all AAAA queries by returning an empty NOERROR response.
+		// Useful on IPv4-only networks to prevent clients from waiting for AAAA
+		// timeouts before falling back to A records.
+		// false = disabled (default). true = all AAAA queries answered with NOERROR/empty.
+		FilterAAAA bool `yaml:"filter_aaaa"`
+
+		// StrictPTR rejects PTR queries that are not valid reverse-lookup addresses.
+		// Valid forms: *.in-addr.arpa (IPv4) and *.ip6.arpa (IPv6).
+		// Any PTR query for an arbitrary hostname (e.g. "ptr.example.com") is
+		// answered with NXDOMAIN instead of being forwarded upstream.
+		// false = disabled (default). true = non-reverse PTR queries rejected.
+		StrictPTR bool `yaml:"strict_ptr"`
+
 		DDR struct {
 			Enabled   bool     `yaml:"enabled"`
 			Hostnames []string `yaml:"hostnames"`
@@ -142,7 +155,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.16.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.18.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {

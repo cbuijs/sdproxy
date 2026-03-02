@@ -12,7 +12,7 @@
 #   1.14.0 - Added domain_routes for suffix-based upstream override.
 
 server:
-  listen_udp: ["0.0.0.0:53"]
+  listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
   listen_tcp: ["0.0.0.0:53"]
   listen_dot: ["0.0.0.0:853"]
   listen_doh: ["0.0.0.0:443"]
@@ -28,7 +28,20 @@ server:
   # Recommended: set to (total_device_ram_mb - 10).
   # Examples: 22 for a 32 MB router, 54 for a 64 MB router, 118 for 128 MB.
   # 0 = disabled (default — fine for full-size machines, tune for embedded targets).
-  memory_limit_mb: 32
+  memory_limit_mb: 0
+
+  # Filter all AAAA (IPv6) queries by returning an empty NOERROR response.
+  # Useful on IPv4-only networks — prevents clients from stalling on AAAA
+  # timeouts before falling back to A records.
+  # false = disabled (default). true = all AAAA queries silently suppressed.
+  filter_aaaa: false
+
+  # Strict PTR validation — reject PTR queries that are not valid reverse-lookup
+  # addresses. Valid forms: *.in-addr.arpa (IPv4) and *.ip6.arpa (IPv6).
+  # PTR queries for arbitrary hostnames (e.g. "ptr.example.com") are answered
+  # with NXDOMAIN instead of being forwarded upstream.
+  # false = disabled (default). true = non-reverse PTR queries rejected.
+  strict_ptr: false
 
   ddr:
     enabled: true
