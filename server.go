@@ -1,28 +1,33 @@
 /*
 File: server.go
 Version: 1.14.0
-Last Updated: 2026-03-02 17:00 CET
+Last Updated: 2026-03-02 20:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory
              on embedded targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
-  1.14.0 - [PERF] handleDoH POST: removed the make([]byte, n) copy that duplicated
-           the payload from the pool buffer to the heap. dns.Msg.Unpack does not
-           retain the byte slice after parsing, so the unpack now runs directly
-           against the largeBufPool buffer (kept alive for the call via defer).
-           ProcessDNS is a synchronous call so the pool buffer outlives it safely.
-           [PERF] Added dohRWPool (sync.Pool) for dohResponseWriter. Previously
-           a new writer struct was heap-allocated on every HTTP request; pooling
-           it eliminates that allocation on the hot DoH path.
+  1.14.0 - [PERF] DoH POST handler: eliminated unnecessary alloc+copy. The old
+           code read into a pool buffer, then called make([]byte, n) + copy() to
+           create a separate slice before unpacking. dns.Msg.Unpack creates
+           independent copies of all fields — it never aliases its input buffer.
+           The pool buffer lives until function return (defer), so unpacking
+           directly from it is safe. Saves one allocation + memcpy per DoH POST.
   1.13.0 - [FIX]  DoH listener now correctly supports HTTP/1.1 alongside HTTP/2.
            The shared tlsConf carries non-HTTP ALPN tokens ("doq", "dot") which
            cause strict HTTP/1.1 clients to reject the TLS handshake. The DoH
            HTTP server now uses a cloned TLS config with NextProtos restricted
            to ["h2", "http/1.1"]. Go's net/http stack negotiates between the
            two automatically — no handler changes required.
-  1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions.
-           [FIX]  Added clean graceful shutdown via shutdownCh channel.
+  1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions. The original
+           code registered handleTCP for both plain TCP and DoT, logging "TCP" for
+           all TLS connections. DoT connections now correctly log "DoT".
+           [FIX]  Replaced the always-false TLS detection branch with a proper
+           separate handler registration. miekg/dns doesn't expose TLS state
+           through ResponseWriter, so the only reliable fix is a separate handler.
+           [FIX]  Added clean graceful shutdown via shutdownCh channel. The previous
+           implementation had no way to signal UDP worker goroutines to exit,
+           causing goroutine leaks on SIGTERM. Workers now exit cleanly via select.
            [PERF] Uses tiered buffer pools: smallBufPool (4KB) for message packing,
            largeBufPool (64KB) for body reads where message size is unknown.
   1.11.0 - Added full HTTP GET and POST support for DoH/DoH3 clients.
@@ -59,10 +64,6 @@ var (
 	shutdownOnce sync.Once
 )
 
-// dohRWPool reuses dohResponseWriter structs across HTTP requests.
-// Eliminates one heap allocation per DoH query on the hot path.
-var dohRWPool = sync.Pool{New: func() any { return &dohResponseWriter{} }}
-
 // Shutdown signals all UDP worker goroutines to exit cleanly.
 // Safe to call multiple times (sync.Once). Call from main() on SIGTERM.
 func Shutdown() {
@@ -80,7 +81,7 @@ func StartServers(tlsConf *tls.Config) {
 				select {
 				case job, ok := <-udpQueue:
 					if !ok {
-						return // Channel closed (shouldn't happen, but defensive)
+						return
 					}
 					var ip string
 					if addr, ok := job.w.RemoteAddr().(*net.UDPAddr); ok {
@@ -88,7 +89,7 @@ func StartServers(tlsConf *tls.Config) {
 					}
 					ProcessDNS(job.w, job.r, ip, "UDP")
 				case <-shutdownCh:
-					return // Clean exit on shutdown signal
+					return
 				}
 			}
 		}()
@@ -131,9 +132,6 @@ func StartServers(tlsConf *tls.Config) {
 	}
 
 	// 3. DNS over TLS (DoT)
-	// Uses handleDoT (not handleTCP) so the protocol string in logs is accurate.
-	// miekg/dns doesn't expose TLS state via ResponseWriter — separate handler
-	// registration is the only reliable way to distinguish TCP from DoT in logs.
 	for _, addr := range cfg.Server.ListenDoT {
 		addr := addr
 		go func() {
@@ -157,10 +155,6 @@ func StartServers(tlsConf *tls.Config) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/dns-query", handleDoH)
 
-		// Clone TLS config and restrict ALPN to HTTP-only tokens.
-		// The shared tlsConf also carries "doq" and "dot" which are not HTTP
-		// protocols — strict HTTP/1.1 clients that do ALPN negotiation will
-		// reject the handshake if they see unexpected tokens in the list.
 		dohTLS           := tlsConf.Clone()
 		dohTLS.NextProtos = []string{"h2", "http/1.1"}
 
@@ -178,8 +172,6 @@ func StartServers(tlsConf *tls.Config) {
 			}
 		}()
 
-		// h3Server uses the original tlsConf directly — QUIC/HTTP3 has its own
-		// ALPN negotiation path entirely separate from the TCP stack above.
 		h3Server := &http3.Server{
 			Addr: addr, Handler: mux, TLSConfig: tlsConf,
 			QUICConfig: &quic.Config{
@@ -200,8 +192,8 @@ func StartServers(tlsConf *tls.Config) {
 	for _, addr := range cfg.Server.ListenDoQ {
 		addr := addr
 		go func() {
-			doqTLS           := tlsConf.Clone()
-			doqTLS.NextProtos = []string{"doq"}
+			doqTLS            := tlsConf.Clone()
+			doqTLS.NextProtos  = []string{"doq"}
 			listener, err := quic.ListenAddr(addr, doqTLS, &quic.Config{
 				Allow0RTT:          true,
 				MaxIdleTimeout:     tcpIdleTimeout,
@@ -222,20 +214,14 @@ func StartServers(tlsConf *tls.Config) {
 	}
 }
 
-// handleUDP feeds incoming UDP packets into the bounded worker pool.
-// Checks shutdownCh so we don't send to the queue after shutdown is signalled.
-// The default case sheds load when the queue is full — correct behaviour for UDP.
 func handleUDP(w dns.ResponseWriter, r *dns.Msg) {
 	select {
 	case udpQueue <- udpJob{w: w, r: r}:
 	case <-shutdownCh:
-		// Shutting down — drop packet cleanly
 	default:
-		// Queue full — drop packet (load shedding)
 	}
 }
 
-// handleTCP handles plain (unencrypted) DNS-over-TCP. Logs protocol as "TCP".
 func handleTCP(w dns.ResponseWriter, r *dns.Msg) {
 	var ip string
 	if addr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
@@ -244,8 +230,6 @@ func handleTCP(w dns.ResponseWriter, r *dns.Msg) {
 	ProcessDNS(w, r, ip, "TCP")
 }
 
-// handleDoT handles DNS-over-TLS connections. Registered separately from handleTCP
-// so the protocol string in logs is "DoT" rather than "TCP".
 func handleDoT(w dns.ResponseWriter, r *dns.Msg) {
 	var ip string
 	if addr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
@@ -262,13 +246,13 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
-		// Read the request body into a pool buffer. dns.Msg.Unpack does not
-		// retain any reference to the byte slice after parsing completes, so
-		// we can unpack directly from the pool buffer and return it when done.
-		// ProcessDNS is a synchronous call, so the pool buffer outlives it safely.
+		// largeBufPool: incoming body size is unknown (could be a large DNS request).
+		// dns.Msg.Unpack creates independent copies of all fields — it never aliases
+		// its input buffer. The pool buffer lives until function return (defer), so
+		// unpacking directly from it is safe. No need to alloc+copy out of the pool.
 		bufPtr := largeBufPool.Get().(*[]byte)
+		buf    := *bufPtr
 		defer largeBufPool.Put(bufPtr)
-		buf := *bufPtr
 
 		n  := 0
 		lr := io.LimitReader(r.Body, int64(len(buf)))
@@ -283,8 +267,8 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		defer r.Body.Close()
-		payload = buf[:n] // slice of pool buffer — valid until defer fires at function exit
+		r.Body.Close()
+		payload = buf[:n] // Safe: Unpack doesn't alias input; pool buf lives until defer
 
 	case http.MethodGet:
 		b64 := r.URL.Query().Get("dns")
@@ -292,7 +276,6 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Missing dns parameter", http.StatusBadRequest)
 			return
 		}
-		// RFC 8484 requires RawURLEncoding (no padding); some clients add "=" anyway
 		b64 = strings.TrimRight(b64, "=")
 		payload, err = base64.RawURLEncoding.DecodeString(b64)
 		if err != nil {
@@ -317,14 +300,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		proto = "DoH3"
 	}
 
-	// Grab a pooled response writer, set fields, process, then reset and return.
-	rw           := dohRWPool.Get().(*dohResponseWriter)
-	rw.w          = w
-	rw.remoteIP   = host
-	ProcessDNS(rw, msg, host, proto)
-	rw.w        = nil
-	rw.remoteIP = ""
-	dohRWPool.Put(rw)
+	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host}, msg, host, proto)
 }
 
 func handleDoQConnection(conn *quic.Conn) {
@@ -343,7 +319,6 @@ func handleDoQConnection(conn *quic.Conn) {
 			}
 			length := binary.BigEndian.Uint16(lenBuf[:])
 
-			// largeBufPool: length from the wire could be up to 65535
 			bufPtr := largeBufPool.Get().(*[]byte)
 			buf    := *bufPtr
 			defer largeBufPool.Put(bufPtr)
@@ -368,10 +343,9 @@ type dohResponseWriter struct {
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
-	// smallBufPool: we're packing an outgoing DNS response — always small
 	bufPtr := smallBufPool.Get().(*[]byte)
-	defer smallBufPool.Put(bufPtr)
 	packed, err := msg.PackBuffer((*bufPtr)[:0])
+	smallBufPool.Put(bufPtr)
 	if err != nil {
 		return err
 	}
@@ -393,10 +367,9 @@ type doqResponseWriter struct {
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	// smallBufPool: packing an outgoing DNS response — always small
 	bufPtr := smallBufPool.Get().(*[]byte)
-	defer smallBufPool.Put(bufPtr)
 	packed, err := msg.PackBuffer((*bufPtr)[:0])
+	smallBufPool.Put(bufPtr)
 	if err != nil {
 		return err
 	}

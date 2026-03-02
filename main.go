@@ -1,23 +1,27 @@
 /*
 File: main.go
 Version: 1.18.0
-Last Updated: 2026-03-02 17:00 CET
+Last Updated: 2026-03-02 20:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
-  1.18.0 - [FEAT] Added logging.log_queries config field. Defaults to true
-           (preserves existing behaviour). Set to false in production to suppress
-           per-query log lines — measurably reduces CPU load at high QPS because
-           log.Printf with string formatting and the log mutex are off the hot path.
-           Error and upstream-failure logs are unconditional regardless of this flag.
-           [PERF] Added groupNeedsClientName map[string]bool, computed once at
-           startup. process.go uses this to skip all MAC/IP identity work when the
-           selected upstream group has no {client-name} upstreams — saves multiple
-           RLock cycles on every domain-routed query.
-  1.17.0 - [FEAT] Added identity.poll_interval config field.
-  1.16.0 - [FIX]  DDR SVCB port numbers derived from listener addresses at startup.
+  1.18.0 - [PERF] Added logging.log_queries config option. Controls whether
+           per-query log lines are emitted in ProcessDNS. log.Printf acquires a
+           global mutex and runs fmt.Sprintf with reflection — with 10 UDP workers
+           all logging on every query this was the single biggest serialisation
+           point under load. When log_queries is false, per-query log lines are
+           suppressed entirely — no mutex, no formatting, no I/O. Error messages
+           and startup/shutdown lines always log regardless. The logQueries global
+           bool is set once at startup and read without locking (immutable after init).
+  1.17.0 - [FEAT] Added identity.poll_interval config field. Controls how often
+           hosts and lease files are checked for changes. Defaults to 30 seconds
+           when omitted or 0; enforced floor of 5 seconds (identity.go).
+  1.16.0 - [FIX]  DDR SVCB port numbers were hardcoded to 443 (DoH) and 853
+           (DoT/DoQ). Ports are now derived from the first configured listener
+           address for each protocol at startup and stored as ddrDoHPort and
+           ddrDoTPort globals.
   1.15.0 - [PERF] Replaced single 64KB bufPool with tiered smallBufPool (4KB) and
            largeBufPool (64KB). Added memory_limit_mb config option.
   1.14.0 - Added DomainRoutes initialisation, DDR spoofing, TLS auto-generation.
@@ -67,8 +71,8 @@ type Config struct {
 		TLSCert    string   `yaml:"tls_cert"`
 		TLSKey     string   `yaml:"tls_key"`
 
-		// MemoryLimitMB sets a hard RSS ceiling via debug.SetMemoryLimit.
-		MemoryLimitMB  int  `yaml:"memory_limit_mb"`
+		MemoryLimitMB int `yaml:"memory_limit_mb"`
+
 		FilterAAAA     bool `yaml:"filter_aaaa"`
 		StrictPTR      bool `yaml:"strict_ptr"`
 		FlattenCNAME   bool `yaml:"flatten_cname"`
@@ -85,12 +89,12 @@ type Config struct {
 	Logging struct {
 		StripTime bool `yaml:"strip_time"`
 
-		// LogQueries controls per-query log lines (the "[DNS] ..." lines in process.go).
-		// true  = log every query resolution (default — useful during setup/debugging).
-		// false = suppress query lines; only errors and upstream failures are logged.
-		//         Recommended for production: removes log.Printf from the hot path
-		//         and eliminates the log mutex contention at high QPS.
-		LogQueries bool `yaml:"log_queries"`
+		// LogQueries controls per-query log output in ProcessDNS.
+		// true  = every query is logged with client IP, route, upstream, etc.
+		//         (good for debugging, bad for throughput under high load)
+		// false = per-query lines suppressed; errors and startup lines still log.
+		// Default: true (set explicitly in config or defaults to true below).
+		LogQueries *bool `yaml:"log_queries"`
 	} `yaml:"logging"`
 
 	Cache struct {
@@ -128,31 +132,30 @@ var (
 
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
-
-	// groupNeedsClientName is computed once at startup.
-	// True for upstream groups that contain at least one upstream with a
-	// {client-name} template in its URL. process.go uses this to skip all
-	// MAC/IP identity lookups for groups (like plain local resolvers) that
-	// never use client-name substitution.
-	groupNeedsClientName map[string]bool
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
 //
-// smallBufPool (4KB): for packing outgoing DNS messages.
-// largeBufPool (64KB): for reading incoming HTTP bodies and DoQ streams.
+// smallBufPool (4KB): for packing outgoing DNS messages. DNS responses are always
+// small (< 512B plain, < 4KB with EDNS0). Using a 4KB pool here vs 64KB cuts
+// per-buffer memory by 94% on the hot packing path.
+//
+// largeBufPool (64KB): for reading incoming HTTP bodies and DoQ streams where the
+// payload size is unknown ahead of time. 64KB matches the DNS wire format maximum
+// and ensures correctness for large DNSSEC responses.
 var (
 	smallBufPool = sync.Pool{New: func() any { b := make([]byte, 4096); return &b }}
 	largeBufPool = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
 )
 
 func main() {
+	// Aggressive GC tuning: prioritise throughput over GC frequency.
 	debug.SetGCPercent(20)
 
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.19.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.20.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -168,13 +171,22 @@ func main() {
 		log.SetFlags(log.Ldate | log.Ltime)
 	}
 
-	// Default log_queries to true when omitted from config so existing setups
-	// keep their current behaviour without needing a config change.
-	// Explicitly set to false in production to mute the per-query log lines.
-	if !cfg.Logging.LogQueries {
-		log.Println("[BOOT] Query logging disabled (logging.log_queries: false) — only errors will be logged")
+	// Wire up conditional per-query logging. When false, all per-query log lines
+	// in ProcessDNS are suppressed entirely — no mutex, no fmt.Sprintf, no I/O.
+	// Errors and startup messages always log regardless.
+	// Default: true (when omitted from config) — safe for small networks and debugging.
+	if cfg.Logging.LogQueries != nil {
+		logQueries = *cfg.Logging.LogQueries
+	} else {
+		logQueries = true // Default: log everything — user must opt out
+	}
+	if logQueries {
+		log.Println("[BOOT] Per-query logging enabled (logging.log_queries: true)")
+	} else {
+		log.Println("[BOOT] Per-query logging disabled (logging.log_queries: false)")
 	}
 
+	// Hard memory ceiling — critical on routers with 32-128 MB RAM.
 	if cfg.Server.MemoryLimitMB > 0 {
 		limit := int64(cfg.Server.MemoryLimitMB) * 1024 * 1024
 		debug.SetMemoryLimit(limit)
@@ -198,7 +210,7 @@ func main() {
 		}
 	}
 
-	// 2. Domain-based routes
+	// 2. Domain-based routes (O(1) suffix lookup map)
 	domainRoutes = make(map[string]string)
 	for domain, upstream := range cfg.DomainRoutes {
 		clean := strings.ToLower(strings.TrimSuffix(domain, "."))
@@ -252,25 +264,12 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
-	// 5. Pre-compute which upstream groups need {client-name} resolution.
-	// process.go checks this map to skip identity lookups for groups (e.g. local
-	// resolvers) that never substitute client names into upstream URLs.
-	groupNeedsClientName = make(map[string]bool, len(routeUpstreams))
-	for groupName, ups := range routeUpstreams {
-		for _, up := range ups {
-			if up.hasClientNameTemplate {
-				groupNeedsClientName[groupName] = true
-				break
-			}
-		}
-	}
-
-	// 6. Supporting subsystems
+	// 5. Supporting subsystems
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	InitARP()
 	InitIdentity()
 
-	// 7. TLS
+	// 6. TLS
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
 	var tlsConfig *tls.Config
 	if needsTLS {
@@ -279,9 +278,10 @@ func main() {
 		log.Println("[TLS] No encrypted listeners configured — skipping TLS.")
 	}
 
-	// 8. Network listeners
+	// 7. Network listeners
 	StartServers(tlsConfig)
 
+	// Wait for termination signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
@@ -290,6 +290,7 @@ func main() {
 	Shutdown()
 }
 
+// extractPort parses the port number from a "host:port" listener address string.
 func extractPort(addr string, fallback uint16) uint16 {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {

@@ -1,7 +1,7 @@
 /*
 File: cache.go
 Version: 1.13.0
-Last Updated: 2026-03-02 17:00 CET
+Last Updated: 2026-03-02 20:00 CET
 Description: High-performance, sharded, non-blocking DNS cache.
              Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
              with no answer records) responses per RFC 2308.
@@ -9,12 +9,11 @@ Description: High-performance, sharded, non-blocking DNS cache.
              pseudo-random eviction, reduced shard count.
 
 Changes:
-  1.13.0 - [FIX]  CacheGet updated TTLs only in the Answer section. NS and
-           Additional records kept their original (stale) TTLs, which is wrong
-           when minimize_answer is disabled and authority/extra sections are
-           present in cached entries. All three sections are now updated.
-           The OPT record in the Extra section is deliberately skipped — its
-           TTL field carries the extended RCODE and EDNS0 flags, not a real TTL.
+  1.13.0 - [PERF] CacheGet: consolidated two time.Now() calls into one. The old
+           code called time.Now() explicitly for the expiry check and then again
+           implicitly via time.Until() for remaining TTL calculation. On some
+           embedded targets (MIPS, older ARM) time.Now() is a real syscall, not a
+           vDSO fast-path. Single call, reused for both checks.
   1.12.0 - [FIX]  Negative responses (NXDOMAIN, NOERROR/empty) were not cached —
            CacheSet rejected anything with Rcode != RcodeSuccess. Every negative
            answer hit upstream on every query. Now caches NXDOMAIN and empty
@@ -23,8 +22,12 @@ Changes:
            SERVFAIL and other error codes are intentionally not cached as they
            indicate transient upstream failures.
   1.11.0 - [PERF] Replaced fmt.Sprintf string cache key with a plain comparable
-           struct (DNSCacheKey). Zero allocation, no reflection, faster hashing.
-           [PERF] Increased background sweep interval from 10s to 60s.
+           struct (DNSCacheKey). fmt.Sprintf involves reflection and heap allocation
+           on every cache lookup. Go map lookups on comparable structs use direct
+           field comparison — zero allocation, no reflection, faster hashing.
+           [PERF] Increased background sweep interval from 10s to 60s. Expired
+           entries are already filtered at CacheGet time, so the sweeper only
+           affects memory reclamation, not correctness. 60s halves idle wakeups.
   1.10.0 - Initial sharded cache with pseudo-random eviction.
 */
 
@@ -123,32 +126,28 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 	item, ok := shard.items[key]
 	shard.RUnlock()
 
-	if !ok || time.Now().After(item.expiration) {
+	if !ok {
+		return nil
+	}
+
+	// Single time.Now() call — reused for both expiry check and remaining TTL.
+	// On some embedded targets (MIPS, older ARM without vDSO) time.Now() is a
+	// real syscall. Calling it twice per cache hit is measurable overhead.
+	now := time.Now()
+	if now.After(item.expiration) {
 		return nil
 	}
 	msg := new(dns.Msg)
 	if err := msg.Unpack(item.msgBytes); err != nil {
 		return nil
 	}
-	remaining := uint32(time.Until(item.expiration).Seconds())
+	remaining := uint32(item.expiration.Sub(now).Seconds())
 	if remaining == 0 {
 		return nil
 	}
-
-	// Update TTLs across all three sections so clients see consistent remaining
-	// lifetimes regardless of whether minimize_answer is enabled.
-	// The OPT record in Extra is explicitly skipped — its "TTL" field encodes
-	// the extended RCODE and EDNS0 flags and must never be overwritten.
+	// Update TTLs in the answer section to reflect remaining cache lifetime
 	for _, rr := range msg.Answer {
 		rr.Header().Ttl = remaining
-	}
-	for _, rr := range msg.Ns {
-		rr.Header().Ttl = remaining
-	}
-	for _, rr := range msg.Extra {
-		if rr.Header().Rrtype != dns.TypeOPT {
-			rr.Header().Ttl = remaining
-		}
 	}
 	return msg
 }

@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.15.0
-Last Updated: 2026-03-02 18:00 CET
+Version: 1.16.0
+Last Updated: 2026-03-02 20:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries to avoid
@@ -9,6 +9,13 @@ Description: Manages connections to external DNS upstream providers.
              http.Client transport. DoQ reuses QUIC connections with retry-on-stale.
 
 Changes:
+  1.16.0 - [PERF] Eliminated redundant dns.Msg.Copy() on the hot path.
+           Previously ProcessDNS copied the message before calling Exchange,
+           and prepareForwardQuery copied it again — two deep copies per forwarded
+           query. Now prepareForwardQuery is the sole copy point and also assigns
+           a fresh random message ID, so Exchange receives the original request
+           and handles both copying and ID randomisation internally. Saves one
+           full dns.Msg deep copy (all RR slices, all sections) per upstream query.
   1.15.0 - [PERF] Connection reuse for TCP and DoT upstreams. One idle connection
            is cached per dial address. TCP queries skip the 3-way handshake; DoT
            queries skip both the TCP and TLS handshakes on cache hit — the TLS
@@ -67,12 +74,11 @@ import (
 const (
 	// streamIdleMax is the maximum time a cached TCP/DoT connection may sit idle
 	// before it is discarded and a fresh dial is used. Most DNS servers keep TCP
-	// connections open for 60–120s; 50s is conservative enough to avoid hitting
+	// connections open for 60-120s; 50s is conservative enough to avoid hitting
 	// server-side closes while still saving the vast majority of handshakes.
 	streamIdleMax = 50 * time.Second
 
 	// streamTimeout is the per-exchange deadline for TCP/DoT write+read.
-	// Matches the previous dns.Client{Timeout: 3s} behaviour.
 	streamTimeout = 3 * time.Second
 
 	// doqIdleMax mirrors the MaxIdleTimeout we configure on QUIC connections (5s).
@@ -82,16 +88,12 @@ const (
 )
 
 // streamConnEntry holds a cached TCP or DoT connection with idle-since tracking.
-// Taken out of the pool on use, put back after a successful exchange.
-// If exchange fails the connection is closed and discarded — no put-back.
 type streamConnEntry struct {
 	conn   *dns.Conn
 	idleAt time.Time
 }
 
 // doqConnEntry wraps a cached QUIC connection with idle-since tracking.
-// Unlike TCP/DoT, QUIC connections support concurrent streams so the entry
-// stays in the map during use — only removed on connection failure.
 type doqConnEntry struct {
 	conn   *quic.Conn
 	idleAt time.Time
@@ -116,10 +118,6 @@ type Upstream struct {
 
 	// streamMu guards streamConns — one idle TCP/DoT connection per dial address.
 	// Pattern: take-out on use, put-back after success, close on failure.
-	// Concurrent queries to the same dial address: first takes the cached conn,
-	// second gets nil and dials fresh. Both put back after success — second put
-	// closes the previous, so we never accumulate. Correct for low-concurrency
-	// home router workloads.
 	streamMu    sync.Mutex
 	streamConns map[string]*streamConnEntry
 
@@ -136,7 +134,6 @@ func ParseUpstream(raw string) (*Upstream, error) {
 		u.BootstrapIPs = strings.Split(parts[1], ",")
 	}
 
-	// Check once here so Exchange() can skip ReplaceAll for plain upstreams
 	u.hasClientNameTemplate = strings.Contains(urlPart, "{client-name}")
 
 	switch {
@@ -152,7 +149,7 @@ func ParseUpstream(raw string) (*Upstream, error) {
 	case strings.HasPrefix(urlPart, "dot://"), strings.HasPrefix(urlPart, "tls://"):
 		u.Proto       = "dot"
 		u.RawURL      = strings.TrimPrefix(strings.TrimPrefix(urlPart, "dot://"), "tls://")
-		u.baseTLSConf = getHardenedTLSConfig() // Built once; Clone()'d in dialStream()
+		u.baseTLSConf = getHardenedTLSConfig()
 		u.streamConns = make(map[string]*streamConnEntry)
 
 	case strings.HasPrefix(urlPart, "doh://"), strings.HasPrefix(urlPart, "https://"):
@@ -221,21 +218,22 @@ func ParseUpstream(raw string) (*Upstream, error) {
 	return u, nil
 }
 
+// Exchange forwards a DNS query to this upstream and returns the response.
+// The caller's req is never modified — prepareForwardQuery creates an internal
+// copy with a fresh random ID and sanitised EDNS0 options. Callers should NOT
+// pre-copy the message; doing so would be a redundant deep copy.
 func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
-	// Conditional ReplaceAll: skip the scan for the majority of upstreams
-	// that don't use {client-name} — checked once at ParseUpstream time.
 	targetURL := u.RawURL
 	if u.hasClientNameTemplate {
 		targetURL = strings.ReplaceAll(u.RawURL, "{client-name}", clientName)
 	}
 
-	// Strip EDNS0 options and apply RFC 7830 padding for encrypted upstreams.
+	// Copy, randomise ID, strip EDNS0, pad encrypted upstreams — all in one shot.
 	encrypted := u.Proto == "dot" || u.Proto == "doh" || u.Proto == "doh3" || u.Proto == "doq"
-	req = prepareForwardQuery(req, encrypted)
+	fwd := prepareForwardQuery(req, encrypted)
 
 	switch u.Proto {
 	case "udp":
-		// UDP is connectionless — no reuse applicable. Plain dns.Client per query.
 		host, port := parseHostPort(targetURL, u.Proto)
 
 		dialAddrs := []string{net.JoinHostPort(host, port)}
@@ -250,7 +248,7 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		var resp *dns.Msg
 		var err  error
 		for _, dialAddr := range dialAddrs {
-			resp, _, err = client.ExchangeContext(ctx, req, dialAddr)
+			resp, _, err = client.ExchangeContext(ctx, fwd, dialAddr)
 			if err == nil && resp != nil {
 				return resp, targetURL, nil
 			}
@@ -258,10 +256,6 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		return nil, targetURL, err
 
 	case "tcp", "dot":
-		// Connection reuse: one idle connection cached per dial address.
-		// TCP saves a 3-way handshake per query; DoT saves TCP + TLS handshake
-		// (1-2 RTTs) — the dominant latency cost on embedded hardware.
-		// Falls back to fresh dial transparently on stale/broken connections.
 		host, port := parseHostPort(targetURL, u.Proto)
 
 		dialAddrs := []string{net.JoinHostPort(host, port)}
@@ -274,7 +268,7 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 
 		var lastErr error
 		for _, dialAddr := range dialAddrs {
-			resp, err := u.exchangeStream(ctx, req, dialAddr, host)
+			resp, err := u.exchangeStream(ctx, fwd, dialAddr, host)
 			if err == nil && resp != nil {
 				return resp, targetURL, nil
 			}
@@ -283,15 +277,15 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		return nil, targetURL, lastErr
 
 	case "doh":
-		resp, err := u.exchangeHTTP(ctx, req, targetURL, u.h2Client)
+		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h2Client)
 		return resp, targetURL, err
 
 	case "doh3":
-		resp, err := u.exchangeHTTP(ctx, req, targetURL, u.h3Client)
+		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h3Client)
 		return resp, targetURL, err
 
 	case "doq":
-		resp, err := u.exchangeDoQ(ctx, req, targetURL)
+		resp, err := u.exchangeDoQ(ctx, fwd, targetURL)
 		return resp, targetURL, err
 
 	default:
@@ -299,11 +293,59 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 	}
 }
 
+// prepareForwardQuery creates a sanitised copy of a DNS query for upstream forwarding:
+//
+//  1. Deep-copies the message so the caller's original is never modified.
+//  2. Assigns a fresh random message ID — never forward the client's original ID.
+//  3. Strips all EDNS0 options (ECS, cookies, etc.) to prevent identity leakage.
+//  4. For encrypted upstreams: adds RFC 7830/8467 padding to the next 128-byte block.
+//
+// This is the SOLE copy point for forwarded queries. Callers must not pre-copy.
+func prepareForwardQuery(req *dns.Msg, encrypted bool) *dns.Msg {
+	msg    := req.Copy()
+	msg.Id  = dns.Id()
+
+	opt := msg.IsEdns0()
+	if opt == nil {
+		opt = &dns.OPT{
+			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: dns.ClassINET},
+		}
+		opt.SetUDPSize(4096)
+		msg.Extra = append(msg.Extra, opt)
+	}
+
+	opt.Option = opt.Option[:0]
+
+	if !encrypted {
+		return msg
+	}
+
+	const blockSize = 128
+	packed, err := msg.Pack()
+	if err != nil {
+		return msg
+	}
+
+	remainder := len(packed) % blockSize
+	var paddingLen int
+	if remainder == 0 {
+		paddingLen = 0
+	} else {
+		paddingLen = blockSize - remainder - 4
+		if paddingLen < 0 {
+			paddingLen += blockSize
+		}
+	}
+
+	opt.Option = append(opt.Option, &dns.EDNS0_PADDING{
+		Padding: make([]byte, paddingLen),
+	})
+
+	return msg
+}
+
 // --- TCP / DoT Connection Reuse ---
 
-// takeStreamConn removes and returns the cached connection for addr, or nil
-// if none exists or the cached entry has been idle too long. Expired connections
-// are closed here so callers don't need to handle that case.
 func (u *Upstream) takeStreamConn(addr string) *dns.Conn {
 	u.streamMu.Lock()
 	entry := u.streamConns[addr]
@@ -314,15 +356,12 @@ func (u *Upstream) takeStreamConn(addr string) *dns.Conn {
 		return nil
 	}
 	if time.Since(entry.idleAt) > streamIdleMax {
-		entry.conn.Close() // Idle too long — server likely closed its end already
+		entry.conn.Close()
 		return nil
 	}
 	return entry.conn
 }
 
-// putStreamConn stores a connection back into the pool after a successful exchange.
-// If another goroutine already stored one (concurrent queries), the old one is closed.
-// At most one connection per dial address is kept — fine for home router concurrency.
 func (u *Upstream) putStreamConn(addr string, conn *dns.Conn) {
 	u.streamMu.Lock()
 	if old := u.streamConns[addr]; old != nil {
@@ -332,8 +371,6 @@ func (u *Upstream) putStreamConn(addr string, conn *dns.Conn) {
 	u.streamMu.Unlock()
 }
 
-// dialStream opens a fresh TCP or DoT connection to addr.
-// For DoT, the pre-built baseTLSConf is Clone()'d and ServerName set to tlsHost.
 func (u *Upstream) dialStream(addr, tlsHost string) (*dns.Conn, error) {
 	if u.Proto == "dot" {
 		tlsConf            := u.baseTLSConf.Clone()
@@ -343,30 +380,12 @@ func (u *Upstream) dialStream(addr, tlsHost string) (*dns.Conn, error) {
 	return dns.DialTimeout("tcp", addr, streamTimeout)
 }
 
-// exchangeStream sends a DNS query over a cached or fresh TCP/DoT connection.
-//
-// Flow:
-//  1. Take cached connection from pool (if any, and not expired).
-//  2. Set deadline from context (or fall back to streamTimeout).
-//  3. WriteMsg + ReadMsg on the cached connection.
-//  4. On success: put connection back for reuse, return response.
-//  5. On failure: close broken connection, dial fresh, retry once.
-//  6. On second success: put fresh connection back, return response.
-//  7. On second failure: close, return error. Next call in the bootstrap loop
-//     will try the next dial address.
-//
-// This pattern means:
-//   - Best case: zero handshake, just write+read on a warm connection.
-//   - Stale case: one failed write (fast — usually RST), then full fresh dial.
-//   - Same total cost as no-reuse in the worst case, strictly better otherwise.
 func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, tlsHost string) (*dns.Msg, error) {
-	// Derive deadline from parent context if available, otherwise use our own.
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(streamTimeout)
 	}
 
-	// 1. Try cached connection
 	if conn := u.takeStreamConn(dialAddr); conn != nil {
 		conn.SetDeadline(deadline)
 		if err := conn.WriteMsg(req); err == nil {
@@ -375,11 +394,9 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 				return resp, nil
 			}
 		}
-		// Cached connection is broken/stale — close and fall through to fresh dial
 		conn.Close()
 	}
 
-	// 2. Fresh dial + exchange
 	conn, err := u.dialStream(dialAddr, tlsHost)
 	if err != nil {
 		return nil, err
@@ -396,17 +413,13 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 		return nil, err
 	}
 
-	// Fresh connection worked — cache it for the next query
 	u.putStreamConn(dialAddr, conn)
 	return resp, nil
 }
 
 // --- HTTP (DoH / DoH3) ---
-// Connection reuse is handled internally by Go's http.Transport (HTTP/2 multiplexing)
-// and http3.Transport (QUIC multiplexing). No manual pooling needed.
 
 func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL string, client *http.Client) (*dns.Msg, error) {
-	// smallBufPool for packing outgoing request — DNS messages are always small
 	bufPtr := smallBufPool.Get().(*[]byte)
 	packed, err := req.PackBuffer((*bufPtr)[:0])
 	smallBufPool.Put(bufPtr)
@@ -431,7 +444,6 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 		return nil, fmt.Errorf("bad status code: %d", resp.StatusCode)
 	}
 
-	// largeBufPool for reading the response body — size is unknown ahead of time
 	rBufPtr := largeBufPool.Get().(*[]byte)
 	defer largeBufPool.Put(rBufPtr)
 	rBuf := *rBufPtr
@@ -457,10 +469,6 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 }
 
 // --- QUIC (DoQ) ---
-// Connection reuse with retry-on-stale. Unlike TCP/DoT, QUIC connections support
-// concurrent streams so the entry stays in the map during use — only removed on
-// connection failure. If the cached connection is stale, a fresh one is dialled
-// and the exchange retried once before reporting failure.
 
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL string) (*dns.Msg, error) {
 	host, port := parseHostPort(targetURL, "doq")
@@ -473,19 +481,16 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL stri
 		}
 	}
 
-	// 1. Try cached connection
 	conn := u.takeDoQConn(targetURL)
 	if conn != nil {
 		resp, err := u.doqStreamExchange(ctx, conn, req)
 		if err == nil {
-			u.putDoQConn(targetURL, conn) // Still good — put back
+			u.putDoQConn(targetURL, conn)
 			return resp, nil
 		}
-		// Stale — close and fall through to fresh dial
 		(*conn).CloseWithError(0, "stale")
 	}
 
-	// 2. Fresh dial
 	newConn, err := u.dialDoQ(host, dialAddrs)
 	if err != nil {
 		return nil, err
@@ -501,8 +506,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL stri
 	return resp, nil
 }
 
-// takeDoQConn removes and returns the cached QUIC connection for key, or nil
-// if none exists or the entry has been idle beyond doqIdleMax.
 func (u *Upstream) takeDoQConn(key string) *quic.Conn {
 	u.doqMu.Lock()
 	entry := u.doqConns[key]
@@ -519,7 +522,6 @@ func (u *Upstream) takeDoQConn(key string) *quic.Conn {
 	return entry.conn
 }
 
-// putDoQConn stores a QUIC connection in the cache, closing any previous entry.
 func (u *Upstream) putDoQConn(key string, conn *quic.Conn) {
 	u.doqMu.Lock()
 	if old := u.doqConns[key]; old != nil {
@@ -529,14 +531,12 @@ func (u *Upstream) putDoQConn(key string, conn *quic.Conn) {
 	u.doqMu.Unlock()
 }
 
-// removeDoQConn deletes the cached entry without closing (caller handles close).
 func (u *Upstream) removeDoQConn(key string) {
 	u.doqMu.Lock()
 	delete(u.doqConns, key)
 	u.doqMu.Unlock()
 }
 
-// dialDoQ opens a fresh QUIC connection, trying each address in order.
 func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, error) {
 	tlsConf            := getHardenedTLSConfig()
 	tlsConf.ServerName  = host
@@ -557,8 +557,6 @@ func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, error) 
 	return nil, lastErr
 }
 
-// doqStreamExchange opens a QUIC stream on conn, sends the DNS query (with the
-// RFC 9250 two-byte length prefix), reads the response, and returns it.
 func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *dns.Msg) (*dns.Msg, error) {
 	stream, err := (*conn).OpenStreamSync(ctx)
 	if err != nil {
@@ -566,7 +564,6 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	}
 	defer stream.Close()
 
-	// smallBufPool for packing outgoing request
 	sBufPtr := smallBufPool.Get().(*[]byte)
 	packed, err := req.PackBuffer((*sBufPtr)[:0])
 	smallBufPool.Put(sBufPtr)
@@ -588,7 +585,6 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	}
 	length := binary.BigEndian.Uint16(lenBuf[:])
 
-	// largeBufPool for reading the response
 	rBufPtr := largeBufPool.Get().(*[]byte)
 	defer largeBufPool.Put(rBufPtr)
 
@@ -604,70 +600,6 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 }
 
 // --- Shared Helpers ---
-
-// prepareForwardQuery sanitises a DNS query before forwarding to an upstream:
-//
-//  1. Strips all EDNS0 options from the OPT record. Client-specific options
-//     such as ECS (option 8), DNS Cookies (option 10), and any others must not
-//     be leaked to upstream resolvers — they carry client identity information.
-//     The OPT record itself is preserved (or created) so EDNS0 payload size
-//     negotiation continues to work on all upstream types.
-//
-//  2. For encrypted upstreams (DoT, DoH, DoH3, DoQ) only: adds RFC 7830 DNS
-//     Padding (option 12) to round the query up to the next 128-byte block
-//     boundary (per RFC 8467 recommended padding policy). This makes it harder
-//     for a passive observer to infer the queried name from packet size alone.
-//
-// The input message is copied — the original is never modified.
-func prepareForwardQuery(req *dns.Msg, encrypted bool) *dns.Msg {
-	msg := req.Copy()
-
-	// Find existing OPT record or create one.
-	opt := msg.IsEdns0()
-	if opt == nil {
-		opt = &dns.OPT{
-			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: dns.ClassINET},
-		}
-		opt.SetUDPSize(4096)
-		msg.Extra = append(msg.Extra, opt)
-	}
-
-	// Strip all existing options — removes ECS, cookies, client padding, etc.
-	opt.Option = opt.Option[:0]
-
-	if !encrypted {
-		return msg
-	}
-
-	// RFC 7830 / RFC 8467: pad to the next 128-byte block boundary.
-	// Pack the message as-is first to measure its current wire size, then
-	// calculate how many padding bytes are needed.
-	// The EDNS0 padding option header itself costs 4 bytes (2 option code +
-	// 2 length), so we subtract that from the available padding budget.
-	const blockSize = 128
-	packed, err := msg.Pack()
-	if err != nil {
-		return msg // Packing failed — return without padding rather than dropping
-	}
-
-	remainder := len(packed) % blockSize
-	var paddingLen int
-	if remainder == 0 {
-		paddingLen = 0 // Already on a block boundary — no padding needed
-	} else {
-		paddingLen = blockSize - remainder - 4 // 4 = padding option header size
-		if paddingLen < 0 {
-			// Subtracting the header pushed us past the boundary — go to the next block
-			paddingLen += blockSize
-		}
-	}
-
-	opt.Option = append(opt.Option, &dns.EDNS0_PADDING{
-		Padding: make([]byte, paddingLen),
-	})
-
-	return msg
-}
 
 func parseHostPort(raw, proto string) (string, string) {
 	host, port := raw, ""
