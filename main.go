@@ -1,12 +1,15 @@
 /*
 File: main.go
-Version: 1.16.0
-Last Updated: 2026-03-01 17:00 CET
+Version: 1.17.0
+Last Updated: 2026-03-02 16:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.17.0 - [FEAT] Added identity.poll_interval config field. Controls how often
+           hosts and lease files are checked for changes. Defaults to 30 seconds
+           when omitted or 0; enforced floor of 5 seconds (identity.go).
   1.16.0 - [FIX]  DDR SVCB port numbers were hardcoded to 443 (DoH) and 853
            (DoT/DoQ). Ports are now derived from the first configured listener
            address for each protocol at startup and stored as ddrDoHPort and
@@ -120,6 +123,12 @@ type Config struct {
 	Identity struct {
 		HostsFiles    []string `yaml:"hosts_files"`
 		DnsmasqLeases []string `yaml:"dnsmasq_leases"`
+
+		// PollInterval is the number of seconds between file-change checks.
+		// Each file is stat()'d first — I/O only happens when the mtime changed.
+		// 0 or omitted = 30 seconds (default). Floor of 5 seconds is enforced
+		// in identity.go to prevent excessive filesystem pressure on routers.
+		PollInterval int `yaml:"poll_interval"`
 	} `yaml:"identity"`
 
 	Upstreams    map[string][]string    `yaml:"upstreams"`

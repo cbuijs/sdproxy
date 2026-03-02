@@ -1,7 +1,7 @@
 /*
 File: identity.go
-Version: 1.18.0
-Last Updated: 2026-03-01 19:00 CET
+Version: 1.19.0
+Last Updated: 2026-03-02 16:00 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
@@ -17,12 +17,16 @@ Description: Parses /etc/hosts and dnsmasq lease files to extract short hostname
                the cached partial result is reused directly, skipping the open(),
                read(), and parse() entirely. /etc/hosts almost never changes;
                the dnsmasq lease file changes on every DHCP event. This means
-               most 30-second ticks are two stat() calls and a map merge, nothing
-               more. Files are read into a single []byte buffer and parsed with
+               most poll ticks are two stat() calls and a map merge, nothing more.
+               Files are read into a single []byte buffer and parsed with
                bytes.IndexByte — no bufio.Scanner overhead, no per-line string
                allocation beyond the fields we actually keep.
 
 Changes:
+  1.19.0 - [FEAT] Poll interval is now configurable via identity.poll_interval in
+           config.yaml. Defaults to 30 seconds when omitted or set to 0.
+           Log line at startup now includes the effective poll interval so it's
+           always visible without reading the config.
   1.18.0 - [FEAT] Added LookupIPsBySuffix for subdomain matching. A hosts entry
            "1.2.3.4 company.com" now also matches "www.company.com" and any
            deeper subdomain. Exact match is always tried first via LookupIPsByName;
@@ -66,9 +70,9 @@ var (
 	// identMu guards all four global maps as a unit.
 	identMu sync.RWMutex
 
-	_ipToName   = make(map[string]string)
-	_macToName  = make(map[string]string)
-	_nameToIPs  = make(map[string][]net.IP)
+	_ipToName    = make(map[string]string)
+	_macToName   = make(map[string]string)
+	_nameToIPs   = make(map[string][]net.IP)
 	_arpaToNames = make(map[string][]string)
 
 	// Per-file parse caches — keyed by absolute file path.
@@ -76,16 +80,34 @@ var (
 	fileCache = make(map[string]*parsedFile)
 )
 
+// identityPollInterval returns the configured poll interval, falling back to
+// 30 seconds when the config value is missing or zero. The lower bound of 5s
+// prevents accidental hammering of the filesystem on constrained hardware.
+func identityPollInterval() time.Duration {
+	s := cfg.Identity.PollInterval
+	if s <= 0 {
+		return 30 * time.Second // Sensible default — leases rarely change faster
+	}
+	if s < 5 {
+		s = 5 // Floor: < 5s is pointless and wasteful on a router
+	}
+	return time.Duration(s) * time.Second
+}
+
 func InitIdentity() {
 	if len(cfg.Identity.HostsFiles) == 0 && len(cfg.Identity.DnsmasqLeases) == 0 {
 		log.Println("[IDENTITY] No hosts files or lease files configured — local identity resolution disabled.")
 		return
 	}
-	log.Printf("[IDENTITY] Initialising: %d hosts file(s), %d lease file(s)",
-		len(cfg.Identity.HostsFiles), len(cfg.Identity.DnsmasqLeases))
+
+	interval := identityPollInterval()
+	log.Printf("[IDENTITY] Initialising: %d hosts file(s), %d lease file(s), poll interval: %s",
+		len(cfg.Identity.HostsFiles), len(cfg.Identity.DnsmasqLeases), interval)
+
 	go func() {
-		pollIdentity()
-		ticker := time.NewTicker(30 * time.Second)
+		pollIdentity() // Immediate first run so identity is available before the first tick
+
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
 			pollIdentity()

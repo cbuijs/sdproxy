@@ -1,10 +1,11 @@
 # File: full_reference_config.yaml
-# Version: 1.19.0
-# Last Updated: 2026-03-02 15:00 CET
+# Version: 1.20.0
+# Last Updated: 2026-03-02 16:00 CET
 # Description: sdproxy full reference configuration — Simple DNS Proxy.
 #              Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.20.0 - Added identity.poll_interval option.
 #   1.19.0 - Added flatten_cname and minimize_answer options.
 #   1.18.0 - Added strict_ptr option.
 #   1.17.0 - Added filter_aaaa option.
@@ -112,10 +113,10 @@ cache:
 #   1. {client-name} substitution in upstream URLs (e.g. ControlD per-device routing)
 #   2. Local A/AAAA/PTR resolution without forwarding to upstream
 #
-# Files are polled every 30 seconds. Each file is stat()'d first — re-parsing
-# only occurs when the modification time has changed, keeping poll overhead minimal.
-# A full fresh-map rebuild each cycle automatically evicts stale entries for
-# devices that changed IP or left the network.
+# Files are polled every poll_interval seconds. Each file is stat()'d first —
+# re-parsing only occurs when the modification time has changed, keeping poll
+# overhead minimal. A full fresh-map rebuild each cycle automatically evicts
+# stale entries for devices that changed IP or left the network.
 #
 # Hosts file entries support subdomain matching: "1.2.3.4 company.com" also
 # answers for "www.company.com", "bla.amsterdam.company.com", etc.
@@ -128,6 +129,15 @@ identity:
   #   Pi-hole:       /etc/pihole/dhcp.leases
   #   Generic Linux: /var/lib/misc/dnsmasq.leases
   dnsmasq_leases: ["/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases"]
+
+  # How often to check hosts and lease files for changes, in seconds.
+  # Each file is only stat()'d — actual I/O and map rebuilds only happen when
+  # the mtime changed, so short intervals are cheap on a quiet network.
+  # Default (0 or omitted): 30 seconds.
+  # Floor: 5 seconds — lower values are clamped to prevent router filesystem pressure.
+  # For dynamic networks with frequent DHCP churn, 10–15s is a reasonable middle ground.
+  # For mostly-static setups where /etc/hosts rarely changes, 60–120s is fine.
+  poll_interval: 30
 
 # UPSTREAM GROUPS
 # Each group is a named list of upstream resolvers tried in order until one
