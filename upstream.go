@@ -1,20 +1,25 @@
 /*
 File: upstream.go
-Version: 1.13.0
-Last Updated: 2026-03-01 14:00 CET
+Version: 1.14.0
+Last Updated: 2026-03-02 13:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
 
 Changes:
+  1.14.0 - [FEAT] prepareForwardQuery strips all EDNS0 options from outgoing
+           queries to prevent leaking client-specific data (ECS, cookies, etc.)
+           to upstream resolvers. For encrypted upstreams (DoT, DoH, DoH3, DoQ),
+           RFC 7830 / RFC 8467 DNS padding is added to round the query up to the
+           next 128-byte block boundary, making traffic analysis harder.
+           OPT record is always preserved (or created) so EDNS0 payload size
+           negotiation continues to work on all upstream types.
   1.13.0 - [PERF] Added hasClientNameTemplate bool to Upstream — checked once at
-           ParseUpstream time. Avoids scanning RawURL for "{client-name}" on every
-           single DNS query for the majority of upstreams that don't use it.
+           ParseUpstream time. Avoids scanning RawURL on every DNS query for
+           upstreams without {client-name}.
            [PERF] Added baseTLSConf *tls.Config to Upstream for DoT — the hardened
-           TLS config (cipher suites, curves) is built once at parse time and
-           Clone()'d per connection. Clone is significantly cheaper than a full
-           struct + slice rebuild via getHardenedTLSConfig() on every DoT exchange.
+           TLS config is built once at parse time and Clone()'d per connection.
            [PERF] Uses tiered buffer pools: smallBufPool (4KB) for message packing,
-           largeBufPool (64KB) for stream/HTTP body reads where size is unknown.
+           largeBufPool (64KB) for stream/HTTP body reads.
   1.12.0 - Exchange returns actual resolved URL for accurate logging.
 */
 
@@ -64,7 +69,7 @@ type Upstream struct {
 func ParseUpstream(raw string) (*Upstream, error) {
 	u := &Upstream{}
 
-	parts  := strings.Split(raw, "#")
+	parts   := strings.Split(raw, "#")
 	urlPart := parts[0]
 	if len(parts) > 1 {
 		u.BootstrapIPs = strings.Split(parts[1], ",")
@@ -83,8 +88,8 @@ func ParseUpstream(raw string) (*Upstream, error) {
 		u.RawURL = strings.TrimPrefix(urlPart, "tcp://")
 
 	case strings.HasPrefix(urlPart, "dot://"), strings.HasPrefix(urlPart, "tls://"):
-		u.Proto      = "dot"
-		u.RawURL     = strings.TrimPrefix(strings.TrimPrefix(urlPart, "dot://"), "tls://")
+		u.Proto       = "dot"
+		u.RawURL      = strings.TrimPrefix(strings.TrimPrefix(urlPart, "dot://"), "tls://")
 		u.baseTLSConf = getHardenedTLSConfig() // Built once; Clone()'d in Exchange()
 
 	case strings.HasPrefix(urlPart, "doh://"), strings.HasPrefix(urlPart, "https://"):
@@ -161,6 +166,10 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		targetURL = strings.ReplaceAll(u.RawURL, "{client-name}", clientName)
 	}
 
+	// Strip EDNS0 options and apply RFC 7830 padding for encrypted upstreams.
+	encrypted := u.Proto == "dot" || u.Proto == "doh" || u.Proto == "doh3" || u.Proto == "doq"
+	req = prepareForwardQuery(req, encrypted)
+
 	switch u.Proto {
 	case "udp", "tcp", "dot":
 		host, port := parseHostPort(targetURL, u.Proto)
@@ -177,8 +186,8 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		if u.Proto == "dot" {
 			// Clone the pre-built config (set in ParseUpstream) and add ServerName.
 			// Clone is O(copy) vs getHardenedTLSConfig() which allocates fresh slices.
-			tlsConf            := u.baseTLSConf.Clone()
-			tlsConf.ServerName  = host
+			tlsConf           := u.baseTLSConf.Clone()
+			tlsConf.ServerName = host
 			client = &dns.Client{Net: "tcp-tls", Timeout: 3 * time.Second, TLSConfig: tlsConf}
 		} else {
 			client = &dns.Client{Net: u.Proto, Timeout: 3 * time.Second}
@@ -209,6 +218,70 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 	default:
 		return nil, targetURL, errors.New("unknown protocol")
 	}
+}
+
+// prepareForwardQuery sanitises a DNS query before forwarding to an upstream:
+//
+//  1. Strips all EDNS0 options from the OPT record. Client-specific options
+//     such as ECS (option 8), DNS Cookies (option 10), and any others must not
+//     be leaked to upstream resolvers — they carry client identity information.
+//     The OPT record itself is preserved (or created) so EDNS0 payload size
+//     negotiation continues to work on all upstream types.
+//
+//  2. For encrypted upstreams (DoT, DoH, DoH3, DoQ) only: adds RFC 7830 DNS
+//     Padding (option 12) to round the query up to the next 128-byte block
+//     boundary (per RFC 8467 recommended padding policy). This makes it harder
+//     for a passive observer to infer the queried name from packet size alone.
+//
+// The input message is copied — the original is never modified.
+func prepareForwardQuery(req *dns.Msg, encrypted bool) *dns.Msg {
+	msg := req.Copy()
+
+	// Find existing OPT record or create one.
+	opt := msg.IsEdns0()
+	if opt == nil {
+		opt = &dns.OPT{
+			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: dns.ClassINET},
+		}
+		opt.SetUDPSize(4096)
+		msg.Extra = append(msg.Extra, opt)
+	}
+
+	// Strip all existing options — removes ECS, cookies, client padding, etc.
+	opt.Option = opt.Option[:0]
+
+	if !encrypted {
+		return msg
+	}
+
+	// RFC 7830 / RFC 8467: pad to the next 128-byte block boundary.
+	// Pack the message as-is first to measure its current wire size, then
+	// calculate how many padding bytes are needed.
+	// The EDNS0 padding option header itself costs 4 bytes (2 option code +
+	// 2 length), so we subtract that from the available padding budget.
+	const blockSize = 128
+	packed, err := msg.Pack()
+	if err != nil {
+		return msg // Packing failed — return without padding rather than dropping
+	}
+
+	remainder := len(packed) % blockSize
+	var paddingLen int
+	if remainder == 0 {
+		paddingLen = 0 // Already on a block boundary — no padding needed
+	} else {
+		paddingLen = blockSize - remainder - 4 // 4 = padding option header size
+		if paddingLen < 0 {
+			// Subtracting the header pushed us past the boundary — go to the next block
+			paddingLen += blockSize
+		}
+	}
+
+	opt.Option = append(opt.Option, &dns.EDNS0_PADDING{
+		Padding: make([]byte, paddingLen),
+	})
+
+	return msg
 }
 
 func parseHostPort(raw, proto string) (string, string) {
@@ -295,9 +368,9 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL stri
 	u.doqMu.Lock()
 	conn, exists := u.doqConns[targetURL]
 	if !exists || conn == nil {
-		tlsConf            := getHardenedTLSConfig()
-		tlsConf.ServerName  = host
-		tlsConf.NextProtos  = []string{"doq"}
+		tlsConf           := getHardenedTLSConfig()
+		tlsConf.ServerName = host
+		tlsConf.NextProtos = []string{"doq"}
 
 		var newConn  *quic.Conn
 		var connErr  error
@@ -353,7 +426,7 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL stri
 	}
 	length := binary.BigEndian.Uint16(lenBuf[:])
 
-	// largeBufPool for reading the response — length known but could be up to 65535
+	// largeBufPool for reading the response
 	rBufPtr := largeBufPool.Get().(*[]byte)
 	defer largeBufPool.Put(rBufPtr)
 

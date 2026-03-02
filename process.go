@@ -1,18 +1,24 @@
 /*
 File: process.go
-Version: 1.25.0
-Last Updated: 2026-03-02 12:00 CET
+Version: 1.26.0
+Last Updated: 2026-03-02 15:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
-  1.25.0 - [FEAT] Strict PTR validation now also syntax-checks the address
-           portion of the query, not just the suffix. IPv4: 1-4 dot-separated
-           labels each 0-255, no leading zeros. IPv6: exactly 32 single hex
-           nibble labels. Malformed addresses rejected with NXDOMAIN.
-  1.24.0 - [FEAT] Added strict PTR validation (step 0b). When cfg.Server.StrictPTR
+  1.26.0 - [FEAT] Added transformResponse, flattenCNAMEChain, and minimizeAnswer
+           helpers. When flatten_cname is enabled, CNAME chains in A/AAAA responses
+           are collapsed into a single synthesized record under the original query
+           name using the minimum TTL across the chain. When minimize_answer is
+           enabled, authority and additional sections are stripped before caching
+           and replying. Both transforms are applied after upstream forwarding and
+           before CacheSet so cached entries are already transformed. Local identity
+           responses are not transformed (already minimal, no CNAME chains).
+           Trade-off: minimize_answer strips SOA from negative responses — those
+           entries fall back to cache.min_ttl for their negative cache TTL.
+  1.25.0 - [FEAT] Strict PTR address syntax validation. When cfg.Server.StrictPTR
            is true, PTR queries not ending in ".in-addr.arpa" or ".ip6.arpa" are
            rejected with NXDOMAIN before touching anything else in the pipeline.
   1.23.0 - [FEAT] Added AAAA filter (step 0a). When cfg.Server.FilterAAAA is true,
@@ -374,6 +380,13 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
+	// --- 8. Response Transforms ---
+	// CNAME flattening and/or answer minimization applied before caching so
+	// that cached entries and cache hits are already in the transformed form.
+	// Local identity responses (step 2) bypass this — they have no CNAME chains
+	// and no authority/additional sections to strip.
+	finalResp = transformResponse(finalResp, q.Qtype)
+
 	// --- 9. Cache & Reply ---
 	CacheSet(cacheKey, finalResp)
 	finalResp.Id = originalID
@@ -381,6 +394,107 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 	log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | UPSTREAM: %s | OK",
 		protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, upstreamUsed)
+}
+
+// --- Response Transform Helpers ---
+
+// transformResponse applies the configured response transforms to an upstream
+// answer before it is cached and sent to the client. Returns the original
+// message unchanged when both transforms are disabled.
+func transformResponse(msg *dns.Msg, qtype uint16) *dns.Msg {
+	if msg == nil || (!cfg.Server.FlattenCNAME && !cfg.Server.MinimizeAnswer) {
+		return msg
+	}
+
+	out := msg.Copy()
+
+	// CNAME flattening: collapse chains for A/AAAA queries into a single
+	// synthesized record. Applied before minimization so the full answer
+	// section is available for chain walking.
+	if cfg.Server.FlattenCNAME {
+		out = flattenCNAMEChain(out, qtype)
+	}
+
+	// Answer minimization: strip authority and additional sections.
+	// Trade-off: SOA TTL for negative caching is lost — CacheSet falls back
+	// to cfg.Cache.MinTTL for NXDOMAIN/NODATA entries when this is enabled.
+	if cfg.Server.MinimizeAnswer {
+		out.Ns    = nil
+		out.Extra = nil
+	}
+
+	return out
+}
+
+// flattenCNAMEChain collapses a CNAME chain in an A or AAAA response.
+//
+// Transforms:
+//   "name CNAME a; a CNAME b; b A 1.2.3.4"  ->  "name A 1.2.3.4"
+//
+// The synthesized records use the original query name and the minimum TTL
+// across every record in the chain — this ensures the cached flat record
+// does not outlive any individual CNAME link.
+//
+// Returns the message unchanged if:
+//   - Rcode is not NOERROR (negative responses are never flattened)
+//   - Query type is not A or AAAA
+//   - No CNAME records are present in the answer
+//   - No final address records are found (degenerate / dangling chain)
+func flattenCNAMEChain(msg *dns.Msg, qtype uint16) *dns.Msg {
+	if msg.Rcode != dns.RcodeSuccess {
+		return msg // Never flatten NXDOMAIN or other negative responses
+	}
+	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
+		return msg // Only meaningful for address queries
+	}
+
+	// Fast path: no CNAMEs in answer — nothing to flatten
+	hasCNAME := false
+	for _, rr := range msg.Answer {
+		if rr.Header().Rrtype == dns.TypeCNAME {
+			hasCNAME = true
+			break
+		}
+	}
+	if !hasCNAME {
+		return msg
+	}
+
+	// Walk the answer section: collect final address records and the minimum
+	// TTL seen across every record (CNAME + final) in the chain.
+	minTTL      := ^uint32(0) // Start at max, take minimum as we go
+	var addrRRs []dns.RR
+
+	for _, rr := range msg.Answer {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+		}
+		if rr.Header().Rrtype == qtype {
+			addrRRs = append(addrRRs, rr)
+		}
+	}
+
+	// Degenerate chain (CNAME with no final address records) — return as-is
+	// so the client can see the partial response rather than an empty answer.
+	if len(addrRRs) == 0 {
+		return msg
+	}
+	if minTTL == ^uint32(0) {
+		minTTL = 0
+	}
+
+	// Synthesize flat records: original query name + minimum chain TTL.
+	qname := msg.Question[0].Name
+	flat  := make([]dns.RR, 0, len(addrRRs))
+	for _, rr := range addrRRs {
+		c              := dns.Copy(rr)
+		c.Header().Name = qname
+		c.Header().Ttl  = minTTL
+		flat = append(flat, c)
+	}
+
+	msg.Answer = flat
+	return msg
 }
 
 // --- PTR Validation Helpers ---

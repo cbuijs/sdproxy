@@ -1,33 +1,45 @@
-# File: config.yaml
-# Version: 1.15.0
-# Last Updated: 2026-03-01 14:00 CET
-# Description: sdproxy configuration — Simple DNS Proxy (Ultra-Low Memory Profile).
-#              All options are documented inline; no separate manual needed.
+# File: full_reference_config.yaml
+# Version: 1.19.0
+# Last Updated: 2026-03-02 15:00 CET
+# Description: sdproxy full reference configuration — Simple DNS Proxy.
+#              Every option is documented inline. No separate manual needed.
 #
 # Changes:
-#   1.15.0 - Added memory_limit_mb under server. Sets a hard RSS ceiling via
-#            Go's runtime/debug.SetMemoryLimit. Critical on routers with 32–128 MB
-#            RAM where the Go GC has no visibility into total available memory.
-#            0 = disabled (safe default). Start with (device_ram_mb - 10).
-#   1.14.0 - Added domain_routes for suffix-based upstream override.
+#   1.19.0 - Added flatten_cname and minimize_answer options.
+#   1.18.0 - Added strict_ptr option.
+#   1.17.0 - Added filter_aaaa option.
+#   1.16.0 - Added memory_limit_mb option. DDR ports derived from listeners.
+#   1.15.0 - Added domain_routes section.
+#   1.14.0 - Added identity section.
 
 server:
+  # Listener addresses. Multiple addresses supported per protocol.
+  # Omit any section to disable that protocol entirely.
   listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
   listen_tcp: ["0.0.0.0:53"]
   listen_dot: ["0.0.0.0:853"]
-  listen_doh: ["0.0.0.0:443"]
-  listen_doq: ["0.0.0.0:853"]
+  listen_doh: ["0.0.0.0:443"]   # Serves HTTP/1.1, HTTP/2, and HTTP/3 (QUIC)
+  listen_doq: ["0.0.0.0:853"]   # DNS over QUIC — RFC 9250
 
+  # Number of goroutines in the UDP worker pool.
+  # On constrained routers, match this to your expected peak concurrent queries.
+  # Excess queries are dropped (load shedding) when the pool is saturated.
   udp_workers: 10
 
+  # TLS certificate and key for DoT, DoH, and DoQ listeners.
+  # Leave both empty to auto-generate an ephemeral self-signed certificate.
+  # For production use, point these at a valid certificate (e.g. from Let's Encrypt).
   tls_cert: ""
   tls_key: ""
 
-  # Hard memory ceiling for the Go runtime. Without this, the GC has no knowledge
-  # of how much RAM the device has and may allocate too aggressively.
-  # Recommended: set to (total_device_ram_mb - 10).
-  # Examples: 22 for a 32 MB router, 54 for a 64 MB router, 118 for 128 MB.
-  # 0 = disabled (default — fine for full-size machines, tune for embedded targets).
+  # Hard memory ceiling for the Go runtime via debug.SetMemoryLimit.
+  # Without this, Go's GC has no knowledge of total device RAM and may allocate
+  # too aggressively on constrained hardware.
+  # Recommended: (total_device_ram_mb - 10). Examples:
+  #   22  — 32 MB router
+  #   54  — 64 MB router
+  #   118 — 128 MB router
+  # 0 = disabled (default — fine for full-size machines).
   memory_limit_mb: 0
 
   # Filter all AAAA (IPv6) queries by returning an empty NOERROR response.
@@ -38,55 +50,210 @@ server:
 
   # Strict PTR validation — reject PTR queries that are not valid reverse-lookup
   # addresses. Valid forms: *.in-addr.arpa (IPv4) and *.ip6.arpa (IPv6).
+  # The address portion is also syntax-checked (octet range, nibble format).
   # PTR queries for arbitrary hostnames (e.g. "ptr.example.com") are answered
   # with NXDOMAIN instead of being forwarded upstream.
-  # false = disabled (default). true = non-reverse PTR queries rejected.
+  # false = disabled (default). true = invalid PTR queries rejected.
   strict_ptr: false
 
+  # CNAME flattening — collapse CNAME chains in A/AAAA responses into a single
+  # synthesized record directly under the original query name. Intermediate CNAME
+  # records are removed. TTL is set to the minimum across the entire chain.
+  # Applied before caching so cache hits also return flat records.
+  # No effect on non-A/AAAA queries, NXDOMAIN, or responses with no CNAMEs.
+  # false = disabled (default).
+  flatten_cname: false
+
+  # Answer minimization — strip authority (NS) and additional sections from
+  # responses before caching and sending to clients. Reduces response size and
+  # avoids leaking internal zone structure to clients.
+  # Trade-off: negative responses (NXDOMAIN/NODATA) lose their SOA record and
+  # will use cache.min_ttl for negative cache TTL rather than the zone's own
+  # designated negative TTL.
+  # false = disabled (default).
+  minimize_answer: false
+
+  # Discovery of Designated Resolvers (DDR) — RFC 9462.
+  # When enabled, sdproxy intercepts _dns.resolver.arpa SVCB queries and
+  # responds with SVCB records advertising its own encrypted DNS endpoints.
+  # Also spoofs A/AAAA lookups for the configured hostnames so clients can
+  # resolve them without hitting an upstream.
+  # Ports are derived automatically from the first configured listener address
+  # for each protocol (listen_doh -> DoH port, listen_dot -> DoT/DoQ port).
   ddr:
     enabled: true
     hostnames: ["dns.local.net", "doh.local.net"]
     ipv4: "192.168.1.100"
-    ipv6: ""
+    ipv6: ""   # Leave empty to omit IPv6 SVCB hints and glue records
 
 logging:
+  # strip_time: true removes the date/time prefix from log lines.
+  # Useful when running under a supervisor (systemd, procd) that adds its own
+  # timestamps, avoiding duplicate timestamp output in logs.
   strip_time: false
 
 cache:
   enabled: true
+
+  # Total number of DNS response entries to hold across all cache shards.
+  # Memory cost is approximately (size * avg_response_bytes) / shardCount.
+  # 1024 is suitable for a typical home network with ~50 active devices.
   size: 1024
+
+  # Minimum TTL in seconds applied to all cached responses.
+  # Prevents thrashing for records with very short TTLs (< 60s).
+  # Also used as the fallback negative cache TTL when no SOA is present
+  # (e.g. when minimize_answer is enabled).
   min_ttl: 60
 
-# IDENTITY RESOLUTION: Extracts short hostnames for {client-name} substitution
-# and local A/AAAA/PTR resolution. Polled every 30 seconds.
-# Maps are fully rebuilt each cycle — stale entries (devices that left or changed IP)
-# are automatically evicted rather than accumulating indefinitely.
+# IDENTITY RESOLUTION
+# Extracts short hostnames from hosts files and dnsmasq lease files for two
+# purposes:
+#   1. {client-name} substitution in upstream URLs (e.g. ControlD per-device routing)
+#   2. Local A/AAAA/PTR resolution without forwarding to upstream
+#
+# Files are polled every 30 seconds. Each file is stat()'d first — re-parsing
+# only occurs when the modification time has changed, keeping poll overhead minimal.
+# A full fresh-map rebuild each cycle automatically evicts stale entries for
+# devices that changed IP or left the network.
+#
+# Hosts file entries support subdomain matching: "1.2.3.4 company.com" also
+# answers for "www.company.com", "bla.amsterdam.company.com", etc.
+# Blocklist-style entries (0.0.0.0 ads.example.com) are handled correctly —
+# only exact and subdomain matches are returned, never partial label matches.
 identity:
   hosts_files: ["/etc/hosts"]
+  # Point at your dnsmasq lease file — location varies by platform:
+  #   OpenWrt:       /tmp/dhcp.leases
+  #   Pi-hole:       /etc/pihole/dhcp.leases
+  #   Generic Linux: /var/lib/misc/dnsmasq.leases
   dnsmasq_leases: ["/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases"]
 
+# UPSTREAM GROUPS
+# Each group is a named list of upstream resolvers tried in order until one
+# succeeds. The "default" group is required — all other groups are optional and
+# referenced by name from routes and domain_routes.
+#
+# PROTOCOL SCHEMES
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   udp://host:port
+#     Plain DNS over UDP (RFC 1035). Fast, no overhead, no privacy.
+#     Default port: 53.
+#     Example: "udp://1.1.1.1:53"
+#
+#   tcp://host:port
+#     Plain DNS over TCP (RFC 1035). Used when responses exceed 512 bytes or
+#     when UDP is blocked. No privacy.
+#     Default port: 53.
+#     Example: "tcp://8.8.8.8:53"
+#
+#   dot://host:port
+#     DNS over TLS (DoT — RFC 7858). Encrypted. The host value is used for TLS
+#     SNI (Server Name Indication) so it must match the upstream's certificate.
+#     Default port: 853.
+#     Example: "dot://dns.quad9.net:853"
+#
+#   doh://host/path
+#     DNS over HTTPS using HTTP/2 with HTTP/1.1 fallback (DoH — RFC 8484).
+#     Encrypted. Queries are sent as POST requests with content-type
+#     application/dns-message. The full URL after "doh://" becomes "https://".
+#     Default port: 443 (implicit in the HTTPS scheme).
+#     Example: "doh://cloudflare-dns.com/dns-query"
+#              "doh://doh.quad9.net:5053/dns-query"   (non-standard port)
+#
+#   doh3://host/path
+#     DNS over HTTP/3 / QUIC (DoH3). Encrypted. Same semantics as doh:// but
+#     uses QUIC transport instead of TCP. Faster connection establishment
+#     (0-RTT) and better performance on lossy links. Falls back to doh:// if
+#     you configure both in the same group.
+#     Default port: 443 (implicit in the HTTPS scheme).
+#     Example: "doh3://security.cloudflare-dns.com/dns-query"
+#
+#   doq://host:port
+#     DNS over QUIC (DoQ — RFC 9250). Encrypted. Lower latency than DoT for
+#     the same privacy level. Distinct from DoH3 — no HTTP layer, raw DNS
+#     messages over a QUIC stream.
+#     Default port: 853.
+#     Example: "doq://dns.adguard.com:853"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# BOOTSTRAP IPs  (appended after #, comma-separated)
+#
+#   Bypasses DNS resolution for the upstream hostname itself, preventing a
+#   chicken-and-egg problem where resolving the upstream requires the upstream.
+#   Multiple IPs are tried in order; the first reachable one is used.
+#   Required for any upstream whose hostname is not a bare IP address.
+#
+#   Syntax:  "scheme://host/path#ip1,ip2"
+#   Example: "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
+#            "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
+#            "doq://dns.adguard.com:853#94.140.14.14,94.140.15.15"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# {client-name} SUBSTITUTION
+#
+#   The literal string {client-name} anywhere in the URL is replaced at query
+#   time with the resolved short hostname of the requesting device. Resolution
+#   order: explicit routes override -> MAC lookup (dnsmasq leases) -> IP lookup
+#   (hosts file / leases) -> hyphenated MAC -> hyphenated IP.
+#
+#   This enables per-device upstream routing with providers that support it,
+#   such as ControlD (https://controld.com) where each device gets its own
+#   resolver profile via a unique URL slug.
+#
+#   The substitution only runs for upstreams whose URL contains the placeholder —
+#   checked once at startup, not on every query.
+#
+#   Syntax:  "doh://provider.com/{client-name}"
+#   Example: "doh://doh.controld.com/{client-name}"
+#            "doh://doh.controld.com/p/{client-name}/strict"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# COMBINING BOOTSTRAP IPs AND {client-name}
+#
+#   Both can be used together. Bootstrap IPs follow the # separator after the
+#   full URL (including the substitution placeholder).
+#
+#   Example: "doh://doh.controld.com/{client-name}#76.76.2.0,76.76.10.0"
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVACY NOTE
+#
+#   All outgoing queries have their EDNS0 options stripped before forwarding
+#   (removes ECS, DNS cookies, and any other client-identifying options).
+#   Encrypted upstreams (DoT, DoH, DoH3, DoQ) additionally have RFC 7830 /
+#   RFC 8467 padding applied to obscure query name length from passive observers.
+#
 upstreams:
   default:
     - "udp://1.1.1.1:53"
     - "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
   kids:
     - "tcp://1.1.1.3:53"
-    - "doh://doh.controld.com/{client-name}"  # {client-name} resolved per-client at query time
+    - "doh://doh.controld.com/{client-name}#76.76.2.0,76.76.10.0"
   secure:
     - "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
     - "doh3://security.cloudflare-dns.com/dns-query#1.1.1.2,1.0.0.2"
   local_network:
     - "udp://192.168.1.1:53"
 
+# MAC-BASED ROUTES
+# Maps a client MAC address to a specific upstream group and/or a fixed
+# {client-name} override. Takes priority over dynamic identity resolution.
+# MAC addresses are normalized (lowercase colon-separated) on load.
 routes:
-  # Explicit MAC overrides take priority over dynamic identity resolution.
   "00:11:22:33:44:55":
     upstream: "kids"
     client_name: "kids-ipad-override"
 
+# DOMAIN-BASED ROUTES
+# High-performance suffix matching — checked before the cache and upstream
+# selection. If the queried domain ends in any configured suffix, it is routed
+# to the specified upstream group regardless of which client sent the query.
+# Uses a zero-allocation label-walk (same pattern as getDomainRoute in process.go).
+# Overrides client-based routing when a match is found.
 domain_routes:
-  # Suffix-based routing — matched before the cache lookup, overrides client route.
-  # Zero-allocation label-by-label walk: O(labels) lookup, no string allocation.
   "lan":           "local_network"
   "local":         "local_network"
   "home.arpa":     "local_network"

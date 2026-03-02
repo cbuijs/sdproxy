@@ -82,6 +82,23 @@ type Config struct {
 		// false = disabled (default). true = non-reverse PTR queries rejected.
 		StrictPTR bool `yaml:"strict_ptr"`
 
+		// FlattenCNAME collapses CNAME chains in A/AAAA responses into a single
+		// synthesized record directly under the original query name, removing all
+		// intermediate CNAME records. TTL is set to the minimum across the entire
+		// chain so no link's TTL is exceeded. Applied before caching so cache hits
+		// also return flat records. No effect on non-A/AAAA queries or NXDOMAIN.
+		// false = disabled (default).
+		FlattenCNAME bool `yaml:"flatten_cname"`
+
+		// MinimizeAnswer strips the authority (NS) and additional sections from
+		// responses before caching and sending to clients — only the answer section
+		// is returned. Reduces response size and avoids leaking internal zone data.
+		// Trade-off: with this enabled, negative responses (NXDOMAIN/NODATA) lose
+		// their SOA record and will use cache.min_ttl for negative cache TTL instead
+		// of the zone's designated negative TTL.
+		// false = disabled (default).
+		MinimizeAnswer bool `yaml:"minimize_answer"`
+
 		DDR struct {
 			Enabled   bool     `yaml:"enabled"`
 			Hostnames []string `yaml:"hostnames"`
@@ -155,7 +172,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.18.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.19.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {

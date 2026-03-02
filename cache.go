@@ -1,12 +1,21 @@
 /*
 File: cache.go
-Version: 1.11.0
-Last Updated: 2026-03-01 14:00 CET
+Version: 1.12.0
+Last Updated: 2026-03-02 14:00 CET
 Description: High-performance, sharded, non-blocking DNS cache.
+             Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
+             with no answer records) responses per RFC 2308.
              Optimised for embedded: struct-based zero-allocation cache keys,
              pseudo-random eviction, reduced shard count.
 
 Changes:
+  1.12.0 - [FIX]  Negative responses (NXDOMAIN, NOERROR/empty) were not cached —
+           CacheSet rejected anything with Rcode != RcodeSuccess. Every negative
+           answer hit upstream on every query. Now caches NXDOMAIN and empty
+           NOERROR per RFC 2308 using the SOA minimum TTL from the authority
+           section. Falls back to cfg.Cache.MinTTL when no SOA is present.
+           SERVFAIL and other error codes are intentionally not cached as they
+           indicate transient upstream failures.
   1.11.0 - [PERF] Replaced fmt.Sprintf string cache key with a plain comparable
            struct (DNSCacheKey). fmt.Sprintf involves reflection and heap allocation
            on every cache lookup. Go map lookups on comparable structs use direct
@@ -14,7 +23,7 @@ Changes:
            [PERF] Increased background sweep interval from 10s to 60s. Expired
            entries are already filtered at CacheGet time, so the sweeper only
            affects memory reclamation, not correctness. 60s halves idle wakeups.
-  1.10.0 - Initial sharded cache with string keys and pseudo-random eviction.
+  1.10.0 - Initial sharded cache with pseudo-random eviction.
 */
 
 package main
@@ -89,8 +98,8 @@ func InitCache(maxSize int, minTTL int) {
 	}()
 }
 
-// getShard hashes the struct fields via maphash (which requires bytes/strings).
-// Field order: Name first (highest entropy for DNS workloads), then type/class, then route.
+// getShard hashes the struct fields via maphash.
+// Name first (highest entropy for DNS workloads), then type/class, then route.
 func getShard(key DNSCacheKey) *cacheShard {
 	var h maphash.Hash
 	h.SetSeed(seed)
@@ -123,6 +132,7 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 	if remaining == 0 {
 		return nil
 	}
+	// Update TTLs in the answer section to reflect remaining cache lifetime
 	for _, rr := range msg.Answer {
 		rr.Header().Ttl = remaining
 	}
@@ -130,32 +140,78 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 }
 
 func CacheSet(key DNSCacheKey, msg *dns.Msg) {
-	if !cfg.Cache.Enabled || msg == nil || msg.Rcode != dns.RcodeSuccess {
+	if !cfg.Cache.Enabled || msg == nil {
 		return
 	}
-	var minTTL uint32 = 3600
-	found := false
-	for _, rr := range msg.Answer {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
-			found = true
+
+	// Cacheable rcodes per RFC 2308:
+	//   NOERROR  (0) — positive answer or empty (NOERROR/NODATA)
+	//   NXDOMAIN (3) — name does not exist
+	// Everything else (SERVFAIL, REFUSED, FORMERR, etc.) indicates a transient
+	// or policy failure at the upstream — never cache these.
+	switch msg.Rcode {
+	case dns.RcodeSuccess, dns.RcodeNameError:
+		// Cacheable — fall through
+	default:
+		return
+	}
+
+	// Determine TTL depending on response type:
+	//
+	// Positive (NOERROR with answers): use the minimum TTL across answer RRs.
+	//
+	// Negative (NXDOMAIN or NOERROR with no answers — RFC 2308 §5):
+	//   Use the SOA MINIMUM field from the authority section if present,
+	//   as this is the TTL the zone owner has designated for negative caching.
+	//   Fall back to cfg.Cache.MinTTL when no SOA is available (e.g. when
+	//   minimize_answer is enabled and Ns section has been stripped).
+	var ttl uint32
+	if msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0 {
+		// Positive response — minimum TTL across all answer records
+		ttl = ^uint32(0) // max uint32 as starting value
+		for _, rr := range msg.Answer {
+			if rr.Header().Ttl < ttl {
+				ttl = rr.Header().Ttl
+			}
+		}
+	} else {
+		// Negative response (NXDOMAIN or NOERROR/NODATA) — use SOA minimum
+		ttl = 0
+		for _, rr := range msg.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				// RFC 2308 §5: negative TTL = min(SOA TTL, SOA MINIMUM field)
+				soaTTL := soa.Hdr.Ttl
+				if soa.Minttl < soaTTL {
+					soaTTL = soa.Minttl
+				}
+				ttl = soaTTL
+				break
+			}
+		}
+		if ttl == 0 {
+			// No SOA in authority section — fall back to configured minimum.
+			// This is the normal path when minimize_answer is enabled since
+			// the Ns section is stripped before CacheSet is called.
+			ttl = uint32(cfg.Cache.MinTTL)
 		}
 	}
-	if !found {
-		return
+
+	// Never cache below the configured floor
+	if int(ttl) < cfg.Cache.MinTTL {
+		ttl = uint32(cfg.Cache.MinTTL)
 	}
-	if int(minTTL) < cfg.Cache.MinTTL {
-		minTTL = uint32(cfg.Cache.MinTTL)
-	}
+
 	packed, err := msg.Pack()
 	if err != nil {
 		return
 	}
-	expiration  := time.Now().Add(time.Duration(minTTL) * time.Second)
+
+	expiration  := time.Now().Add(time.Duration(ttl) * time.Second)
 	maxPerShard := cfg.Cache.Size / shardCount
 	if maxPerShard < 1 {
 		maxPerShard = 1
 	}
+
 	shard := getShard(key)
 	shard.Lock()
 	// Zero-allocation pseudo-random eviction: Go map iteration order is randomised,
