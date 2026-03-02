@@ -1,32 +1,25 @@
 /*
 File: process.go
-Version: 1.27.0
-Last Updated: 2026-03-02 20:00 CET
+Version: 1.28.0
+Last Updated: 2026-03-02 21:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.28.0 - [FEAT] Per-query log lines now include the resolved client name next
+           to the client IP: "192.168.1.42 (my-laptop) -> example.com. A | ...".
+           Identity resolution (MAC lookup, client name chain) moved to the top of
+           ProcessDNS — before AAAA filter, strict PTR, DDR, and local interception
+           — so the name is available on every code path including early exits.
+           Cost: 2-3 RLock+map lookups on paths that previously skipped identity.
+           Negligible vs the network round-trips those paths already save.
+           Route assignment from MAC stays bundled with identity since both use
+           the same MAC lookup result.
   1.27.0 - [PERF] Eliminated redundant dns.Msg.Copy() on the forwarding path.
-           ProcessDNS now passes the original request directly to Exchange(), which
-           handles both copying and ID randomisation internally via prepareForwardQuery.
-           Previously ProcessDNS deep-copied the message, then prepareForwardQuery
-           deep-copied it again — two full deep copies per forwarded query. Now
-           exactly one. On a MIPS router this saves measurable microseconds per query.
-           [PERF] All per-query log.Printf calls replaced with conditional logQuery.
-           log.Printf acquires a global mutex and runs fmt.Sprintf with reflection —
-           with 10 UDP workers all logging on every query this was the single biggest
-           serialisation point under load. Controlled via logging.log_queries config.
-           Errors and startup messages always log regardless of the setting.
-  1.26.0 - [FEAT] Added transformResponse, flattenCNAMEChain, and minimizeAnswer
-           helpers. When flatten_cname is enabled, CNAME chains in A/AAAA responses
-           are collapsed into a single synthesized record under the original query
-           name using the minimum TTL across the chain. When minimize_answer is
-           enabled, authority and additional sections are stripped before caching
-           and replying. Both transforms are applied after upstream forwarding and
-           before CacheSet so cached entries are already transformed. Local identity
-           responses are not transformed (already minimal, no CNAME chains).
+           [PERF] All per-query log.Printf calls gated behind logQueries bool.
+  1.26.0 - [FEAT] Added transformResponse, flattenCNAMEChain, and minimizeAnswer.
   1.25.0 - [FEAT] Strict PTR address syntax validation.
   1.23.0 - [FEAT] Added AAAA filter (step 0a).
   1.22.0 - [FIX]  Local identity and PTR answers now cached with route key "local".
@@ -53,8 +46,6 @@ import (
 // logQueries is the hot-path logging gate. Set once at startup from config.
 // When false, per-query log lines are suppressed entirely — no mutex, no
 // fmt.Sprintf, no I/O. Errors and startup messages always log regardless.
-// Checked inline at each call site rather than via a wrapper function to
-// avoid variadic argument boxing when logging is disabled.
 var logQueries bool
 
 // getDomainRoute performs ultra-fast zero-allocation suffix matching.
@@ -101,6 +92,54 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	qNameLower   := strings.ToLower(q.Name)
 	qNameTrimmed := strings.TrimSuffix(qNameLower, ".")
 
+	// --- Identity Extraction (early — so every log line can show the client name) ---
+	// Resolves: MAC from ARP table, route override from MAC config, and the
+	// human-readable client name via the priority chain:
+	//   1. Explicit MAC route config override
+	//   2. MAC -> name (dnsmasq leases)
+	//   3. IP -> name (hosts files / leases)
+	//   4. Fallback: hyphenated MAC or hyphenated IP
+	// Cost: 2-3 RLock + map lookups. Negligible vs any network I/O.
+	mac        := LookupMAC(clientIP)
+	routeName  := "default"
+	clientName := ""
+
+	if mac != "" {
+		if routeInfo, exists := macRoutes[mac]; exists {
+			if routeInfo.Upstream != "" {
+				routeName = routeInfo.Upstream
+			}
+			if routeInfo.ClientName != "" {
+				clientName = routeInfo.ClientName
+			}
+		}
+	}
+	if clientName == "" && mac != "" {
+		if name, ok := LookupNameByMAC(mac); ok {
+			clientName = name
+		}
+	}
+	if clientName == "" {
+		if name, ok := LookupNameByIP(clientIP); ok {
+			clientName = name
+		}
+	}
+	if clientName == "" {
+		if mac != "" {
+			clientName = strings.ReplaceAll(mac, ":", "-")
+		} else {
+			clientName = strings.ReplaceAll(strings.ReplaceAll(clientIP, ".", "-"), ":", "-")
+		}
+	}
+
+	// Pre-format the client identifier for log lines: "192.168.1.42 (my-laptop)"
+	// Built once here, reused by every log call below. Only allocated when logging
+	// is enabled — skip the string concat entirely when it won't be used.
+	var clientID string
+	if logQueries {
+		clientID = clientIP + " (" + clientName + ")"
+	}
+
 	// --- 0a. AAAA Filter ---
 	if q.Qtype == dns.TypeAAAA && cfg.Server.FilterAAAA {
 		resp := new(dns.Msg)
@@ -108,7 +147,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		resp.Authoritative = true
 		w.WriteMsg(resp)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s AAAA | FILTERED", protocol, clientIP, q.Name)
+			log.Printf("[DNS] [%s] %s -> %s AAAA | FILTERED", protocol, clientID, q.Name)
 		}
 		return
 	}
@@ -120,7 +159,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			resp.SetRcode(r, dns.RcodeNameError)
 			w.WriteMsg(resp)
 			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s PTR | STRICT PTR REJECTED", protocol, clientIP, q.Name)
+				log.Printf("[DNS] [%s] %s -> %s PTR | STRICT PTR REJECTED", protocol, clientID, q.Name)
 			}
 			return
 		}
@@ -188,7 +227,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 		w.WriteMsg(resp)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s %s | DDR DISCOVERY", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
+			log.Printf("[DNS] [%s] %s -> %s %s | DDR DISCOVERY", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 		}
 		return
 	}
@@ -215,7 +254,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		if handled {
 			w.WriteMsg(resp)
 			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s %s | DDR SPOOF", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
+				log.Printf("[DNS] [%s] %s -> %s %s | DDR SPOOF", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 			}
 			return
 		}
@@ -227,7 +266,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		cachedResp.Id = originalID
 		w.WriteMsg(cachedResp)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s %s | LOCAL CACHE HIT", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
+			log.Printf("[DNS] [%s] %s -> %s %s | LOCAL CACHE HIT", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 		}
 		return
 	}
@@ -260,7 +299,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				CacheSet(localCacheKey, resp)
 				w.WriteMsg(resp)
 				if logQueries {
-					log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
+					log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 				}
 				return
 			}
@@ -279,71 +318,39 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			CacheSet(localCacheKey, resp)
 			w.WriteMsg(resp)
 			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL PTR", protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
+				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL PTR", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 			}
 			return
 		}
 	}
 
-	// --- 3. Identity Extraction (Client Base Routing) ---
-	mac        := LookupMAC(clientIP)
-	routeName  := "default"
-	clientName := ""
-
-	if mac != "" {
-		if routeInfo, exists := macRoutes[mac]; exists {
-			if routeInfo.Upstream != "" {
-				routeName = routeInfo.Upstream
-			}
-			if routeInfo.ClientName != "" {
-				clientName = routeInfo.ClientName
-			}
-		}
-	}
-	if clientName == "" && mac != "" {
-		if name, ok := LookupNameByMAC(mac); ok {
-			clientName = name
-		}
-	}
-	if clientName == "" {
-		if name, ok := LookupNameByIP(clientIP); ok {
-			clientName = name
-		}
-	}
-	if clientName == "" {
-		if mac != "" {
-			clientName = strings.ReplaceAll(mac, ":", "-")
-		} else {
-			clientName = strings.ReplaceAll(strings.ReplaceAll(clientIP, ".", "-"), ":", "-")
-		}
-	}
-
-	// --- 4. Domain Route Interception ---
+	// --- 3. Domain Route Interception ---
+	// Overrides the client-based route if the queried domain matches a configured suffix.
 	routeOriginType := "CLIENT"
 	if domainUpstream, matched := getDomainRoute(qNameTrimmed); matched {
 		routeName       = domainUpstream
 		routeOriginType = "DOMAIN"
 	}
 
-	// --- 5. Cache Lookup ---
+	// --- 4. Cache Lookup ---
 	cacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, Route: routeName}
 	if cachedResp := CacheGet(cacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
 		w.WriteMsg(cachedResp)
 		if logQueries {
 			log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | CACHE HIT",
-				protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName)
+				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName)
 		}
 		return
 	}
 
-	// --- 6. Upstream Selection ---
+	// --- 5. Upstream Selection ---
 	upstreams, exists := routeUpstreams[routeName]
 	if !exists || len(upstreams) == 0 {
 		upstreams = routeUpstreams["default"]
 	}
 
-	// --- 7. Upstream Forwarding ---
+	// --- 6. Upstream Forwarding ---
 	// Pass the original request directly — Exchange() handles copying internally
 	// via prepareForwardQuery. Do NOT pre-copy here; that would be a redundant
 	// deep copy (prepareForwardQuery already copies and randomises the ID).
@@ -366,25 +373,25 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		lastErr = err
 	}
 
-	// --- 8. Handle Error ---
+	// --- 7. Handle Error ---
 	if finalResp == nil {
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | FAILED: %v",
-			protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, lastErr)
+			protocol, clientIP+" ("+clientName+")", q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, lastErr)
 		dns.HandleFailed(w, r)
 		return
 	}
 
-	// --- 9. Response Transforms ---
+	// --- 8. Response Transforms ---
 	finalResp = transformResponse(finalResp, q.Qtype)
 
-	// --- 10. Cache & Reply ---
+	// --- 9. Cache & Reply ---
 	CacheSet(cacheKey, finalResp)
 	finalResp.Id = originalID
 	w.WriteMsg(finalResp)
 
 	if logQueries {
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | UPSTREAM: %s | OK",
-			protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, upstreamUsed)
+			protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, upstreamUsed)
 	}
 }
 
