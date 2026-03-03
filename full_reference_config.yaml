@@ -1,10 +1,11 @@
 # File: full_reference_config.yaml
-# Version: 1.21.0
-# Last Updated: 2026-03-02 20:00 CET
+# Version: 1.22.0
+# Last Updated: 2026-03-03 23:30 CET
 # Description: sdproxy full reference configuration — Simple DNS Proxy.
 #              Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.22.0 - Added cache.max_ttl option.
 #   1.21.0 - Added logging.log_queries option.
 #   1.20.0 - Added identity.poll_interval option.
 #   1.19.0 - Added flatten_cname and minimize_answer options.
@@ -52,26 +53,23 @@ server:
 
   # Strict PTR validation — reject PTR queries that are not valid reverse-lookup
   # addresses. Valid forms: *.in-addr.arpa (IPv4) and *.ip6.arpa (IPv6).
-  # The address portion is also syntax-checked (octet range, nibble format).
-  # PTR queries for arbitrary hostnames (e.g. "ptr.example.com") are answered
-  # with NXDOMAIN instead of being forwarded upstream.
-  # false = disabled (default). true = invalid PTR queries rejected.
+  # false = disabled (default). true = invalid PTR queries rejected with NXDOMAIN.
   strict_ptr: false
 
   # CNAME flattening — collapse CNAME chains in A/AAAA responses into a single
   # synthesized record directly under the original query name. Intermediate CNAME
   # records are removed. TTL is set to the minimum across the entire chain.
-  # Applied before caching so cache hits also return flat records.
+  # Applies to both live upstream responses and cache hits for consistent behaviour.
   # No effect on non-A/AAAA queries, NXDOMAIN, or responses with no CNAMEs.
   # false = disabled (default).
   flatten_cname: false
 
   # Answer minimization — strip authority (NS) and additional sections from
-  # responses before caching and sending to clients. Reduces response size and
-  # avoids leaking internal zone structure to clients.
-  # Trade-off: negative responses (NXDOMAIN/NODATA) lose their SOA record and
-  # will use cache.min_ttl for negative cache TTL rather than the zone's own
-  # designated negative TTL.
+  # responses before sending to clients. Reduces response size and avoids leaking
+  # internal zone structure. Applies on top of the cached raw response, so the
+  # full Ns/Extra sections remain available in the cache for correct TTL calculation
+  # (e.g. SOA-based negative TTL). Transforms are applied on the way out to the
+  # client, not on the stored cache entry.
   # false = disabled (default).
   minimize_answer: false
 
@@ -111,7 +109,6 @@ logging:
   # becomes the dominant serialisation bottleneck.
   # true  = log every query (default — good for debugging and small networks).
   # false = suppress per-query lines; errors and startup messages still log.
-  #         Recommended for production on busy networks.
   # Omitting this key defaults to true.
   log_queries: true
 
@@ -126,29 +123,17 @@ logging:
 # before AAAA filter, strict PTR, DDR spoofing, local identity, and routing.
 # Cost on the hot path: one map lookup on a uint16 key.
 #
-# Keys:   RR type names, case-insensitive. Any type known to miekg/dns works —
-#         A, AAAA, MX, TXT, ANY, AXFR, IXFR, HINFO, CAA, NAPTR, SPF, …
-# Values: RCODE names, case-insensitive.
-#         NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, …
-#
-# Unknown type or RCODE names are logged as [WARN] and skipped at startup —
-# a config typo never crashes the daemon.
-#
-# Omit the section entirely to apply no type-based policy (default behaviour).
+# Keys:   RR type names, case-insensitive.
+# Values: RCODE names, case-insensitive. NOERROR, FORMERR, SERVFAIL, NXDOMAIN,
+#         NOTIMP, REFUSED, …
+# Unknown type or RCODE names are logged as [WARN] and skipped at startup.
 #
 # Recommended hardening set for a home/office stub resolver:
-#   ANY:  REFUSED — RFC 8482 explicitly allows resolvers to refuse ANY queries.
-#                   ANY is the classic amplification vector; there is no
-#                   legitimate reason a stub client needs it answered.
-#   AXFR: REFUSED — Zone transfer requests make no sense on a forwarding resolver.
-#   IXFR: REFUSED — Same rationale as AXFR.
-#   HINFO: NOTIMP — Historical host-info record, no modern legitimate use case.
-#                   NOTIMP ("not implemented") is the semantically correct signal.
 rtype_policy:
-  ANY:   "REFUSED"
-  AXFR:  "REFUSED"
-  IXFR:  "REFUSED"
-  HINFO: "NOTIMP"
+  ANY:   "REFUSED"   # RFC 8482 — amplification vector, no legitimate stub use
+  AXFR:  "REFUSED"   # Zone transfers make no sense on a forwarding resolver
+  IXFR:  "REFUSED"   # Same rationale as AXFR
+  HINFO: "NOTIMP"    # Historical record, no modern use case
 
 cache:
   enabled: true
@@ -158,11 +143,25 @@ cache:
   # 1024 is suitable for a typical home network with ~50 active devices.
   size: 1024
 
-  # Minimum TTL in seconds applied to all cached responses.
+  # min_ttl: floor applied to all cached response TTLs (seconds).
   # Prevents thrashing for records with very short TTLs (< 60s).
-  # Also used as the fallback negative cache TTL when no SOA is present
-  # (e.g. when minimize_answer is enabled).
+  # Also used as the fallback negative cache TTL when a response has no SOA
+  # (e.g. when the upstream strips the authority section itself).
   min_ttl: 60
+
+  # max_ttl: ceiling applied to all cached response TTLs (seconds).
+  # Prevents stale data sitting in cache when upstreams advertise excessively
+  # long TTLs (some CDN records use 86400s or more). Applies uniformly to:
+  #   - Positive responses  (NOERROR with answer records)
+  #   - Negative responses  (NXDOMAIN — TTL derived from SOA or min_ttl fallback)
+  #   - Empty responses     (NOERROR/NODATA — no matching records for the type)
+  # The TTL ceiling is applied before any response transforms (flatten_cname,
+  # minimize_answer) run, so it is always calculated from the full upstream
+  # response including any SOA in the authority section.
+  # 0 = disabled (no ceiling — default). Must be >= min_ttl when non-zero.
+  # Recommended: 3600 (1 hour) for home networks; 300-900 for frequently
+  # changing environments or when you want tighter cache coherence.
+  max_ttl: 0
 
 # IDENTITY RESOLUTION
 # Extracts short hostnames from hosts files and dnsmasq lease files for two
@@ -171,14 +170,7 @@ cache:
 #   2. Local A/AAAA/PTR resolution without forwarding to upstream
 #
 # Files are polled every poll_interval seconds. Each file is stat()'d first —
-# re-parsing only occurs when the modification time has changed, keeping poll
-# overhead minimal. A full fresh-map rebuild each cycle automatically evicts
-# stale entries for devices that changed IP or left the network.
-#
-# Hosts file entries support subdomain matching: "1.2.3.4 company.com" also
-# answers for "www.company.com", "bla.amsterdam.company.com", etc.
-# Blocklist-style entries (0.0.0.0 ads.example.com) are handled correctly —
-# only exact and subdomain matches are returned, never partial label matches.
+# re-parsing only occurs when the modification time has changed.
 identity:
   hosts_files: ["/etc/hosts"]
   # Point at your dnsmasq lease file — location varies by platform:
@@ -190,10 +182,7 @@ identity:
   # How often to check hosts and lease files for changes, in seconds.
   # Each file is only stat()'d — actual I/O and map rebuilds only happen when
   # the mtime changed, so short intervals are cheap on a quiet network.
-  # Default (0 or omitted): 30 seconds.
-  # Floor: 5 seconds — lower values are clamped to prevent router filesystem pressure.
-  # For dynamic networks with frequent DHCP churn, 10-15s is a reasonable middle ground.
-  # For mostly-static setups where /etc/hosts rarely changes, 60-120s is fine.
+  # Default (0 or omitted): 30 seconds. Floor: 5 seconds.
   poll_interval: 30
 
 # UPSTREAM GROUPS
@@ -202,103 +191,33 @@ identity:
 # referenced by name from routes and domain_routes.
 #
 # TCP, DoT, and DoQ connections are reused across queries — one idle connection
-# is cached per upstream dial address. TCP saves a 3-way handshake per query;
-# DoT saves both TCP and TLS handshakes (1-2 RTTs). DoH/DoH3 reuse is handled
-# by Go's http.Transport (HTTP/2 multiplexing) and http3.Transport (QUIC).
-# Falls back to fresh dial transparently when the cached connection is stale.
+# is cached per upstream dial address. DoH/DoH3 reuse is handled by Go's
+# http.Transport (HTTP/2 multiplexing) and http3.Transport (QUIC).
 #
 # PROTOCOL SCHEMES
 # ─────────────────────────────────────────────────────────────────────────────
 #
-#   udp://host:port
-#     Plain DNS over UDP (RFC 1035). Fast, no overhead, no privacy.
-#     Default port: 53.
-#     Example: "udp://1.1.1.1:53"
+#   udp://host:port   Plain DNS over UDP (RFC 1035). Default port: 53.
+#   tcp://host:port   Plain DNS over TCP (RFC 1035). Default port: 53.
+#   dot://host:port   DNS over TLS — RFC 7858. Default port: 853.
+#   doh://host/path   DNS over HTTPS/2 with HTTP/1.1 fallback — RFC 8484.
+#   doh3://host/path  DNS over HTTP/3 / QUIC. Same semantics as doh://.
+#   doq://host:port   DNS over QUIC — RFC 9250. Default port: 853.
 #
-#   tcp://host:port
-#     Plain DNS over TCP (RFC 1035). Used when responses exceed 512 bytes or
-#     when UDP is blocked. No privacy. Connection reused across queries.
-#     Default port: 53.
-#     Example: "tcp://8.8.8.8:53"
-#
-#   dot://host:port
-#     DNS over TLS (DoT — RFC 7858). Encrypted. The host value is used for TLS
-#     SNI (Server Name Indication) so it must match the upstream's certificate.
-#     Connection reused across queries (avoids TLS handshake on cache hit).
-#     Default port: 853.
-#     Example: "dot://dns.quad9.net:853"
-#
-#   doh://host/path
-#     DNS over HTTPS using HTTP/2 with HTTP/1.1 fallback (DoH — RFC 8484).
-#     Encrypted. Queries are sent as POST requests with content-type
-#     application/dns-message. The full URL after "doh://" becomes "https://".
-#     Connection multiplexing handled by Go's http.Transport.
-#     Default port: 443 (implicit in the HTTPS scheme).
-#     Example: "doh://cloudflare-dns.com/dns-query"
-#              "doh://doh.quad9.net:5053/dns-query"   (non-standard port)
-#
-#   doh3://host/path
-#     DNS over HTTP/3 / QUIC (DoH3). Encrypted. Same semantics as doh:// but
-#     uses QUIC transport instead of TCP. Faster connection establishment
-#     (0-RTT) and better performance on lossy links. Falls back to doh:// if
-#     you configure both in the same group.
-#     Default port: 443 (implicit in the HTTPS scheme).
-#     Example: "doh3://security.cloudflare-dns.com/dns-query"
-#
-#   doq://host:port
-#     DNS over QUIC (DoQ — RFC 9250). Encrypted. Lower latency than DoT for
-#     the same privacy level. Distinct from DoH3 — no HTTP layer, raw DNS
-#     messages over a QUIC stream. Connection reused with retry-on-stale.
-#     Default port: 853.
-#     Example: "doq://dns.adguard.com:853"
-#
-# ─────────────────────────────────────────────────────────────────────────────
 # BOOTSTRAP IPs  (appended after #, comma-separated)
-#
-#   Bypasses DNS resolution for the upstream hostname itself, preventing a
-#   chicken-and-egg problem where resolving the upstream requires the upstream.
-#   Multiple IPs are tried in order; the first reachable one is used.
-#   Required for any upstream whose hostname is not a bare IP address.
-#
+#   Bypasses DNS for the upstream hostname itself. Required for any upstream
+#   whose hostname is not a bare IP address.
 #   Syntax:  "scheme://host/path#ip1,ip2"
-#   Example: "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
-#            "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
-#            "doq://dns.adguard.com:853#94.140.14.14,94.140.15.15"
 #
-# ─────────────────────────────────────────────────────────────────────────────
 # {client-name} SUBSTITUTION
+#   Replaced at query time with the resolved short hostname of the requesting
+#   device. Resolution order: explicit route override -> MAC lookup -> IP lookup
+#   -> hyphenated MAC -> hyphenated IP.
+#   Syntax:  "doh://provider.com/{client-name}#bootstrap_ip"
 #
-#   The literal string {client-name} anywhere in the URL is replaced at query
-#   time with the resolved short hostname of the requesting device. Resolution
-#   order: explicit routes override -> MAC lookup (dnsmasq leases) -> IP lookup
-#   (hosts file / leases) -> hyphenated MAC -> hyphenated IP.
-#
-#   This enables per-device upstream routing with providers that support it,
-#   such as ControlD (https://controld.com) where each device gets its own
-#   resolver profile via a unique URL slug.
-#
-#   The substitution only runs for upstreams whose URL contains the placeholder —
-#   checked once at startup, not on every query.
-#
-#   Syntax:  "doh://provider.com/{client-name}"
-#   Example: "doh://doh.controld.com/{client-name}"
-#            "doh://doh.controld.com/p/{client-name}/strict"
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# COMBINING BOOTSTRAP IPs AND {client-name}
-#
-#   Both can be used together. Bootstrap IPs follow the # separator after the
-#   full URL (including the substitution placeholder).
-#
-#   Example: "doh://doh.controld.com/{client-name}#76.76.2.0,76.76.10.0"
-#
-# ─────────────────────────────────────────────────────────────────────────────
 # PRIVACY NOTE
-#
-#   All outgoing queries have their EDNS0 options stripped before forwarding
-#   (removes ECS, DNS cookies, and any other client-identifying options).
-#   Encrypted upstreams (DoT, DoH, DoH3, DoQ) additionally have RFC 7830 /
-#   RFC 8467 padding applied to obscure query name length from passive observers.
+#   All outgoing queries have EDNS0 options stripped (removes ECS, cookies, etc.).
+#   Encrypted upstreams additionally get RFC 7830/8467 padding applied.
 #
 upstreams:
   default:
@@ -316,18 +235,15 @@ upstreams:
 # MAC-BASED ROUTES
 # Maps a client MAC address to a specific upstream group and/or a fixed
 # {client-name} override. Takes priority over dynamic identity resolution.
-# MAC addresses are normalized (lowercase colon-separated) on load.
 routes:
   "00:11:22:33:44:55":
     upstream: "kids"
     client_name: "kids-ipad-override"
 
 # DOMAIN-BASED ROUTES
-# High-performance suffix matching — checked before the cache and upstream
-# selection. If the queried domain ends in any configured suffix, it is routed
-# to the specified upstream group regardless of which client sent the query.
-# Uses a zero-allocation label-walk (same pattern as getDomainRoute in process.go).
-# Overrides client-based routing when a match is found.
+# Suffix matching — checked before the cache and upstream selection. If the
+# queried domain ends in any configured suffix it is routed to that upstream
+# group regardless of which client sent the query.
 domain_routes:
   "lan":           "local_network"
   "local":         "local_network"

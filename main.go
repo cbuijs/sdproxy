@@ -1,36 +1,30 @@
 /*
 File: main.go
-Version: 1.22.0
-Last Updated: 2026-03-03 23:00 CET
+Version: 1.24.0
+Last Updated: 2026-03-03 23:45 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
-  1.22.0 - [FEAT] DDR.IPv4 and DDR.IPv6 config fields changed from string to
-           []string to support multiple resolver addresses per address family.
-           ddrIPv4 and ddrIPv6 globals changed from net.IP to []net.IP.
-           Parsing validates address family: IPv4 entries rejected in ipv6 list
-           and vice versa, with a [WARN] log and skip rather than a fatal error.
-           Empty lists are valid — process.go v1.36.0 falls back to the
-           incoming query's interface address at query time via ddrAddrs().
-           Startup now logs the resolved address lists (or a "will use interface
-           address" notice when a list is empty) for easy diagnostics.
-  1.21.0 - [PERF] Four feature-presence flags set at startup and used by process.go
-           to skip hot-path work when features are unconfigured:
-             hasMACRoutes:          true when cfg.Routes has valid MAC entries.
-             hasDomainRoutes:       true when cfg.DomainRoutes is non-empty.
-             hasRtypePolicy:        true when cfg.RtypePolicy is non-empty.
-             hasClientNameUpstream: true when any upstream URL contains {client-name}.
-  1.20.0 - [PERF] Route index table: upstream group names mapped to uint8 indices
-           (routeIdxByName). DNSCacheKey.RouteIdx replaces Route string field.
-           [PERF] SetGCPercent changed from 20 to 100.
+  1.24.0 - [FEAT] block_obsolete_qtypes config flag. When enabled, all obsolete,
+           withdrawn, experimental-never-standardised, and IANA-reserved RR types
+           are injected into rtypePolicy with NOTIMP at startup. User-defined
+           rtype_policy entries always take precedence. A companion runtime check
+           (blockUnknownQtypes flag, read by process.go) blocks completely
+           unrecognised type numbers — IANA unassigned gaps that have no name and
+           therefore cannot be addressed via rtype_policy at all.
+           The full list of blocked types and their RFC justifications is in the
+           obsoleteQtypes map below.
+  1.23.0 - [FEAT] Cache.MaxTTL config field — caps cached response TTLs.
+  1.22.0 - [FEAT] DDR.IPv4/IPv6 changed to []string for multiple addresses.
+  1.21.0 - [PERF] Four feature-presence flags set at startup for hot-path gating.
+  1.20.0 - [PERF] Route index table: upstream group names mapped to uint8 indices.
   1.19.0 - [FEAT] RType Policy config section.
   1.18.0 - [PERF] logging.log_queries config option.
   1.17.0 - [FEAT] identity.poll_interval config field.
   1.16.0 - [FIX]  DDR SVCB port numbers derived from first configured listener.
   1.15.0 - [PERF] Tiered buffer pools (smallBufPool 4KB, largeBufPool 64KB).
-           Added memory_limit_mb config option.
   1.14.0 - Added DomainRoutes initialisation, DDR spoofing, TLS auto-generation.
 */
 
@@ -81,20 +75,23 @@ type Config struct {
 
 		MemoryLimitMB int `yaml:"memory_limit_mb"`
 
-		FilterAAAA     bool `yaml:"filter_aaaa"`
-		StrictPTR      bool `yaml:"strict_ptr"`
-		FlattenCNAME   bool `yaml:"flatten_cname"`
-		MinimizeAnswer bool `yaml:"minimize_answer"`
+		FilterAAAA          bool `yaml:"filter_aaaa"`
+		StrictPTR           bool `yaml:"strict_ptr"`
+		FlattenCNAME        bool `yaml:"flatten_cname"`
+		MinimizeAnswer      bool `yaml:"minimize_answer"`
+		// BlockObsoleteQtypes injects all obsolete/unassigned/reserved RR types
+		// into rtypePolicy with NOTIMP at startup, and enables a runtime check
+		// for completely unrecognised type numbers (IANA unassigned gaps). See
+		// the obsoleteQtypes map for the full list with RFC citations.
+		BlockObsoleteQtypes bool `yaml:"block_obsolete_qtypes"`
 
 		DDR struct {
 			Enabled   bool     `yaml:"enabled"`
 			Hostnames []string `yaml:"hostnames"`
 			// IPv4 and IPv6 are lists of resolver addresses to advertise in DDR
-			// spoofed responses. Multiple addresses are supported — all are included
-			// in SVCB/HTTPS hints and generate individual A/AAAA records.
-			// Empty list: process.go falls back to the local interface address of
-			// each incoming query at query time. Useful for single-homed setups
-			// where the resolver address is always the same as the listener.
+			// spoofed responses. Multiple addresses are supported.
+			// Empty list: falls back to the local interface address of each incoming
+			// query at query time.
 			IPv4 []string `yaml:"ipv4"`
 			IPv6 []string `yaml:"ipv6"`
 		} `yaml:"ddr"`
@@ -110,7 +107,13 @@ type Config struct {
 	Cache struct {
 		Enabled bool `yaml:"enabled"`
 		Size    int  `yaml:"size"`
-		MinTTL  int  `yaml:"min_ttl"`
+		// MinTTL is the floor applied to all cached response TTLs (seconds).
+		// Prevents thrashing for records with very short TTLs.
+		// Also used as the fallback negative cache TTL when no SOA is available.
+		MinTTL int `yaml:"min_ttl"`
+		// MaxTTL is the ceiling applied to all cached response TTLs (seconds).
+		// 0 = disabled (no ceiling). Must be >= MinTTL when non-zero.
+		MaxTTL int `yaml:"max_ttl"`
 	} `yaml:"cache"`
 
 	Identity struct {
@@ -135,6 +138,49 @@ type ParsedRoute struct {
 	ClientName string
 }
 
+// obsoleteQtypes maps IANA RR type numbers to a short label for every type that
+// is obsolete, withdrawn, experimental-and-never-standardised, or IANA-reserved
+// with no published specification.
+//
+// These are injected into rtypePolicy (NOTIMP) at startup when
+// block_obsolete_qtypes: true. Using numeric keys means this map compiles
+// regardless of which constants miekg/dns exposes for older/obscure types.
+//
+// Sources: IANA "Domain Name System (DNS) Parameters" registry,
+//          and the RFCs cited per entry.
+var obsoleteQtypes = map[uint16]string{
+	3:   "MD",       // Obsolete — use MX (RFC 974)
+	4:   "MF",       // Obsolete — use MX (RFC 974)
+	7:   "MB",       // Experimental, never standardised (RFC 1035 §3.3.3)
+	8:   "MG",       // Experimental, never standardised (RFC 1035 §3.3.6)
+	9:   "MR",       // Experimental, never standardised (RFC 1035 §3.3.8)
+	10:  "NULL",     // Experimental (RFC 1035 §3.3.10)
+	11:  "WKS",      // Deprecated (RFC 1123 §4.2.2)
+	14:  "MINFO",    // Experimental, never standardised (RFC 1035 §3.3.7)
+	19:  "X25",      // Obsolete (RFC 1183)
+	20:  "ISDN",     // Obsolete (RFC 1183)
+	21:  "RT",       // Obsolete (RFC 1183)
+	22:  "NSAP",     // Obsolete (RFC 1706)
+	23:  "NSAP-PTR", // Obsolete (RFC 1348, superseded by RFC 1637, then RFC 1706)
+	24:  "SIG",      // Obsolete — superseded by RRSIG (RFC 4034)
+	25:  "KEY",      // Obsolete — superseded by DNSKEY (RFC 4034)
+	26:  "PX",       // Obsolete (RFC 2163)
+	27:  "GPOS",     // Withdrawn (RFC 1712)
+	30:  "NXT",      // Obsolete — superseded by NSEC (RFC 4034)
+	31:  "EID",      // Nimrod EID, never standardised (Patton 1995)
+	32:  "NIMLOC",   // Nimrod Locator, never standardised (Patton 1995)
+	34:  "ATMA",     // ATM Address, never deployed (ATMDOC)
+	38:  "A6",       // Historic — superseded by AAAA (RFC 6563)
+	40:  "SINK",     // Kitchen Sink, never published as RFC (Eastlake draft)
+	99:  "SPF",      // Deprecated — use TXT instead (RFC 7208 §3.1)
+	100: "UINFO",    // IANA reserved, no published specification
+	101: "UID",      // IANA reserved, no published specification
+	102: "GID",      // IANA reserved, no published specification
+	103: "UNSPEC",   // IANA reserved, no published specification
+	253: "MAILB",    // Meta-qtype for obsolete MB/MG/MR — all three are obsolete
+	254: "MAILA",    // Meta-qtype for obsolete MD/MF — both are obsolete
+}
+
 // Global read-only state — set during init, never written after (inherently thread-safe).
 var (
 	macRoutes      map[string]ParsedRoute
@@ -145,7 +191,7 @@ var (
 	// ddrIPv4 and ddrIPv6 hold the configured resolver addresses for DDR spoofing.
 	// Both are []net.IP so multiple addresses per family are supported.
 	// When a slice is empty, process.go falls back to the incoming query's interface
-	// address at query time via ddrAddrs() — no static config needed for simple setups.
+	// address at query time via ddrAddrs().
 	ddrIPv4 []net.IP
 	ddrIPv6 []net.IP
 
@@ -164,12 +210,17 @@ var (
 	hasDomainRoutes       bool
 	hasRtypePolicy        bool
 	hasClientNameUpstream bool
+	// blockUnknownQtypes enables the per-query check for type numbers that
+	// miekg/dns doesn't recognise (unassigned IANA slots). Set when
+	// block_obsolete_qtypes: true. Named obsolete types are already handled by
+	// rtypePolicy injection; this flag catches numeric gaps that have no name.
+	blockUnknownQtypes bool
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
 //
 // smallBufPool (4KB): packing outgoing DNS messages. DNS responses are always
-// small (< 512B plain, < 4KB with EDNS0). 94% smaller than a 64KB pool per buffer.
+// small (< 512B plain, < 4KB with EDNS0).
 //
 // largeBufPool (64KB): reading incoming HTTP bodies and DoQ streams where payload
 // size is unknown. Matches the DNS wire format maximum for large DNSSEC responses.
@@ -186,7 +237,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.22.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.24.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -261,7 +312,6 @@ func main() {
 			ddrHostnames[strings.ToLower(strings.TrimSuffix(h, "."))] = true
 		}
 
-		// Parse IPv4 list — reject entries that are not valid IPv4 addresses.
 		for _, s := range cfg.Server.DDR.IPv4 {
 			ip := net.ParseIP(s)
 			if ip == nil {
@@ -276,7 +326,6 @@ func main() {
 			ddrIPv4 = append(ddrIPv4, v4)
 		}
 
-		// Parse IPv6 list — reject entries that are IPv4 addresses.
 		for _, s := range cfg.Server.DDR.IPv6 {
 			ip := net.ParseIP(s)
 			if ip == nil {
@@ -302,8 +351,6 @@ func main() {
 		log.Printf("[INIT] DDR enabled for %d hostname(s), DoH port: %d, DoT/DoQ port: %d",
 			len(ddrHostnames), ddrDoHPort, ddrDoTPort)
 
-		// Log the effective address configuration. Empty slices are valid —
-		// process.go falls back to the incoming query's interface address at runtime.
 		if len(ddrIPv4) == 0 {
 			log.Println("[INIT] DDR IPv4: none configured — will use incoming query interface address")
 		} else {
@@ -337,8 +384,6 @@ func main() {
 	}
 
 	// Scan all upstream groups for {client-name} template usage.
-	// Done after routeUpstreams is fully built — single two-level range with early
-	// break, so no measurable overhead at startup. Avoids re-parsing raw URLs.
 outer:
 	for _, group := range routeUpstreams {
 		for _, up := range group {
@@ -350,8 +395,9 @@ outer:
 	}
 	log.Printf("[INIT] {client-name} upstream substitution: %v", hasClientNameUpstream)
 
-	// 5. RType policy
-	rtypePolicy = make(map[uint16]int, len(cfg.RtypePolicy))
+	// 5. RType policy — load user-defined type->RCODE mappings first.
+	// Obsolete type injection (step 6) runs after this so user entries take precedence.
+	rtypePolicy = make(map[uint16]int, len(cfg.RtypePolicy)+len(obsoleteQtypes))
 	for typeName, rcodeName := range cfg.RtypePolicy {
 		qtype, ok := dns.StringToType[strings.ToUpper(typeName)]
 		if !ok {
@@ -366,9 +412,28 @@ outer:
 		rtypePolicy[qtype] = rcode
 		log.Printf("[INIT] RType Policy: %s -> %s", dns.TypeToString[qtype], dns.RcodeToString[rcode])
 	}
+
+	// 6. Obsolete qtype blocking — inject after user rtype_policy so user wins on conflicts.
+	// Named obsolete types land in rtypePolicy (checked at step 0 in ProcessDNS, zero extra
+	// hot-path cost). The blockUnknownQtypes flag covers IANA unassigned gaps — type numbers
+	// that have no name and therefore can't be targeted by rtype_policy at all.
+	if cfg.Server.BlockObsoleteQtypes {
+		added := 0
+		for qtype, label := range obsoleteQtypes {
+			if _, userSet := rtypePolicy[qtype]; !userSet {
+				rtypePolicy[qtype] = dns.RcodeNotImplemented
+				added++
+				_ = label // label used only when building a debug summary below
+			}
+		}
+		blockUnknownQtypes = true
+		log.Printf("[INIT] Obsolete qtype blocking: %d types injected into rtype_policy (NOTIMP); unassigned type numbers also blocked at query time", added)
+	} else {
+		log.Println("[INIT] Obsolete qtype blocking: disabled (block_obsolete_qtypes: false)")
+	}
 	hasRtypePolicy = len(rtypePolicy) > 0
 
-	// 6. Route index table
+	// 7. Route index table
 	routeIdxByName = make(map[string]uint8, len(cfg.Upstreams)+4)
 	routeIdxByName["local"] = routeIdxLocal
 	nextIdx := uint8(1)
@@ -392,12 +457,17 @@ outer:
 	routeIdxDefault = routeIdxByName["default"]
 	log.Printf("[INIT] Route index table: %d entries", len(routeIdxByName))
 
-	// 7. Supporting subsystems
+	// 8. Cache — log effective TTL bounds for easy diagnostics.
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
+	if cfg.Cache.Enabled {
+		if cfg.Cache.MaxTTL > 0 {
+			log.Printf("[INIT] Cache TTL bounds: min=%ds, max=%ds", cfg.Cache.MinTTL, cfg.Cache.MaxTTL)
+		} else {
+			log.Printf("[INIT] Cache TTL bounds: min=%ds, max=unlimited", cfg.Cache.MinTTL)
+		}
+	}
 
 	// ARP polling is Linux-only and only useful when MAC-based routes are configured.
-	// Skipping it saves a goroutine + a /proc/net/arp read every 30s + per-query
-	// atomic loads in process.go on purely IP-routed or non-Linux deployments.
 	if hasMACRoutes {
 		InitARP()
 	} else {
@@ -406,7 +476,7 @@ outer:
 
 	InitIdentity()
 
-	// 8. TLS
+	// 9. TLS
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
 	var tlsConfig *tls.Config
 	if needsTLS {
@@ -415,7 +485,7 @@ outer:
 		log.Println("[TLS] No encrypted listeners configured — skipping TLS.")
 	}
 
-	// 9. Network listeners
+	// 10. Network listeners
 	StartServers(tlsConfig)
 
 	sigChan := make(chan os.Signal, 1)

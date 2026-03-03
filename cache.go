@@ -1,7 +1,7 @@
 /*
 File: cache.go
-Version: 1.14.0
-Last Updated: 2026-03-03 16:00 CET
+Version: 1.15.0
+Last Updated: 2026-03-03 23:30 CET
 Description: High-performance, sharded, non-blocking DNS cache.
              Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
              with no answer records) responses per RFC 2308.
@@ -9,17 +9,18 @@ Description: High-performance, sharded, non-blocking DNS cache.
              pseudo-random eviction, reduced shard count.
 
 Changes:
+  1.15.0 - [FEAT] max_ttl support: caps cached TTLs at a configurable ceiling.
+           Applied in CacheSet alongside min_ttl so both floors and ceilings are
+           enforced before the expiration timestamp is written — works uniformly
+           for positive, negative (NXDOMAIN), and empty (NODATA) responses.
+           [FIX]  CacheGet now rewrites TTLs in the Ns and Extra sections in
+           addition to Answer. This matters for negative responses where the SOA
+           lives in Ns — without this, clients received the original upstream TTL
+           on cache hits instead of the actual remaining cache lifetime.
+           OPT records (EDNS0 pseudo-RR, TypeOPT) are skipped — they carry a UDP
+           buffer size in the TTL field, not a real lifetime value.
   1.14.0 - [PERF] Replaced maphash.Hash shard selector with inline FNV-1a.
-           maphash required creating a Hash struct, calling SetSeed, and invoking
-           WriteString/Write methods on every cache operation. FNV-1a is pure
-           arithmetic — no struct, no seed, no method calls, zero setup cost.
-           Hash-DOS resistance (maphash's main advantage) is irrelevant for a
-           private resolver; FNV-1a distribution is more than adequate for 16 shards.
-           [PERF] Replaced DNSCacheKey.Route string with RouteIdx uint8. A string
-           field in a map key requires Go to hash its backing bytes via a pointer
-           chase. A uint8 is hashed inline with the rest of the struct — no pointer
-           chase, smaller key (struct shrinks ~15 bytes), faster map operations.
-           Route indices are assigned once at startup in main.go (routeIdxByName).
+           [PERF] Replaced DNSCacheKey.Route string with RouteIdx uint8.
   1.13.0 - [PERF] CacheGet: consolidated two time.Now() calls into one.
   1.12.0 - [FIX]  Negative responses (NXDOMAIN, NOERROR/empty) now cached per RFC 2308.
   1.11.0 - [PERF] Struct-based DNSCacheKey, 60s sweep interval.
@@ -153,9 +154,27 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 	if remaining == 0 {
 		return nil
 	}
-	// Update TTLs in the answer section to reflect remaining cache lifetime.
+
+	// Rewrite TTLs in all sections to reflect remaining cache lifetime.
+	//
+	// Answer: standard positive responses.
+	// Ns:     negative responses (NXDOMAIN / NODATA) — the SOA record lives here.
+	//         Without this rewrite, clients would see the original upstream TTL
+	//         on cache hits instead of how much lifetime is actually left.
+	// Extra:  glue records and other additional data.
+	//
+	// OPT (TypeOPT) is the EDNS0 pseudo-RR — its "TTL" field is really a bitfield
+	// for extended RCODE and flags, not a lifetime. Never touch it.
 	for _, rr := range msg.Answer {
 		rr.Header().Ttl = remaining
+	}
+	for _, rr := range msg.Ns {
+		rr.Header().Ttl = remaining
+	}
+	for _, rr := range msg.Extra {
+		if rr.Header().Rrtype != dns.TypeOPT {
+			rr.Header().Ttl = remaining
+		}
 	}
 	return msg
 }
@@ -177,15 +196,18 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg) {
 		return
 	}
 
-	// Determine TTL depending on response type:
+	// Determine TTL depending on response type.
 	//
-	// Positive (NOERROR with answers): use the minimum TTL across answer RRs.
+	// This function receives the RAW upstream response (before any transforms).
+	// process.go ensures CacheSet is called before transformResponse, so the Ns
+	// section is guaranteed to be intact and the SOA is always available for
+	// negative TTL calculation — even when minimize_answer is enabled.
 	//
-	// Negative (NXDOMAIN or NOERROR with no answers — RFC 2308 §5):
-	//   Use the SOA MINIMUM field from the authority section if present,
-	//   as this is the TTL the zone owner has designated for negative caching.
-	//   Fall back to cfg.Cache.MinTTL when no SOA is available (e.g. when
-	//   minimize_answer is enabled and Ns section has been stripped).
+	// Positive (NOERROR with answers): minimum TTL across all answer RRs.
+	//
+	// Negative (NXDOMAIN or NOERROR/NODATA — RFC 2308 §5):
+	//   Use min(SOA TTL, SOA MINIMUM) from the authority section when present.
+	//   Fall back to cfg.Cache.MinTTL when no SOA is available.
 	var ttl uint32
 	if msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0 {
 		ttl = ^uint32(0)
@@ -211,8 +233,15 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg) {
 		}
 	}
 
+	// Apply min_ttl floor — prevents thrashing for records with very short TTLs.
 	if int(ttl) < cfg.Cache.MinTTL {
 		ttl = uint32(cfg.Cache.MinTTL)
+	}
+
+	// Apply max_ttl ceiling — prevents stale data from sitting in cache too long.
+	// 0 means disabled (no ceiling). Applies to positive and negative responses alike.
+	if cfg.Cache.MaxTTL > 0 && int(ttl) > cfg.Cache.MaxTTL {
+		ttl = uint32(cfg.Cache.MaxTTL)
 	}
 
 	packed, err := msg.Pack()

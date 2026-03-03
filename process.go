@@ -1,65 +1,50 @@
 /*
 File: process.go
-Version: 1.36.0
-Last Updated: 2026-03-03 23:00 CET
+Version: 1.39.0
+Last Updated: 2026-03-04 00:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.38.0 - [FEAT] Unassigned qtype filter (step 0a): when blockUnknownQtypes is
+           set, type numbers that miekg/dns doesn't recognise — IANA unassigned
+           gaps — are blocked with NOTIMP at query time. Named obsolete types are
+           handled earlier via rtypePolicy injection in main.go (step 0), so the
+           runtime cost here is one map lookup only for truly unknown numbers.
+  1.37.0 - [FIX]  CacheSet is now called on the raw upstream response BEFORE
+           transformResponse runs. This guarantees that the full response —
+           including the Ns SOA record used for negative TTL calculation — is
+           visible to CacheSet even when minimize_answer is enabled (which strips
+           the Ns section). Without this fix, negative responses would always
+           fall back to min_ttl because the SOA had already been stripped.
+           [FIX]  transformResponse is now also applied on cache-hit paths (steps
+           2 and 4) so clients receive a consistent transformed view regardless of
+           whether the response came from cache or live from upstream. Previously,
+           flatten_cname and minimize_answer only applied on the first query for a
+           name; cache hits returned the raw upstream response. transformResponse
+           already has a fast early-return when both transforms are disabled, so
+           the cost on cache hits is one nil/bool check when transforms are off.
   1.36.0 - [FEAT] DDR spoofed records now support multiple IP addresses per
            address family and automatic interface-IP fallback when no addresses
            are configured. ddrIPv4/ddrIPv6 are now []net.IP (set in main.go).
-           localAddrIP(w) extracts the listener IP from the ResponseWriter's
-           LocalAddr — works natively for UDP, TCP, and DoT; DoH and DoQ
-           require the localIP field added to their ResponseWriter adapters in
-           server.go v1.16.0 which populates LocalAddr() from the HTTP request
-           context and the QUIC connection respectively.
-           ddrAddrs(w) combines the configured slices with the per-query
-           interface fallback and returns the effective (ipv4s, ipv6s) pair
-           used for hints, glue, and spoofed A/AAAA records across all DDR
-           paths. When both slices are non-empty the fallback is never invoked.
   1.35.1 - [FEAT] HTTPS response for DDR hostnames includes glue A/AAAA records
            in the additional section.
   1.35.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
-           Any query type other than A, AAAA, or HTTPS for a DDR hostname now
-           returns NXDOMAIN immediately — never forwarded upstream.
-  1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags (set in main.go):
-             hasMACRoutes:         skips LookupMAC() + MAC route lookup entirely when
-                                   cfg.Routes is empty. Saves one atomic load + map read
-                                   per query on purely IP-routed deployments.
-             hasClientNameUpstream: combined with logQueries to gate the entire
-                                   LookupNameByMACOrIP() call and all clientName string
-                                   building. When both are false (log_queries: false and
-                                   no {client-name} upstream) saves an atomic load +
-                                   2 map reads + up to 2 string allocs per query.
-             hasRtypePolicy:       skips the rtypePolicy map lookup when rtype_policy
-                                   section is absent from config.
-             hasDomainRoutes:      skips the getDomainRoute() label walk entirely when
-                                   domain_routes section is absent.
-           These flags are set once at startup in main.go and are read-only after that —
-           no synchronisation needed.
+  1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags.
   1.33.0 - [FEAT] Upstream forwarding now uses raceExchange (upstream.go v1.18.0).
-           [CLEAN] Removed "context" import.
   1.32.0 - [PERF] lowerTrimDot: zero-alloc single-pass lowercase + dot trim.
-           [PERF] Dropped context.WithTimeout on the upstream forwarding path.
   1.31.0 - [PERF] Single LookupNameByMACOrIP call, routeIdx uint8 tracking.
   1.30.0 - [FEAT] RType Policy (step 0): immediate RCODE by query type.
-           Local-only names get NXDOMAIN for non-A/AAAA/PTR types.
   1.28.0 - [FEAT] Per-query log lines include resolved client name.
   1.27.0 - [PERF] Eliminated redundant dns.Msg.Copy() on forwarding path.
-           [PERF] All per-query log.Printf calls gated behind logQueries bool.
   1.26.0 - [FEAT] Added transformResponse, flattenCNAMEChain, and minimizeAnswer.
   1.25.0 - [FEAT] Strict PTR address syntax validation.
   1.23.0 - [FEAT] Added AAAA filter (step 0a).
   1.22.0 - [FIX]  Local identity and PTR answers now cached with route key "local".
   1.21.0 - [FEAT] resolveLocalIdentity falls back to LookupIPsBySuffix.
-  1.20.0 - [FIX]  resolveLocalIdentity exact full-name lookup only.
-  1.19.0 - [FIX]  DDR SVCB ports now use ddrDoHPort/ddrDoTPort globals.
-  1.18.0 - [FIX]  DDR glue records deduplicated. ALPN updated with "http/1.1".
   1.17.0 - [PERF] O(1) identity lookups via pre-computed reverse maps.
-           Struct-based DNS cache key replaces fmt.Sprintf.
 */
 
 package main
@@ -195,13 +180,7 @@ func localAddrIP(w dns.ResponseWriter) net.IP {
 //
 // When a configured slice (ddrIPv4 / ddrIPv6) is non-empty it is used as-is.
 // When empty, the local interface address of the incoming query is used as a
-// single-entry fallback — but only for the matching address family:
-//   - IPv4 fallback only when LocalAddr() returns an IPv4 address.
-//   - IPv6 fallback only when LocalAddr() returns a pure IPv6 address.
-//
-// If LocalAddr() is nil (e.g. DoH/DoQ without server.go v1.16.0) or returns an
-// unspecified address, no fallback is added for that family. In that case the
-// caller should have explicit IPs configured in the DDR config section.
+// single-entry fallback — but only for the matching address family.
 func ddrAddrs(w dns.ResponseWriter) (ipv4s, ipv6s []net.IP) {
 	ipv4s = ddrIPv4
 	ipv6s = ddrIPv6
@@ -231,8 +210,42 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
+	// --- OpCode guard ---
+	// Only QUERY (0) is supported. All other opcodes — IQUERY (1, obsolete RFC 3425),
+	// STATUS (2), NOTIFY (4 RFC 1996), UPDATE (5 RFC 2136), DSO (6 RFC 8490) etc. —
+	// require authoritative server semantics. Forwarding them would be semantically
+	// wrong and could cause unintended mutations on upstream authoritative servers.
+	// SetRcode mirrors the opcode back in the response header, which is correct per RFC.
+	if r.Opcode != dns.OpcodeQuery {
+		resp := new(dns.Msg)
+		resp.SetRcode(r, dns.RcodeNotImplemented)
+		w.WriteMsg(resp)
+		if logQueries {
+			// clientID isn't built yet at this point — use raw clientIP.
+			log.Printf("[DNS] [%s] %s -> OPCODE %d | UNSUPPORTED OPCODE: NOTIMP",
+				protocol, clientIP, r.Opcode)
+		}
+		return
+	}
+
 	q          := r.Question[0]
 	originalID := r.Id
+
+	// --- QClass guard ---
+	// Only class IN (Internet, 1) is supported. CH (Chaosnet, 3) is sometimes used
+	// to query server identity (e.g. "hostname.bind CH TXT") — we don't expose that.
+	// HS (Hesiod, 4), NONE (254), and ANY (255) have no meaning on a forwarding
+	// resolver. Returning NOTIMP is correct per RFC 1035 §4.1.2.
+	if q.Qclass != dns.ClassINET {
+		resp := new(dns.Msg)
+		resp.SetRcode(r, dns.RcodeNotImplemented)
+		w.WriteMsg(resp)
+		if logQueries {
+			log.Printf("[DNS] [%s] %s -> %s CLASS %d | UNSUPPORTED CLASS: NOTIMP",
+				protocol, clientIP, q.Name, q.Qclass)
+		}
+		return
+	}
 
 	// lowerTrimDot: single pass, zero-alloc when already lowercase (~95% of queries).
 	qNameTrimmed := lowerTrimDot(q.Name)
@@ -241,10 +254,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	// needsClientName collapses two independent conditions into one flag check.
 	// When both logQueries and hasClientNameUpstream are false — the common case
 	// in production with log_queries: false and no ControlD-style per-device URLs —
-	// we skip the entire identity lookup + string building block, saving:
-	//   - one LookupNameByMACOrIP call (atomic load + up to 2 map reads)
-	//   - up to 2 strings.ReplaceAll calls for the MAC/IP fallback
-	// per query across all UDP workers.
+	// we skip the entire identity lookup + string building block.
 	needsClientName := logQueries || hasClientNameUpstream
 
 	routeName := "default"
@@ -252,9 +262,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	var mac, clientName string
 
 	// MAC lookup and MAC-based routing — only when cfg.Routes has valid entries.
-	// Skipping LookupMAC entirely avoids an atomic pointer load + map read per query
-	// on deployments that rely solely on IP/hostname-based routing. Also skips
-	// the ARP goroutine being started at all (see main.go InitARP guard).
 	if hasMACRoutes {
 		mac = LookupMAC(clientIP)
 		if mac != "" {
@@ -271,8 +278,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// Identity name resolution and clientName fallback string building.
-	// Both are skipped when neither per-query logging nor {client-name} upstream
-	// substitution needs them.
 	if needsClientName {
 		if identityName := LookupNameByMACOrIP(mac, clientIP); identityName != "" && clientName == "" {
 			clientName = identityName
@@ -293,8 +298,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 0. RType Policy ---
-	// Entire map lookup skipped when rtype_policy section is absent from config,
-	// which is the most common case on a plain forwarding resolver.
 	if hasRtypePolicy {
 		if rcode, blocked := rtypePolicy[q.Qtype]; blocked {
 			resp := new(dns.Msg)
@@ -308,7 +311,27 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
-	// --- 0a. AAAA Filter ---
+	// --- 0a. Unassigned Qtype Filter ---
+	// Named obsolete types are already handled above via rtypePolicy (injected at
+	// startup by main.go). This check catches purely numeric IANA gaps — type
+	// values that miekg/dns has no name for, meaning they are either unassigned in
+	// the IANA registry or so new that the library predates their allocation.
+	// A forwarding resolver has nothing useful to do with either case.
+	// Cost: one uint16 map lookup, skipped entirely when blockUnknownQtypes is false.
+	if blockUnknownQtypes {
+		if _, known := dns.TypeToString[q.Qtype]; !known {
+			resp := new(dns.Msg)
+			resp.SetRcode(r, dns.RcodeNotImplemented)
+			w.WriteMsg(resp)
+			if logQueries {
+				log.Printf("[DNS] [%s] %s -> %s TYPE%d | UNASSIGNED QTYPE: NOTIMP",
+					protocol, clientID, q.Name, q.Qtype)
+			}
+			return
+		}
+	}
+
+	// --- 0b. AAAA Filter ---
 	if q.Qtype == dns.TypeAAAA && cfg.Server.FilterAAAA {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
@@ -320,7 +343,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
-	// --- 0b. Strict PTR Validation ---
+	// --- 0c. Strict PTR Validation ---
 	if q.Qtype == dns.TypePTR && cfg.Server.StrictPTR {
 		if !isValidReversePTR(qNameTrimmed) {
 			resp := new(dns.Msg)
@@ -342,8 +365,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		resp.Authoritative = true
 
 		if cfg.Server.DDR.Enabled {
-			// Resolve effective addresses once for this query — applies configured
-			// lists or falls back to the interface IP for any unconfigured family.
 			ipv4s, ipv6s := ddrAddrs(w)
 
 			for host := range ddrHostnames {
@@ -381,7 +402,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				resp.Answer = append(resp.Answer, svcbTLS)
 			}
 
-			// Glue records — one A/AAAA per configured (or derived) IP per hostname.
 			for _, ip := range ipv4s {
 				for host := range ddrHostnames {
 					resp.Extra = append(resp.Extra, &dns.A{
@@ -407,27 +427,14 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
-	// 1b. DDR hostname spoofing — A, AAAA, and HTTPS records for the configured
-	// resolver hostnames (e.g. dns.local.net). All other query types return
-	// NXDOMAIN immediately and are never forwarded upstream. These hostnames are
-	// virtual — they exist only as resolver discovery glue, so leaking MX, TXT,
-	// or other queries upstream serves no purpose and may confuse upstreams.
-	//
-	// HTTPS (TypeHTTPS, RFC 9460): synthesised SVCB-style record with the DoH
-	// endpoint details. Priority 1, target "." (ServiceMode self-reference),
-	// same ALPN/port/path/hints as the SVCB answer on _dns.resolver.arpa.
-	//
-	// NODATA vs NXDOMAIN: A with no effective IPv4, or AAAA with no effective
-	// IPv6, returns NOERROR/empty (NODATA) because the name itself exists.
-	// Unknown types return NXDOMAIN because there is genuinely no such data.
+	// 1b. DDR hostname spoofing — A, AAAA, and HTTPS records for configured resolver
+	// hostnames. All other query types return NXDOMAIN immediately; never forwarded.
 	if cfg.Server.DDR.Enabled && ddrHostnames[qNameTrimmed] {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
 		resp.Authoritative = true
 		label := "DDR SPOOF"
 
-		// Resolve effective addresses once — respects multi-IP config and
-		// falls back to the query's interface address when slices are empty.
 		ipv4s, ipv6s := ddrAddrs(w)
 
 		switch q.Qtype {
@@ -438,8 +445,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					A:   ip.To4(),
 				})
 			}
-			// len(ipv4s) == 0 → NOERROR/empty (NODATA). The name exists, just
-			// no A record for this address family. resp already has Rcode NOERROR.
 
 		case dns.TypeAAAA:
 			for _, ip := range ipv6s {
@@ -448,13 +453,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					AAAA: ip.To16(),
 				})
 			}
-			// len(ipv6s) == 0 → NOERROR/empty (NODATA), same rationale as A.
 
 		case dns.TypeHTTPS:
-			// HTTPS RR uses the same wire format as SVCB (RFC 9460 §2.1).
-			// miekg/dns represents it as dns.SVCB with Rrtype = TypeHTTPS.
-			// Priority 1 + Target "." = ServiceMode self-reference: the HTTPS
-			// parameters apply to the hostname itself, no further CNAME needed.
 			svcb := &dns.SVCB{
 				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 60},
 				Priority: 1,
@@ -470,8 +470,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				svcb.Value = append(svcb.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
 			}
 			resp.Answer = append(resp.Answer, svcb)
-			// Glue records in the additional section — saves the client a
-			// separate A/AAAA lookup for the same hostname.
 			for _, ip := range ipv4s {
 				resp.Extra = append(resp.Extra, &dns.A{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
@@ -486,8 +484,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			}
 
 		default:
-			// MX, TXT, PTR, NS, CAA, … — these names are synthetic resolver glue,
-			// not real hostnames. Return NXDOMAIN and stop here. Never forward.
 			resp.SetRcode(r, dns.RcodeNameError)
 			label = "DDR NXDOMAIN"
 		}
@@ -504,6 +500,9 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	localCacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdxLocal}
 	if cachedResp := CacheGet(localCacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
+		// Apply transforms on cache hits for consistent client-facing behaviour.
+		// transformResponse fast-returns when both transforms are disabled (no-op cost).
+		cachedResp = transformResponse(cachedResp, q.Qtype)
 		w.WriteMsg(cachedResp)
 		if logQueries {
 			log.Printf("[DNS] [%s] %s -> %s %s | LOCAL CACHE HIT", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
@@ -579,8 +578,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 3. Domain Route Interception ---
-	// getDomainRoute does a label walk on every call. Skip entirely when no
-	// domain_routes are configured — the common case on simple setups.
 	routeOriginType := "CLIENT"
 	if hasDomainRoutes {
 		if domainUpstream, matched := getDomainRoute(qNameTrimmed); matched {
@@ -594,6 +591,10 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	cacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdx}
 	if cachedResp := CacheGet(cacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
+		// Apply transforms on cache hits — same reasoning as the local cache hit
+		// path above. Ensures flatten_cname and minimize_answer are applied
+		// consistently whether the response is fresh from upstream or from cache.
+		cachedResp = transformResponse(cachedResp, q.Qtype)
 		w.WriteMsg(cachedResp)
 		if logQueries {
 			log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | CACHE HIT",
@@ -613,20 +614,27 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 	// --- 7. Handle Error ---
 	if finalResp == nil {
-		// This log line always fires regardless of logQueries. clientName may be ""
-		// when needsClientName was false — that's fine, the IP alone is sufficient
-		// for diagnosing upstream failures.
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | FAILED: %v",
 			protocol, clientIP+" ("+clientName+")", q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, lastErr)
 		dns.HandleFailed(w, r)
 		return
 	}
 
-	// --- 8. Response Transforms ---
+	// --- 8. Cache (before transforms) ---
+	// CacheSet receives the raw upstream response so it can read the full Ns
+	// section — in particular any SOA record for correct negative TTL calculation.
+	// If we cached after transformResponse, minimize_answer would have stripped
+	// the Ns section and CacheSet would always fall back to min_ttl for negative
+	// responses. min_ttl and max_ttl clamping are applied inside CacheSet.
+	CacheSet(cacheKey, finalResp)
+
+	// --- 9. Response Transforms ---
+	// Applied after caching. The stored entry is always the raw upstream response;
+	// transforms are presentation-layer concerns applied on the way out to the
+	// client — both here (live path) and on cache hits (step 4 above).
 	finalResp = transformResponse(finalResp, q.Qtype)
 
-	// --- 9. Cache & Reply ---
-	CacheSet(cacheKey, finalResp)
+	// --- 10. Reply ---
 	finalResp.Id = originalID
 	w.WriteMsg(finalResp)
 
