@@ -2,21 +2,23 @@
 
 /*
 File: arp.go
-Version: 1.11.0
-Last Updated: 2026-03-01 14:00 CET
+Version: 1.12.0
+Last Updated: 2026-03-03 18:00 CET
 Description: Linux-only ARP table reader for IP->MAC resolution.
-             Reads /proc/net/arp directly — no subprocess, no iproute2 dependency,
-             works on OpenWrt, DD-WRT, and any Linux-based router.
+             Reads /proc/net/arp directly — no subprocess, no iproute2 dependency.
              Full fresh-map rebuild per cycle auto-evicts stale entries.
 
 Changes:
+  1.12.0 - [PERF] Replaced sync.RWMutex + plain map with atomic.Pointer to an
+           immutable map. LookupMAC is called on every single DNS query — it was
+           the second-hottest lock (after identMu, now also eliminated). With
+           atomic.Pointer, readers pay one atomic load (~1 CPU instruction on
+           ARM64/x86) instead of an RLock/RUnlock pair. The writer (pollARP)
+           already rebuilt the map from scratch every 30s, so the atomic swap
+           pattern is a drop-in replacement with zero semantic change.
   1.11.0 - [PERF] Replaced exec.Command("ip neigh") with direct /proc/net/arp read.
-           Eliminates fork+exec overhead every 30s — critical on MIPS/ARM routers.
-           [PERF] Switched sync.Map to RWMutex + plain map with full rebuild per poll.
-           sync.Map is optimised for append-once workloads; a full periodic rewrite
-           (our pattern) has lower overhead with a plain map under RWMutex.
-           [FIX]  Full rebuild automatically evicts entries for devices that left
-           the network — Store-only approaches accumulate stale data indefinitely.
+           [PERF] Switched sync.Map to RWMutex + plain map with full rebuild.
+           [FIX]  Full rebuild automatically evicts stale entries.
   1.10.0 - Initial version using exec.Command("ip neigh") and sync.Map.
 */
 
@@ -28,14 +30,19 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
-var (
-	arpMu   sync.RWMutex
-	arpData = make(map[string]string, 64) // IP -> normalized MAC
-)
+// arpSnap holds the current IP->MAC table as an atomically-swapped immutable map.
+// Readers: (*arpSnap.Load())[ip] — zero locks, zero contention.
+// Writer:  arpSnap.Store(&fresh) — called only from the pollARP goroutine.
+var arpSnap atomic.Pointer[map[string]string]
+
+func init() {
+	m := make(map[string]string, 64)
+	arpSnap.Store(&m)
+}
 
 func InitARP() {
 	go func() {
@@ -50,11 +57,9 @@ func InitARP() {
 }
 
 // LookupMAC returns the normalized MAC for an IP, or "" if unknown.
+// Single atomic pointer load — zero locks, called on every query.
 func LookupMAC(ipStr string) string {
-	arpMu.RLock()
-	mac := arpData[ipStr]
-	arpMu.RUnlock()
-	return mac
+	return (*arpSnap.Load())[ipStr]
 }
 
 // pollARP reads /proc/net/arp and rebuilds the IP->MAC table from scratch.
@@ -63,7 +68,7 @@ func LookupMAC(ipStr string) string {
 //   IP address       HW type  Flags  HW address         Mask  Device
 //   192.168.1.42     0x1      0x2    aa:bb:cc:dd:ee:ff  *     br-lan
 //
-// Flags: 0x0 = incomplete (kernel still resolving), 0x2 = valid, 0x4 = permanent.
+// Flags: 0x0 = incomplete, 0x2 = valid, 0x4 = permanent.
 // Incomplete entries have HW address "00:00:00:00:00:00" — skip them.
 func pollARP() {
 	file, err := os.Open("/proc/net/arp")
@@ -85,20 +90,17 @@ func pollARP() {
 		ip  := fields[0]
 		mac := fields[3]
 
-		// Skip incomplete ARP entries (kernel hasn't resolved them yet)
 		if mac == "00:00:00:00:00:00" {
 			continue
 		}
 
-		// Normalize MAC so it matches the format used in dnsmasq leases
 		if parsedMAC, err := net.ParseMAC(mac); err == nil {
 			fresh[ip] = parsedMAC.String()
 		}
 	}
 
-	// Atomic swap — readers block for one RLock/RUnlock cycle at most
-	arpMu.Lock()
-	arpData = fresh
-	arpMu.Unlock()
+	// Atomic swap — readers see old map until this store completes,
+	// then instantly see the new one. No partial state possible.
+	arpSnap.Store(&fresh)
 }
 

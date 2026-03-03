@@ -98,6 +98,8 @@ type Config struct {
 			IPv4      string   `yaml:"ipv4"`
 			IPv6      string   `yaml:"ipv6"`
 		} `yaml:"ddr"`
+
+		UpstreamStaggerMs int `yaml:"upstream_stagger_ms"`
 	} `yaml:"server"`
 
 	Logging struct {
@@ -239,6 +241,15 @@ func main() {
 
 	if cfg.Server.UDPWorkers <= 0 {
 		cfg.Server.UDPWorkers = 10
+	}
+
+	// Staggered parallel upstream racing (upstream.go raceExchange).
+	// 0 = sequential (no parallelism). >0 = stagger delay between parallel launches.
+	upstreamStagger = time.Duration(cfg.Server.UpstreamStaggerMs) * time.Millisecond
+	if upstreamStagger > 0 {
+	    log.Printf("[BOOT] Upstream stagger: %s (parallel racing enabled)", upstreamStagger)
+	} else {
+	    log.Println("[BOOT] Upstream stagger: 0 (sequential mode)")
 	}
 
 	// 1. MAC-based routes

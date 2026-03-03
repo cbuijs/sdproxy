@@ -1,24 +1,39 @@
 /*
 File: upstream.go
-Version: 1.17.0
-Last Updated: 2026-03-03 16:00 CET
+Version: 1.18.0
+Last Updated: 2026-03-03 20:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
-             TCP and DoT connections are cached and reused across queries to avoid
-             repeated handshake overhead. DoH/DoH3 reuse is handled by Go's
-             http.Client transport. DoQ reuses QUIC connections with retry-on-stale.
+             TCP and DoT connections are cached and reused across queries.
+             DoH/DoH3 reuse is handled by Go's http.Client transport.
+             DoQ reuses QUIC connections with retry-on-stale.
+
+             STAGGERED PARALLEL RACING (raceExchange):
+               When an upstream group has multiple targets and upstream_stagger_ms > 0,
+               queries are sent in parallel with a stagger delay between launches.
+               First successful response wins; losing goroutines are canceled via
+               context. This eliminates "context deadline exceeded" in practice:
+               you'd need ALL upstreams to be simultaneously unreachable.
+
+             HEALTH TRACKING (per-upstream, lock-free):
+               Each Upstream tracks consecutive failures via atomic counters.
+               After 3 consecutive failures, the upstream is marked unhealthy and
+               the stagger wait before the next upstream is skipped (fire immediately).
+               One success resets the counter. No timestamps, no background goroutines —
+               the natural cadence of DNS queries provides the probing.
 
 Changes:
-  1.17.0 - [PERF] prepareForwardQuery: eliminated the first of two Pack() calls for
-           encrypted upstreams. The previous code packed the full message just to
-           measure its wire length for RFC 7830/8467 padding, then packed it again
-           when sending. The measurement is replaced with a wire-size estimate:
-             12 (DNS header) + len(QNAME) + 4 (Qtype+Qclass) + 11 (empty OPT RR)
-           The dot-notation QNAME length is within 1-3 bytes of the wire-encoded
-           length for any real query, so the padding target is never missed by more
-           than one padding block step. The privacy properties are identical — the
-           message still rounds to a 128-byte boundary. Saves one full dns.Msg.Pack()
-           call (type-switch over all RR slices) on every DoT/DoH/DoH3/DoQ exchange.
+  1.18.0 - [FEAT] raceExchange: staggered parallel upstream queries. Launches
+           upstreams with a configurable delay (upstream_stagger_ms) between them.
+           First good response wins, context.WithCancel aborts the rest. Sequential
+           fallback when stagger is 0 or only one upstream in the group.
+           [FEAT] Per-upstream health tracking via atomic.Int32. Consecutive failures
+           are counted; >=3 = unhealthy. Unhealthy upstreams don't get a stagger
+           grace period — the next upstream fires immediately alongside them.
+           One success resets the counter to 0.
+           [PERF] context.WithCancel (not WithTimeout) for racing — no timer goroutine.
+           Individual upstream transports still enforce their own deadlines.
+  1.17.0 - [PERF] prepareForwardQuery: eliminated first Pack() via wire-size estimate.
   1.16.0 - [PERF] Eliminated redundant dns.Msg.Copy() on the hot path.
   1.15.0 - [PERF] Connection reuse for TCP/DoT/DoQ upstreams.
   1.14.0 - [FEAT] EDNS0 stripping and RFC 7830/8467 padding.
@@ -41,6 +56,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -49,16 +65,21 @@ import (
 )
 
 const (
-	// streamIdleMax is the maximum time a cached TCP/DoT connection may sit idle
-	// before it is discarded and a fresh dial is used.
 	streamIdleMax = 50 * time.Second
-
-	// streamTimeout is the per-exchange deadline for TCP/DoT write+read.
 	streamTimeout = 3 * time.Second
+	doqIdleMax    = 5 * time.Second
 
-	// doqIdleMax mirrors the MaxIdleTimeout we configure on QUIC connections (5s).
-	doqIdleMax = 5 * time.Second
+	// healthThreshold: an upstream is marked unhealthy after this many consecutive
+	// failures. Unhealthy upstreams still receive queries (they might recover) but
+	// the stagger wait before the *next* upstream is skipped so the fallback fires
+	// immediately. One success resets the counter.
+	healthThreshold = 3
 )
+
+// upstreamStagger is the delay between launching parallel upstream queries in
+// raceExchange. Set once at startup from cfg.Server.UpstreamStaggerMs.
+// 0 = sequential (no parallelism). Read-only after init — no sync needed.
+var upstreamStagger time.Duration
 
 type streamConnEntry struct {
 	conn   *dns.Conn
@@ -86,7 +107,24 @@ type Upstream struct {
 
 	doqMu    sync.Mutex
 	doqConns map[string]*doqConnEntry
+
+	// Health tracking — lock-free via atomics.
+	// consFails counts consecutive Exchange failures. Incremented on failure,
+	// reset to 0 on success. When >= healthThreshold the upstream is considered
+	// unhealthy and the stagger delay before the next upstream is skipped.
+	consFails atomic.Int32
 }
+
+// recordSuccess resets the consecutive failure counter.
+func (u *Upstream) recordSuccess() { u.consFails.Store(0) }
+
+// recordFailure increments the consecutive failure counter.
+func (u *Upstream) recordFailure() { u.consFails.Add(1) }
+
+// isHealthy returns true if the upstream has fewer than healthThreshold
+// consecutive failures. Unhealthy upstreams still participate in exchanges
+// (they're probed naturally by DNS traffic) but don't get stagger grace time.
+func (u *Upstream) isHealthy() bool { return u.consFails.Load() < healthThreshold }
 
 func ParseUpstream(raw string) (*Upstream, error) {
 	u := &Upstream{}
@@ -256,6 +294,123 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 	}
 }
 
+// --- Staggered Parallel Racing ---
+
+// raceResult is the channel payload for raceExchange goroutines.
+type raceResult struct {
+	msg *dns.Msg
+	url string
+	up  *Upstream
+	err error
+}
+
+// raceExchange sends a DNS query to an upstream group using staggered parallelism.
+//
+// ALGORITHM (Happy Eyeballs for DNS):
+//   1. Launch upstream[0] immediately.
+//   2. Wait upstreamStagger (e.g. 150ms). If a response arrives during the wait,
+//      return it immediately (fast path — typical for healthy upstreams).
+//   3. If no response yet, launch upstream[1] in parallel. Repeat for each upstream.
+//   4. First successful response wins. context.WithCancel aborts the losers.
+//
+// HEALTH-AWARE STAGGER:
+//   If the *previous* upstream is unhealthy (>=3 consecutive failures), the stagger
+//   wait is skipped entirely — the next upstream fires at t=0 alongside the sick one.
+//   This means a dead primary adds zero latency from the second query onward.
+//
+// SEQUENTIAL FALLBACK:
+//   When upstreamStagger is 0 or the group has only one target, queries are sent
+//   sequentially with no goroutine overhead (same as pre-v1.18.0 behaviour).
+//
+// GOROUTINE SAFETY:
+//   The channel is buffered to len(upstreams), so losing goroutines can always
+//   send their result without blocking even after the winner returns. They'll be
+//   GC'd after their transport timeout fires or context cancellation propagates.
+func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
+	n := len(upstreams)
+	if n == 0 {
+		return nil, "", errors.New("no upstreams configured")
+	}
+
+	// Fast path: single upstream or sequential mode — no goroutine overhead.
+	if n == 1 || upstreamStagger <= 0 {
+		return sequentialExchange(upstreams, req, clientName)
+	}
+
+	// Staggered parallel path.
+	// WithCancel (not WithTimeout): no timer goroutine. Individual transports
+	// enforce their own deadlines. Cancel fires only when we have a winner.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ch       := make(chan raceResult, n)
+	launched := 0
+
+	for i, up := range upstreams {
+		// Between launches (except the first), wait for stagger or an early result.
+		// Skip the wait if the *previous* upstream is unhealthy — fire immediately
+		// so the healthy fallback starts without delay.
+		if i > 0 {
+			prevHealthy := upstreams[i-1].isHealthy()
+
+			if prevHealthy {
+				t := time.NewTimer(upstreamStagger)
+				select {
+				case r := <-ch:
+					t.Stop()
+					launched--
+					if r.err == nil && r.msg != nil {
+						r.up.recordSuccess()
+						return r.msg, r.url, nil
+					}
+					r.up.recordFailure()
+					// Previous upstream failed fast (e.g. connection refused) —
+					// continue launching the next one immediately.
+				case <-t.C:
+					// Stagger elapsed, no early result — launch next upstream in parallel.
+				}
+			}
+			// If !prevHealthy: skip wait entirely, fire next upstream immediately.
+		}
+
+		launched++
+		go func(u *Upstream) {
+			msg, aURL, err := u.Exchange(ctx, req, clientName)
+			ch <- raceResult{msg, aURL, u, err}
+		}(up)
+	}
+
+	// All upstreams launched — collect remaining results.
+	var lastErr error
+	for i := 0; i < launched; i++ {
+		r := <-ch
+		if r.err == nil && r.msg != nil {
+			r.up.recordSuccess()
+			return r.msg, r.url, nil
+		}
+		r.up.recordFailure()
+		lastErr = r.err
+	}
+	return nil, "", lastErr
+}
+
+// sequentialExchange tries upstreams one by one with no parallelism.
+// Used when upstreamStagger is 0 or only one upstream exists.
+// Zero goroutine overhead — just a plain loop.
+func sequentialExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
+	var lastErr error
+	for _, up := range upstreams {
+		resp, aURL, err := up.Exchange(context.Background(), req, clientName)
+		if err == nil && resp != nil {
+			up.recordSuccess()
+			return resp, aURL, nil
+		}
+		up.recordFailure()
+		lastErr = err
+	}
+	return nil, "", lastErr
+}
+
 // prepareForwardQuery creates a sanitised copy of a DNS query for upstream forwarding:
 //
 //  1. Deep-copies the message so the caller's original is never modified.
@@ -264,9 +419,6 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 //  4. For encrypted upstreams: adds RFC 7830/8467 padding to the next 128-byte block.
 //
 // Padding size is calculated from a wire-length estimate rather than a full Pack().
-// The estimate is within 1-3 bytes of the true wire size for any real query, so
-// padding always lands on or just inside the target 128-byte block — identical
-// privacy properties, one fewer Pack() call per encrypted exchange.
 func prepareForwardQuery(req *dns.Msg, encrypted bool) *dns.Msg {
 	msg    := req.Copy()
 	msg.Id  = dns.Id()
@@ -279,32 +431,19 @@ func prepareForwardQuery(req *dns.Msg, encrypted bool) *dns.Msg {
 		opt.SetUDPSize(4096)
 		msg.Extra = append(msg.Extra, opt)
 	}
-	opt.Option = opt.Option[:0] // strip all EDNS0 options
+	opt.Option = opt.Option[:0]
 
 	if !encrypted {
 		return msg
 	}
 
 	const blockSize = 128
-
-	// Estimate wire size without packing:
-	//
-	//   DNS header  : 12 bytes (fixed)
-	//   QNAME       : len(Name) bytes — dot-notation length is within 1-3 bytes of
-	//                 the wire-encoded length (wire uses length prefixes instead of
-	//                 dots, plus a terminating zero byte; the difference is ≤ label count)
-	//   Qtype+Qclass: 4 bytes
-	//   OPT RR      : 11 bytes (name=1 + type=2 + class=2 + ttl=4 + rdlen=2, no options)
-	//
-	// A slight underestimate produces a few bytes of extra padding — acceptable.
-	// A slight overestimate is also fine: the padding length just becomes slightly
-	// smaller, still keeping the total within the same 128-byte block.
-	wireEst  := 12 + len(msg.Question[0].Name) + 4 + 11
+	wireEst   := 12 + len(msg.Question[0].Name) + 4 + 11
 	remainder := wireEst % blockSize
 
 	var paddingLen int
 	if remainder != 0 {
-		paddingLen = blockSize - remainder - 4 // 4 = EDNS0 option header (code+len)
+		paddingLen = blockSize - remainder - 4
 		if paddingLen < 0 {
 			paddingLen += blockSize
 		}

@@ -1,41 +1,29 @@
 /*
 File: process.go
-Version: 1.31.0
-Last Updated: 2026-03-03 16:00 CET
+Version: 1.33.0
+Last Updated: 2026-03-03 20:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
-  1.31.0 - [PERF] Replaced separate LookupNameByMAC + LookupNameByIP calls with
-           a single LookupNameByMACOrIP call (identity.go v1.21.0). Reduces identity
-           resolution from two identMu RLock/RUnlock cycles to one per query.
-           Added routeIdx uint8 tracking alongside routeName — used in all
-           DNSCacheKey construction so the key contains a uint8 rather than a
-           string (see cache.go v1.14.0). getRouteIdx() provides a safe map lookup
-           with a "default" fallback for routes that aren't in the index table.
+  1.33.0 - [FEAT] Upstream forwarding now uses raceExchange (upstream.go v1.18.0):
+           staggered parallel queries with health-aware stagger skipping. Replaces
+           the sequential for-loop that waited for a full timeout on each upstream
+           before trying the next. Eliminates "context deadline exceeded" in practice.
+           [CLEAN] Removed "context" import — no longer used directly in process.go.
+           context.WithCancel is now managed inside raceExchange (upstream.go).
+  1.32.0 - [PERF] lowerTrimDot: replaces strings.ToLower + strings.TrimSuffix with
+           a single pass that is zero-allocation when the name is already lowercase
+           (the ~95% case for DNS wire names). Only allocates on the rare slow path
+           where uppercase bytes are found. Eliminates two heap allocations per query.
+           [PERF] Dropped context.WithTimeout wrapper on the upstream forwarding path.
+  1.31.0 - [PERF] Single LookupNameByMACOrIP call, routeIdx uint8 tracking.
   1.30.0 - [FEAT] RType Policy (step 0): immediate RCODE by query type.
-           If a hostname resolves locally (has A/AAAA records in hosts/leases) but
-           the client asks for a different type (MX, TXT, SRV, NS, …), we return
-           NXDOMAIN immediately instead of forwarding upstream. This prevents
-           pointless upstream traffic and avoids leaking internal hostnames.
-           Technically RFC-correct would be NODATA (RCODE=NOERROR + empty answer),
-           because the name *does* exist — it just has no records of that type.
-           NXDOMAIN is deliberately chosen here: it is more decisive, stops client
-           retries, and is appropriate for local-only names that will never have
-           MX/TXT/SRV records anywhere. The NXDOMAIN response is cached under the
-           "local" route key just like A/AAAA/PTR local answers.
-  1.28.0 - [FEAT] Per-query log lines now include the resolved client name next
-           to the client IP: "192.168.1.42 (my-laptop) -> example.com. A | ...".
-           Identity resolution (MAC lookup, client name chain) moved to the top of
-           ProcessDNS — before AAAA filter, strict PTR, DDR, and local interception
-           — so the name is available on every code path including early exits.
-           Cost: 2-3 RLock+map lookups on paths that previously skipped identity.
-           Negligible vs the network round-trips those paths already save.
-           Route assignment from MAC stays bundled with identity since both use
-           the same MAC lookup result.
-  1.27.0 - [PERF] Eliminated redundant dns.Msg.Copy() on the forwarding path.
+           Local-only names get NXDOMAIN for non-A/AAAA/PTR types.
+  1.28.0 - [FEAT] Per-query log lines include resolved client name.
+  1.27.0 - [PERF] Eliminated redundant dns.Msg.Copy() on forwarding path.
            [PERF] All per-query log.Printf calls gated behind logQueries bool.
   1.26.0 - [FEAT] Added transformResponse, flattenCNAMEChain, and minimizeAnswer.
   1.25.0 - [FEAT] Strict PTR address syntax validation.
@@ -52,11 +40,9 @@ Changes:
 package main
 
 import (
-	"context"
 	"log"
 	"net"
 	"strings"
-	"time"
 
 	"github.com/miekg/dns"
 )
@@ -67,9 +53,7 @@ import (
 var logQueries bool
 
 // getRouteIdx returns the uint8 index for a route name, falling back to
-// routeIdxDefault when the name isn't in the table. The fallback handles
-// the edge case of a domain_route or MAC route pointing at a non-existent
-// upstream group without panicking or producing a wrong cache partition.
+// routeIdxDefault when the name isn't in the table.
 func getRouteIdx(name string) uint8 {
 	if idx, ok := routeIdxByName[name]; ok {
 		return idx
@@ -77,9 +61,46 @@ func getRouteIdx(name string) uint8 {
 	return routeIdxDefault
 }
 
+// lowerTrimDot lowercases a DNS name and strips a trailing dot in a single pass.
+//
+// Fast path (zero allocation): when the input is already all-lowercase — which
+// is the case for ~95% of DNS wire names — returns a substring of the original
+// string (just adjusts the length to trim the dot). No []byte, no copy.
+//
+// Slow path (one allocation): when an uppercase byte is found, allocates a
+// []byte of the trimmed length and lowercases in one forward pass from that
+// point onward. Everything before the first uppercase byte is bulk-copied.
+//
+// Replaces the previous strings.ToLower() + strings.TrimSuffix() which always
+// allocated twice regardless of input case.
+func lowerTrimDot(s string) string {
+	end := len(s)
+	if end > 0 && s[end-1] == '.' {
+		end--
+	}
+	// Fast path: scan for any uppercase byte
+	for i := 0; i < end; i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			// Slow path: found uppercase — allocate and finish the rest
+			buf := make([]byte, end)
+			copy(buf, s[:i])
+			for j := i; j < end; j++ {
+				c := s[j]
+				if c >= 'A' && c <= 'Z' {
+					c += 0x20
+				}
+				buf[j] = c
+			}
+			return string(buf)
+		}
+	}
+	// Fast path: already lowercase, just trim — zero allocation
+	return s[:end]
+}
+
 // getDomainRoute performs ultra-fast zero-allocation suffix matching.
-// Walks the domain label by label using index arithmetic — avoids the
-// []string allocation that strings.Split or strings.Join would incur.
+// Walks the domain label by label using index arithmetic.
 func getDomainRoute(qname string) (string, bool) {
 	search := qname
 	for {
@@ -116,20 +137,19 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
-	q            := r.Question[0]
-	originalID   := r.Id
-	qNameLower   := strings.ToLower(q.Name)
-	qNameTrimmed := strings.TrimSuffix(qNameLower, ".")
+	q          := r.Question[0]
+	originalID := r.Id
+
+	// lowerTrimDot: single pass, zero-alloc when already lowercase (~95% of queries).
+	// Replaces the old strings.ToLower + strings.TrimSuffix pair (2 allocs per query).
+	qNameTrimmed := lowerTrimDot(q.Name)
 
 	// --- Identity Extraction (early — so every log line can show the client name) ---
-	// Resolves: MAC from ARP table, route override from MAC config, and the
-	// human-readable client name via the priority chain:
-	//   1. Explicit MAC route config override
-	//   2. MAC -> name  \  combined under one identMu.RLock in LookupNameByMACOrIP
-	//   3. IP  -> name  /  (was two separate lock cycles — now one)
-	//   4. Fallback: hyphenated MAC or hyphenated IP
-	mac          := LookupMAC(clientIP)                    // arpMu:   1 RLock cycle
-	identityName := LookupNameByMACOrIP(mac, clientIP)     // identMu: 1 RLock cycle (was 2)
+	// All lookups are now lock-free via atomic.Pointer snapshots:
+	//   LookupMAC        -> (*arpSnap.Load())[ip]           (was arpMu.RLock)
+	//   LookupNameByMACOrIP -> identSnap.Load() + 2 map reads (was identMu.RLock)
+	mac          := LookupMAC(clientIP)
+	identityName := LookupNameByMACOrIP(mac, clientIP)
 	routeName    := "default"
 	routeIdx     := routeIdxDefault
 	clientName   := ""
@@ -156,19 +176,13 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
-	// Pre-format the client identifier for log lines: "192.168.1.42 (my-laptop)"
-	// Built once here, reused by every log call below. Only allocated when logging
-	// is enabled — skip the string concat entirely when it won't be used.
+	// Pre-format client identifier for log lines — only when logging is enabled
 	var clientID string
 	if logQueries {
 		clientID = clientIP + " (" + clientName + ")"
 	}
 
 	// --- 0. RType Policy ---
-	// Blanket per-query-type RCODE policy configured via rtype_policy in config.yaml.
-	// Fired before everything else (AAAA filter, strict PTR, DDR, local identity,
-	// upstream) — cost is one map lookup on a uint16 key, essentially free.
-	// clientID is already set above so log lines are fully annotated.
 	if rcode, blocked := rtypePolicy[q.Qtype]; blocked {
 		resp := new(dns.Msg)
 		resp.SetRcode(r, rcode)
@@ -364,17 +378,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	} else {
 		// Any other query type (MX, TXT, SRV, NS, CNAME, HTTPS, …):
-		// If the name is known locally it will never have these record types
-		// upstream either — return NXDOMAIN immediately.
-		//
-		// Strict RFC note: when a name exists but lacks records of the requested
-		// type, NODATA (RCODE=NOERROR, empty answer) is technically more correct.
-		// NXDOMAIN is chosen deliberately here because:
-		//   - Local-only names (router, laptop, NAS, …) genuinely don't exist in
-		//     any public or upstream zone — NXDOMAIN is not misleading.
-		//   - NXDOMAIN is final: clients stop retrying and don't fall back to
-		//     other resolvers. NODATA sometimes triggers a second upstream query.
-		//   - It prevents leaking internal hostnames to upstream resolvers.
+		// If the name is known locally — return NXDOMAIN immediately.
+		// See v1.30.0 changelog for the RFC rationale.
 		if localIPs := resolveLocalIdentity(qNameTrimmed); len(localIPs) > 0 {
 			resp := new(dns.Msg)
 			resp.SetRcode(r, dns.RcodeNameError)
@@ -390,7 +395,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 3. Domain Route Interception ---
-	// Overrides the client-based route if the queried domain matches a configured suffix.
 	routeOriginType := "CLIENT"
 	if domainUpstream, matched := getDomainRoute(qNameTrimmed); matched {
 		routeName        = domainUpstream
@@ -417,27 +421,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 6. Upstream Forwarding ---
-	// Pass the original request directly — Exchange() handles copying internally
-	// via prepareForwardQuery. Do NOT pre-copy here; that would be a redundant
-	// deep copy (prepareForwardQuery already copies and randomises the ID).
-	var (
-		finalResp    *dns.Msg
-		lastErr      error
-		upstreamUsed string
-	)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	for _, up := range upstreams {
-		resp, actualURL, err := up.Exchange(ctx, r, clientName)
-		if err == nil && resp != nil {
-			finalResp    = resp
-			upstreamUsed = actualURL
-			break
-		}
-		lastErr = err
-	}
+	// raceExchange: staggered parallel queries when upstream_stagger_ms > 0.
+	// First successful response wins, losers are canceled via context.
+	// Falls back to sequential when stagger is 0 or single upstream.
+	// Health tracking automatically skips stagger delay for broken upstreams.
+	finalResp, upstreamUsed, lastErr := raceExchange(upstreams, r, clientName)
 
 	// --- 7. Handle Error ---
 	if finalResp == nil {

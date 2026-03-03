@@ -1,35 +1,40 @@
 /*
 File: identity.go
-Version: 1.21.0
-Last Updated: 2026-03-03 16:00 CET
+Version: 1.22.0
+Last Updated: 2026-03-03 18:00 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
-             DESIGN — four O(1) lookup maps, rebuilt atomically each poll cycle:
-               _ipToName    IP  -> short hostname  (forward, for client-name resolution)
-               _macToName   MAC -> short hostname  (forward, for client-name resolution)
-               _nameToIPs   short hostname -> []net.IP  (reverse, for A/AAAA answers)
-               _arpaToNames ARPA string    -> []string  (reverse, for PTR answers)
+             DESIGN — immutable snapshot with atomic pointer swap:
+               All four lookup maps are grouped in an identitySnapshot struct.
+               Readers load the current snapshot via a single atomic.Pointer.Load()
+               — zero mutex overhead on the query hot path. The writer (pollIdentity)
+               builds a completely new snapshot and atomically swaps it in.
+               Old snapshots are GC'd once all in-flight readers release them.
+
+               Maps inside a snapshot:
+                 ipToName    IP  -> short hostname  (forward, for client-name resolution)
+                 macToName   MAC -> short hostname  (forward, for client-name resolution)
+                 nameToIPs   short hostname -> []net.IP  (reverse, for A/AAAA answers)
+                 arpaToNames ARPA string    -> []string  (reverse, for PTR answers)
 
              PERFORMANCE — per-file mtime cache:
                Each file's mtime is stored after a successful parse. On the next
                poll tick the file is stat()'d first — if the mtime is unchanged
                the cached partial result is reused directly, skipping the open(),
-               read(), and parse() entirely. /etc/hosts almost never changes;
-               the dnsmasq lease file changes on every DHCP event. This means
-               most poll ticks are two stat() calls and a map merge, nothing more.
-               Files are read into a single []byte buffer and parsed with
-               bytes.IndexByte — no bufio.Scanner overhead, no per-line string
-               allocation beyond the fields we actually keep.
+               read(), and parse() entirely.
 
 Changes:
-  1.21.0 - [PERF] Added LookupNameByMACOrIP: combines the MAC→name and IP→name
-           lookups under a single identMu.RLock instead of two separate calls.
-           ProcessDNS previously called LookupNameByMAC + LookupNameByIP as two
-           independent RLock/RUnlock cycles per query. The combined function halves
-           that to one cycle — the critical section is pure CPU (two map lookups),
-           so holding the lock across both is safe and saves a full mutex round-trip
-           on every query.
+  1.22.0 - [PERF] Replaced sync.RWMutex + 4 global maps with atomic.Pointer to
+           an immutable identitySnapshot struct. Eliminates identMu entirely —
+           readers pay zero lock overhead. On the hot path ProcessDNS called
+           LookupNameByMACOrIP on every query under RLock; now it's a single
+           atomic pointer load + two map reads. On a 10-worker UDP pool this
+           removes 10 concurrent mutex acquisitions per query burst.
+           The old LookupNameByMACOrIP combined two lookups under one RLock
+           (v1.21.0). That optimisation is now moot — atomic loads are cheaper
+           than even a single uncontended RLock.
+  1.21.0 - [PERF] LookupNameByMACOrIP: combined MAC+IP under single RLock.
   1.20.0 - [PERF] LookupIPsBySuffix: single RLock for entire suffix walk.
   1.19.0 - [FEAT] Poll interval configurable via identity.poll_interval.
   1.18.0 - [FEAT] LookupIPsBySuffix for subdomain matching.
@@ -45,11 +50,36 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+// identitySnapshot is an immutable point-in-time view of all identity maps.
+// Created fresh by pollIdentity and swapped in atomically. Readers hold a
+// reference to the snapshot for the duration of their lookup — no locks needed.
+// Go's GC ensures the old snapshot stays alive until all readers are done.
+type identitySnapshot struct {
+	ipToName    map[string]string
+	macToName   map[string]string
+	nameToIPs   map[string][]net.IP
+	arpaToNames map[string][]string
+}
+
+// identSnap is the single source of truth for all identity lookups.
+// Readers: identSnap.Load() — returns *identitySnapshot, zero contention.
+// Writer:  identSnap.Store() — called only from pollIdentity goroutine.
+var identSnap atomic.Pointer[identitySnapshot]
+
+func init() {
+	identSnap.Store(&identitySnapshot{
+		ipToName:    make(map[string]string),
+		macToName:   make(map[string]string),
+		nameToIPs:   make(map[string][]net.IP),
+		arpaToNames: make(map[string][]string),
+	})
+}
 
 // parsedFile holds the per-file cached parse result and the mtime that produced it.
 type parsedFile struct {
@@ -61,16 +91,8 @@ type parsedFile struct {
 	seen        map[string]bool
 }
 
-var (
-	identMu sync.RWMutex
-
-	_ipToName    = make(map[string]string)
-	_macToName   = make(map[string]string)
-	_nameToIPs   = make(map[string][]net.IP)
-	_arpaToNames = make(map[string][]string)
-
-	fileCache = make(map[string]*parsedFile)
-)
+// fileCache is only accessed from the single pollIdentity goroutine — no sync needed.
+var fileCache = make(map[string]*parsedFile)
 
 func identityPollInterval() time.Duration {
 	s := cfg.Identity.PollInterval
@@ -106,54 +128,39 @@ func InitIdentity() {
 
 // LookupNameByIP returns the short hostname for a given IP, if known.
 func LookupNameByIP(ip string) (string, bool) {
-	identMu.RLock()
-	name, ok := _ipToName[ip]
-	identMu.RUnlock()
-	return name, ok
+	name := identSnap.Load().ipToName[ip]
+	return name, name != ""
 }
 
 // LookupNameByMAC returns the short hostname for a normalized MAC, if known.
 func LookupNameByMAC(mac string) (string, bool) {
-	identMu.RLock()
-	name, ok := _macToName[mac]
-	identMu.RUnlock()
-	return name, ok
+	name := identSnap.Load().macToName[mac]
+	return name, name != ""
 }
 
 // LookupNameByMACOrIP returns the short hostname for a client, trying MAC first
-// then IP under a single identMu.RLock. Use this instead of calling LookupNameByMAC
-// and LookupNameByIP separately — it halves the mutex round-trips on the query
-// hot path from two RLock/RUnlock cycles to one.
-//
-// mac may be empty (e.g. on non-Linux builds where ARP is unavailable) — the
-// function falls through cleanly to the IP lookup in that case.
+// then IP. Single atomic.Pointer.Load — no locks, no contention.
+// mac may be empty (non-Linux builds where ARP is unavailable).
 func LookupNameByMACOrIP(mac, ip string) string {
-	identMu.RLock()
-	defer identMu.RUnlock()
+	snap := identSnap.Load()
 	if mac != "" {
-		if name := _macToName[mac]; name != "" {
+		if name := snap.macToName[mac]; name != "" {
 			return name
 		}
 	}
-	return _ipToName[ip]
+	return snap.ipToName[ip]
 }
 
 // LookupIPsByName returns all IPs mapped to a full hostname (case-insensitive). O(1).
 func LookupIPsByName(name string) []net.IP {
-	identMu.RLock()
-	ips := _nameToIPs[strings.ToLower(name)]
-	identMu.RUnlock()
-	return ips
+	return identSnap.Load().nameToIPs[strings.ToLower(name)]
 }
 
 // LookupIPsBySuffix walks the query name label by label and returns the IPs of
 // the first matching parent domain found in nameToIPs.
-// Single RLock for the entire walk — the critical section is pure CPU (map
-// lookups only, no I/O or blocking). Reduces lock overhead from O(labels) to O(1).
+// Single atomic load for the entire walk — pure CPU, no I/O, no blocking.
 func LookupIPsBySuffix(qname string) []net.IP {
-	identMu.RLock()
-	defer identMu.RUnlock()
-
+	snap := identSnap.Load()
 	search := qname
 	for {
 		idx := strings.IndexByte(search, '.')
@@ -164,7 +171,7 @@ func LookupIPsBySuffix(qname string) []net.IP {
 		if len(search) == 0 {
 			break
 		}
-		if ips := _nameToIPs[search]; len(ips) > 0 {
+		if ips := snap.nameToIPs[search]; len(ips) > 0 {
 			return ips
 		}
 	}
@@ -173,16 +180,13 @@ func LookupIPsBySuffix(qname string) []net.IP {
 
 // LookupNamesByARPA returns all hostnames for an ARPA string. O(1).
 func LookupNamesByARPA(arpa string) []string {
-	identMu.RLock()
-	names := _arpaToNames[arpa]
-	identMu.RUnlock()
-	return names
+	return identSnap.Load().arpaToNames[arpa]
 }
 
 func pollIdentity() {
-	identMu.RLock()
-	hint := len(_ipToName) + 8
-	identMu.RUnlock()
+	// Use previous snapshot size as hint for pre-sizing new maps.
+	prev := identSnap.Load()
+	hint := len(prev.ipToName) + 8
 
 	freshIP   := make(map[string]string,   hint)
 	freshMAC  := make(map[string]string,   hint)
@@ -214,12 +218,14 @@ func pollIdentity() {
 		return
 	}
 
-	identMu.Lock()
-	_ipToName    = freshIP
-	_macToName   = freshMAC
-	_nameToIPs   = freshName
-	_arpaToNames = freshARPA
-	identMu.Unlock()
+	// Atomic swap — readers see the old snapshot until this completes,
+	// then instantly see the new one. No partial state, no locks.
+	identSnap.Store(&identitySnapshot{
+		ipToName:    freshIP,
+		macToName:   freshMAC,
+		nameToIPs:   freshName,
+		arpaToNames: freshARPA,
+	})
 
 	log.Printf("[IDENTITY] Maps rebuilt: %d IPs, %d MACs, %d hostnames, %d PTR records",
 		len(freshIP), len(freshMAC), len(freshName), len(freshARPA))

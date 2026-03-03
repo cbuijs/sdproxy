@@ -88,6 +88,22 @@ server:
     ipv4: "192.168.1.100"
     ipv6: ""   # Leave empty to omit IPv6 SVCB hints and glue records
 
+  # Staggered parallel upstream queries — eliminates "context deadline exceeded".
+  # When > 0 and an upstream group has multiple targets, queries are launched in
+  # parallel with this delay (ms) between them. First response wins; losers are
+  # canceled. A healthy upstream responds in 10-50ms, so the stagger almost never
+  # fires — but when the primary is down, the fallback starts after just this delay
+  # instead of waiting for the full 3-5s transport timeout.
+  #
+  # Health tracking (automatic): after 3 consecutive failures an upstream is marked
+  # unhealthy and the stagger delay is skipped entirely — the next upstream fires
+  # at t=0 alongside the sick one. One success resets the counter.
+  #
+  # 0 = sequential (default — one upstream at a time, fail-then-next).
+  # Recommended: 150 for groups with 2-3 upstreams on a home network.
+  # On very slow links (satellite, rural DSL), 300-500 avoids false positives.
+  upstream_stagger_ms: 150
+
 logging:
   # Per-query logging — logs every DNS query with client IP, route, upstream, etc.
   # log.Printf acquires a global mutex and runs fmt.Sprintf with reflection on
