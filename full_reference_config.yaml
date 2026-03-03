@@ -1,10 +1,11 @@
 # File: full_reference_config.yaml
-# Version: 1.22.0
+# Version: 1.23.0
 # Last Updated: 2026-03-03 23:30 CET
 # Description: sdproxy full reference configuration — Simple DNS Proxy.
 #              Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.23.0 - Added domain_policy section with IETF-reserved TLD examples.
 #   1.22.0 - Added cache.max_ttl option.
 #   1.21.0 - Added logging.log_queries option.
 #   1.20.0 - Added identity.poll_interval option.
@@ -120,7 +121,8 @@ logging:
 # QUERY-TYPE POLICY
 # Maps specific DNS RR query types to an immediate RCODE — no cache lookup,
 # no identity check, no upstream forwarding. Fired at step 0 in ProcessDNS,
-# before AAAA filter, strict PTR, DDR spoofing, local identity, and routing.
+# before AAAA filter, strict PTR, domain policy, DDR spoofing, local identity,
+# and routing.
 # Cost on the hot path: one map lookup on a uint16 key.
 #
 # Keys:   RR type names, case-insensitive.
@@ -134,6 +136,62 @@ rtype_policy:
   AXFR:  "REFUSED"   # Zone transfers make no sense on a forwarding resolver
   IXFR:  "REFUSED"   # Same rationale as AXFR
   HINFO: "NOTIMP"    # Historical record, no modern use case
+
+# DOMAIN POLICY
+# Maps domain suffixes to an immediate RCODE — no cache lookup, no upstream
+# forwarding. A single entry covers the apex AND all sub-domains:
+#   "example.com" blocks "example.com" and "anything.below.example.com"
+#   "onion"       blocks "onion"       and "anything.onion"
+#
+# Fired at step 0d in ProcessDNS — after qtype checks (rtype_policy, AAAA filter,
+# strict PTR) but before DDR spoofing, local identity, domain_routes, and the
+# upstream cache. Blocked names never touch the network or cache regardless of
+# any other configuration.
+#
+# Keys:   Domain suffixes, case-insensitive, trailing dot optional.
+# Values: RCODE names, case-insensitive. NXDOMAIN, REFUSED, NOTIMP, etc.
+# Unknown RCODE names are logged as [WARN] and skipped at startup.
+#
+# IMPORTANT: domain_policy fires BEFORE domain_routes and local identity. If you
+# route a zone internally (e.g. "lan" or "home.arpa" in domain_routes) do NOT
+# also add it here — it would be blocked before routing ever applies.
+#
+# The entries below cover IETF-reserved names that must never leak to a public
+# upstream. Adjust to taste — add ad-network roots, tracker domains, or any
+# other names you want to sink locally.
+domain_policy:
+  # RFC 6761 §6.4 — "invalid." is guaranteed never to be delegated.
+  # Any query for *.invalid is definitionally a misconfiguration or a bug.
+  "invalid":      "NXDOMAIN"
+
+  # RFC 6761 §6.2 — "test." is reserved for local testing and must not be
+  # forwarded to the global DNS. Remove this entry if you use .test internally
+  # and resolve it via domain_routes or local identity instead.
+  "test":         "NXDOMAIN"
+
+  # RFC 2606 / RFC 6761 §6.5 — "example.", "example.com", "example.net", and
+  # "example.org" are IANA-reserved for documentation and examples. They have
+  # real delegations (IANA serves them) but forwarding queries for them wastes
+  # upstream capacity and leaks your users' browsing behaviour.
+  "example":      "NXDOMAIN"
+  "example.com":  "NXDOMAIN"
+  "example.net":  "NXDOMAIN"
+  "example.org":  "NXDOMAIN"
+
+  # RFC 7686 — ".onion" is reserved for Tor hidden services. Tor clients resolve
+  # .onion internally via the Tor daemon — queries must never reach a public
+  # resolver (it's a privacy leak and always returns NXDOMAIN upstream anyway).
+  "onion":        "NXDOMAIN"
+
+  # RFC 8375 — "home.arpa" is the designated zone for home-network use.
+  # Uncomment and change to REFUSED if you want to actively reject rather than
+  # silently drop, or remove entirely if you route home.arpa via domain_routes.
+  # "home.arpa":  "NXDOMAIN"
+
+  # Examples of custom blocks — uncomment or add your own:
+  # "doubleclick.net":   "NXDOMAIN"   # Google ad network
+  # "googlesyndication.com": "NXDOMAIN"
+  # "adnxs.com":         "NXDOMAIN"   # AppNexus / Xandr
 
 cache:
   enabled: true
@@ -244,6 +302,9 @@ routes:
 # Suffix matching — checked before the cache and upstream selection. If the
 # queried domain ends in any configured suffix it is routed to that upstream
 # group regardless of which client sent the query.
+#
+# NOTE: domain_policy is checked BEFORE domain_routes. Do not add zones here
+# that are also blocked in domain_policy — the block wins and routing never fires.
 domain_routes:
   "lan":           "local_network"
   "local":         "local_network"

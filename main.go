@@ -1,12 +1,18 @@
 /*
 File: main.go
-Version: 1.24.0
+Version: 1.25.0
 Last Updated: 2026-03-03 23:45 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.25.0 - [FEAT] domain_policy config section: maps domain suffixes (and all
+           their sub-domains) to an immediate RCODE. Parsed into domainPolicy
+           map[string]int at startup. Hot-path gated via hasDomainPolicy bool.
+           Processed in ProcessDNS at new step 0d — before DDR, local identity,
+           domain_routes, and the cache. Complements rtype_policy (which blocks
+           by query type) with name-based blocking.
   1.24.0 - [FEAT] block_obsolete_qtypes config flag. When enabled, all obsolete,
            withdrawn, experimental-never-standardised, and IANA-reserved RR types
            are injected into rtypePolicy with NOTIMP at startup. User-defined
@@ -75,10 +81,11 @@ type Config struct {
 
 		MemoryLimitMB int `yaml:"memory_limit_mb"`
 
-		FilterAAAA          bool `yaml:"filter_aaaa"`
-		StrictPTR           bool `yaml:"strict_ptr"`
-		FlattenCNAME        bool `yaml:"flatten_cname"`
-		MinimizeAnswer      bool `yaml:"minimize_answer"`
+		FilterAAAA     bool `yaml:"filter_aaaa"`
+		StrictPTR      bool `yaml:"strict_ptr"`
+		FlattenCNAME   bool `yaml:"flatten_cname"`
+		MinimizeAnswer bool `yaml:"minimize_answer"`
+
 		// BlockObsoleteQtypes injects all obsolete/unassigned/reserved RR types
 		// into rtypePolicy with NOTIMP at startup, and enables a runtime check
 		// for completely unrecognised type numbers (IANA unassigned gaps). See
@@ -129,6 +136,14 @@ type Config struct {
 	// RtypePolicy maps DNS RR type names to RCODE names (both case-insensitive).
 	// Resolved to uint16/int at startup and stored in rtypePolicy for O(1) hot-path use.
 	RtypePolicy map[string]string `yaml:"rtype_policy"`
+
+	// DomainPolicy maps domain suffixes to RCODE names (both case-insensitive).
+	// A single entry covers the apex AND all sub-domains — "example.com" blocks
+	// both "example.com" and "foo.bar.example.com". Suffix matching via label walk,
+	// same algorithm as domain_routes. Stored in domainPolicy (map[string]int)
+	// for efficient hot-path lookups. Checked at step 0d in ProcessDNS — before
+	// DDR, local identity, domain_routes, and the upstream cache.
+	DomainPolicy map[string]string `yaml:"domain_policy"`
 }
 
 var cfg Config
@@ -198,7 +213,8 @@ var (
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
 
-	rtypePolicy map[uint16]int
+	rtypePolicy  map[uint16]int
+	domainPolicy map[string]int // normalized suffix -> RCODE
 
 	routeIdxByName  map[string]uint8
 	routeIdxLocal   uint8 = 0
@@ -209,6 +225,7 @@ var (
 	hasMACRoutes          bool
 	hasDomainRoutes       bool
 	hasRtypePolicy        bool
+	hasDomainPolicy       bool // true when domain_policy has at least one entry
 	hasClientNameUpstream bool
 	// blockUnknownQtypes enables the per-query check for type numbers that
 	// miekg/dns doesn't recognise (unassigned IANA slots). Set when
@@ -237,7 +254,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.24.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.25.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -412,6 +429,26 @@ outer:
 		rtypePolicy[qtype] = rcode
 		log.Printf("[INIT] RType Policy: %s -> %s", dns.TypeToString[qtype], dns.RcodeToString[rcode])
 	}
+
+	// 5b. Domain policy — suffix-based name blocking, independent of query type.
+	// Entries are normalised to lowercase with trailing dots stripped, matching
+	// the same form that ProcessDNS passes to getDomainPolicyRcode() via lowerTrimDot.
+	domainPolicy = make(map[string]int, len(cfg.DomainPolicy))
+	for domainStr, rcodeName := range cfg.DomainPolicy {
+		clean := strings.ToLower(strings.TrimSuffix(domainStr, "."))
+		if clean == "" {
+			log.Printf("[WARN] domain_policy: empty domain key — skipped")
+			continue
+		}
+		rcode, ok := dns.StringToRcode[strings.ToUpper(rcodeName)]
+		if !ok {
+			log.Printf("[WARN] domain_policy: unknown RCODE %q for domain %q — skipped", rcodeName, domainStr)
+			continue
+		}
+		domainPolicy[clean] = rcode
+		log.Printf("[INIT] Domain Policy: *.%s (and apex) -> %s", clean, dns.RcodeToString[rcode])
+	}
+	hasDomainPolicy = len(domainPolicy) > 0
 
 	// 6. Obsolete qtype blocking — inject after user rtype_policy so user wins on conflicts.
 	// Named obsolete types land in rtypePolicy (checked at step 0 in ProcessDNS, zero extra

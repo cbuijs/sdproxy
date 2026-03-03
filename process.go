@@ -1,6 +1,6 @@
 /*
 File: process.go
-Version: 1.39.0
+Version: 1.40.0
 Last Updated: 2026-03-04 00:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
@@ -8,7 +8,13 @@ Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
-  1.38.0 - [FEAT] Unassigned qtype filter (step 0a): when blockUnknownQtypes is
+  1.40.0 - [FEAT] Domain Policy (step 0d): suffix-based name blocking with a
+           configurable RCODE. getDomainPolicyRcode() uses the same label-walk as
+           getDomainRoute — one entry covers the apex AND all sub-domains. Fired
+           before DDR, local identity, domain_routes, and the cache. Hot-path
+           gated via hasDomainPolicy so the label walk is completely skipped when
+           no domain_policy entries are configured.
+  1.39.0 - [FEAT] Unassigned qtype filter (step 0a): when blockUnknownQtypes is
            set, type numbers that miekg/dns doesn't recognise — IANA unassigned
            gaps — are blocked with NOTIMP at query time. Named obsolete types are
            handled earlier via rtypePolicy injection in main.go (step 0), so the
@@ -121,6 +127,32 @@ func getDomainRoute(qname string) (string, bool) {
 		search = search[idx+1:]
 	}
 	return "", false
+}
+
+// getDomainPolicyRcode performs suffix matching against domainPolicy via label walk.
+//
+// The walk is identical to getDomainRoute — it checks the full qname first, then
+// strips labels one by one walking toward the root. This means a single entry in
+// domain_policy covers both the apex and all sub-domains:
+//
+//	"example.com" matches "example.com" and "foo.bar.example.com"
+//	"onion"       matches "onion"       and "anything.onion"
+//
+// Returns the configured RCODE and true on a match, 0 and false otherwise.
+// Only called from ProcessDNS when hasDomainPolicy is true.
+func getDomainPolicyRcode(qname string) (int, bool) {
+	search := qname
+	for {
+		if rcode, ok := domainPolicy[search]; ok {
+			return rcode, true
+		}
+		idx := strings.IndexByte(search, '.')
+		if idx < 0 {
+			break
+		}
+		search = search[idx+1:]
+	}
+	return 0, false
 }
 
 // resolveLocalIdentity returns IPs for a queried hostname — O(1) exact match
@@ -351,6 +383,26 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			w.WriteMsg(resp)
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s PTR | STRICT PTR REJECTED", protocol, clientID, q.Name)
+			}
+			return
+		}
+	}
+
+	// --- 0d. Domain Policy ---
+	// Suffix-based name blocking — one entry covers the apex AND all sub-domains.
+	// Fired before DDR, local identity, domain_routes, and the upstream cache so
+	// blocked names never touch the network regardless of other configuration.
+	// Hot-path cost when disabled: one bool check (hasDomainPolicy == false).
+	// Hot-path cost when enabled: a label walk over the query name (same O(labels)
+	// as getDomainRoute, which already runs on every query with domain_routes).
+	if hasDomainPolicy {
+		if rcode, blocked := getDomainPolicyRcode(qNameTrimmed); blocked {
+			resp := new(dns.Msg)
+			resp.SetRcode(r, rcode)
+			w.WriteMsg(resp)
+			if logQueries {
+				log.Printf("[DNS] [%s] %s -> %s %s | DOMAIN POLICY: %s",
+					protocol, clientID, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[rcode])
 			}
 			return
 		}
