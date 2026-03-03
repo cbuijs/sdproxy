@@ -23,6 +23,12 @@ Description: Manages connections to external DNS upstream providers.
                the natural cadence of DNS queries provides the probing.
 
 Changes:
+  1.22.0 - [PERF] Pre-allocated udpClient *dns.Client on Upstream struct.
+           Previously &dns.Client{Net:"udp", Timeout:3s} was constructed on every
+           single UDP Exchange() call — one allocation per forwarded UDP query.
+           UDP is the most common upstream protocol so this is the hottest alloc
+           path in the whole file. Stored alongside h2Client/h3Client which were
+           already pre-allocated by the same logic.
   1.21.0 - [PERF] Pre-computed dialHost and dialAddrs fields on Upstream.
            parseHostPort (which calls url.Parse + allocates "http://"+raw) was
            called on every Exchange() for UDP, TCP, DoT, and DoQ. These values
@@ -118,7 +124,8 @@ type Upstream struct {
 	baseTLSConf           *tls.Config
 
 	h2Client *http.Client
-	h3Client *http.Client
+	h3Client  *http.Client
+	udpClient *dns.Client // pre-allocated at startup; reused on every UDP Exchange call
 
 	streamMu    sync.Mutex
 	streamConns map[string]*streamConnEntry
@@ -169,8 +176,9 @@ func ParseUpstream(raw string) (*Upstream, error) {
 
 	switch {
 	case strings.HasPrefix(urlPart, "udp://"):
-		u.Proto  = "udp"
-		u.RawURL = strings.TrimPrefix(urlPart, "udp://")
+		u.Proto     = "udp"
+		u.RawURL    = strings.TrimPrefix(urlPart, "udp://")
+		u.udpClient = &dns.Client{Net: "udp", Timeout: 3 * time.Second}
 
 	case strings.HasPrefix(urlPart, "tcp://"):
 		u.Proto       = "tcp"
@@ -288,14 +296,13 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 
 	switch u.Proto {
 	case "udp":
-		// u.dialAddrs is pre-computed in ParseUpstream — no parseHostPort here.
-		client := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+		// u.dialAddrs and u.udpClient are both pre-computed in ParseUpstream.
 		var (
 			resp *dns.Msg
 			err  error
 		)
 		for _, dialAddr := range u.dialAddrs {
-			resp, _, err = client.ExchangeContext(ctx, fwd, dialAddr)
+			resp, _, err = u.udpClient.ExchangeContext(ctx, fwd, dialAddr)
 			if err == nil && resp != nil {
 				return resp, "udp://"+dialAddr, nil
 			}

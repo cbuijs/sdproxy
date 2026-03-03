@@ -1,7 +1,7 @@
 /*
 File: identity.go
-Version: 1.22.0
-Last Updated: 2026-03-03 18:00 CET
+Version: 1.23.0
+Last Updated: 2026-03-04 16:00 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
@@ -25,6 +25,17 @@ Description: Parses /etc/hosts and dnsmasq lease files to extract short hostname
                read(), and parse() entirely.
 
 Changes:
+  1.23.0 - [PERF] storeEntry: dropped strings.ToLower on ARPA key — dns.ReverseAddr
+           already returns lowercase for both IPv4 (decimal digits) and IPv6 (hex
+           nibbles). Replaced strings.TrimSuffix(arpa, ".") with arpa[:len(arpa)-1]
+           since dns.ReverseAddr always appends "." unconditionally. Both calls were
+           doing redundant work on every parsed entry.
+           [PERF] storeEntry now computes shortName before the sink guard and returns
+           it. parseLeasesBytes was repeating the identical strings.IndexByte dot-search
+           to build the MAC->name mapping. Using the returned value eliminates the
+           duplicate. storeEntry returns "" only when net.ParseIP fails (invalid IP),
+           in which case parseLeasesBytes skips the MAC entry too — correct behaviour
+           since a lease with an unparseable IP is malformed.
   1.22.0 - [PERF] Replaced sync.RWMutex + 4 global maps with atomic.Pointer to
            an immutable identitySnapshot struct. Eliminates identMu entirely —
            readers pay zero lock overhead. On the hot path ProcessDNS called
@@ -363,14 +374,16 @@ func parseLeasesBytes(data []byte) *parsedFile {
 			continue
 		}
 
-		ip       := string(ipBytes)
 		fullName := string(nameBytes)
-		storeEntry(ip, fullName, pf)
 
-		shortName := fullName
-		if idx := strings.IndexByte(fullName, '.'); idx > 0 {
-			shortName = fullName[:idx]
+		// storeEntry returns the pre-computed shortName, eliminating a duplicate
+		// strings.IndexByte dot-search here. Returns "" when net.ParseIP fails
+		// (malformed IP) — skip the MAC entry in that case too.
+		shortName := storeEntry(string(ipBytes), fullName, pf)
+		if shortName == "" {
+			continue
 		}
+
 		if parsedMAC, err := net.ParseMAC(string(macBytes)); err == nil {
 			pf.macToName[parsedMAC.String()] = shortName
 		}
@@ -382,10 +395,30 @@ func isSinkIP(ip net.IP) bool {
 	return ip.IsUnspecified() || ip.IsLoopback()
 }
 
-func storeEntry(ip, rawName string, pf *parsedFile) {
+// storeEntry populates all four maps in pf for a single IP+hostname pair and
+// returns the shortName (first label of rawName). Returns "" when ip is unparseable
+// — callers can use this as a validity signal to skip further processing.
+//
+// shortName is computed before the sink guard so it is always available to the
+// caller regardless of whether the IP is loopback/unspecified. Sink IPs still
+// get nameToIPs and arpaToNames entries (so local PTR and forward lookups work
+// for ::1 / 127.0.0.1) but are excluded from ipToName (so they don't pollute
+// client-name resolution with "localhost").
+//
+// ARPA key: dns.ReverseAddr always returns a lowercase, "." terminated string.
+// strings.ToLower and strings.TrimSuffix are both redundant — we slice off the
+// trailing dot directly with arpa[:len(arpa)-1].
+func storeEntry(ip, rawName string, pf *parsedFile) string {
 	parsedIP := net.ParseIP(ip)
 	if parsedIP == nil {
-		return
+		return ""
+	}
+
+	// Compute shortName up-front — needed by the caller (parseLeasesBytes for
+	// MAC->name) and by the ipToName store below, regardless of sink status.
+	shortName := rawName
+	if idx := strings.IndexByte(rawName, '.'); idx > 0 {
+		shortName = rawName[:idx]
 	}
 
 	sink    := isSinkIP(parsedIP)
@@ -397,20 +430,18 @@ func storeEntry(ip, rawName string, pf *parsedFile) {
 		pf.nameToIPs[fullKey] = append(pf.nameToIPs[fullKey], parsedIP)
 
 		if arpa, err := dns.ReverseAddr(ip); err == nil {
-			arpaKey := strings.TrimSuffix(strings.ToLower(arpa), ".")
-			pf.arpaToNames[arpaKey] = append(pf.arpaToNames[arpaKey], rawName)
+			// dns.ReverseAddr: always lowercase (IPv4 = decimal, IPv6 = hex nibbles
+			// via fmt.Sprintf %x), always "." terminated. Slice is cheaper than
+			// strings.TrimSuffix and strings.ToLower is a guaranteed no-op here.
+			key := arpa[:len(arpa)-1]
+			pf.arpaToNames[key] = append(pf.arpaToNames[key], rawName)
 		}
 	}
 
-	if sink {
-		return
+	if !sink {
+		pf.ipToName[ip] = shortName
 	}
-
-	shortName := rawName
-	if idx := strings.IndexByte(rawName, '.'); idx > 0 {
-		shortName = rawName[:idx]
-	}
-	pf.ipToName[ip] = shortName
+	return shortName
 }
 
 func splitLine(data []byte) (line, rest []byte) {
