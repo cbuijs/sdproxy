@@ -1,13 +1,30 @@
 /*
 File: process.go
-Version: 1.34.0
-Last Updated: 2026-03-03 22:00 CET
+Version: 1.36.0
+Last Updated: 2026-03-03 23:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.36.0 - [FEAT] DDR spoofed records now support multiple IP addresses per
+           address family and automatic interface-IP fallback when no addresses
+           are configured. ddrIPv4/ddrIPv6 are now []net.IP (set in main.go).
+           localAddrIP(w) extracts the listener IP from the ResponseWriter's
+           LocalAddr — works natively for UDP, TCP, and DoT; DoH and DoQ
+           require the localIP field added to their ResponseWriter adapters in
+           server.go v1.16.0 which populates LocalAddr() from the HTTP request
+           context and the QUIC connection respectively.
+           ddrAddrs(w) combines the configured slices with the per-query
+           interface fallback and returns the effective (ipv4s, ipv6s) pair
+           used for hints, glue, and spoofed A/AAAA records across all DDR
+           paths. When both slices are non-empty the fallback is never invoked.
+  1.35.1 - [FEAT] HTTPS response for DDR hostnames includes glue A/AAAA records
+           in the additional section.
+  1.35.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
+           Any query type other than A, AAAA, or HTTPS for a DDR hostname now
+           returns NXDOMAIN immediately — never forwarded upstream.
   1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags (set in main.go):
              hasMACRoutes:         skips LookupMAC() + MAC route lookup entirely when
                                    cfg.Routes is empty. Saves one atomic load + map read
@@ -136,6 +153,78 @@ func resolveLocalPTR(arpa string) []string {
 	return LookupNamesByARPA(arpa)
 }
 
+// localAddrIP extracts the listener IP from a ResponseWriter's local address.
+//
+// For miekg/dns UDP/TCP/DoT writers the local address is always populated.
+// For the custom dohResponseWriter and doqResponseWriter in server.go, it relies
+// on the localIP field added in v1.16.0 — without that field LocalAddr() returns
+// nil and no interface fallback is available for those protocols.
+//
+// Returns nil when the address is unavailable, unresolvable, or unspecified
+// (0.0.0.0 / ::) — callers must handle nil gracefully.
+func localAddrIP(w dns.ResponseWriter) net.IP {
+	addr := w.LocalAddr()
+	if addr == nil {
+		return nil
+	}
+	var ip net.IP
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		ip = a.IP
+	case *net.TCPAddr:
+		ip = a.IP
+	case *net.IPAddr:
+		ip = a.IP
+	default:
+		// Generic fallback for any other net.Addr implementation.
+		host, _, err := net.SplitHostPort(addr.String())
+		if err != nil {
+			ip = net.ParseIP(addr.String())
+		} else {
+			ip = net.ParseIP(host)
+		}
+	}
+	if ip == nil || ip.IsUnspecified() {
+		return nil
+	}
+	return ip
+}
+
+// ddrAddrs returns the effective IPv4 and IPv6 address slices for all DDR
+// spoofed responses (SVCB hints, HTTPS hints, A, AAAA, and glue records).
+//
+// When a configured slice (ddrIPv4 / ddrIPv6) is non-empty it is used as-is.
+// When empty, the local interface address of the incoming query is used as a
+// single-entry fallback — but only for the matching address family:
+//   - IPv4 fallback only when LocalAddr() returns an IPv4 address.
+//   - IPv6 fallback only when LocalAddr() returns a pure IPv6 address.
+//
+// If LocalAddr() is nil (e.g. DoH/DoQ without server.go v1.16.0) or returns an
+// unspecified address, no fallback is added for that family. In that case the
+// caller should have explicit IPs configured in the DDR config section.
+func ddrAddrs(w dns.ResponseWriter) (ipv4s, ipv6s []net.IP) {
+	ipv4s = ddrIPv4
+	ipv6s = ddrIPv6
+	if len(ipv4s) > 0 && len(ipv6s) > 0 {
+		return // both families configured — skip the LocalAddr() call entirely
+	}
+	local := localAddrIP(w)
+	if local == nil {
+		return
+	}
+	if len(ipv4s) == 0 {
+		if v4 := local.To4(); v4 != nil {
+			ipv4s = []net.IP{v4}
+		}
+	}
+	if len(ipv6s) == 0 {
+		if local.To4() == nil { // pure IPv6, not an IPv4-mapped address
+			ipv6s = []net.IP{local}
+		}
+	}
+	return
+}
+
 func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol string) {
 	if len(r.Question) == 0 {
 		dns.HandleFailed(w, r)
@@ -245,12 +334,18 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 1. DDR Spoofing & Interception ---
+
+	// 1a. _dns.resolver.arpa SVCB — RFC 9462 discovery endpoint.
 	if q.Qtype == dns.TypeSVCB && qNameTrimmed == "_dns.resolver.arpa" {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
 		resp.Authoritative = true
 
 		if cfg.Server.DDR.Enabled {
+			// Resolve effective addresses once for this query — applies configured
+			// lists or falls back to the interface IP for any unconfigured family.
+			ipv4s, ipv6s := ddrAddrs(w)
+
 			for host := range ddrHostnames {
 				target := dns.Fqdn(host)
 
@@ -262,11 +357,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: ddrDoHPort})
 				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
-				if ddrIPv4 != nil {
-					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{ddrIPv4.To4()}})
+				if len(ipv4s) > 0 {
+					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
 				}
-				if ddrIPv6 != nil {
-					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv6Hint{Hint: []net.IP{ddrIPv6.To16()}})
+				if len(ipv6s) > 0 {
+					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
 				}
 				resp.Answer = append(resp.Answer, svcbHTTPS)
 
@@ -277,28 +372,29 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				}
 				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBAlpn{Alpn: []string{"dot", "doq"}})
 				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBPort{Port: ddrDoTPort})
-				if ddrIPv4 != nil {
-					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv4Hint{Hint: []net.IP{ddrIPv4.To4()}})
+				if len(ipv4s) > 0 {
+					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
 				}
-				if ddrIPv6 != nil {
-					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv6Hint{Hint: []net.IP{ddrIPv6.To16()}})
+				if len(ipv6s) > 0 {
+					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
 				}
 				resp.Answer = append(resp.Answer, svcbTLS)
 			}
 
-			if ddrIPv4 != nil {
+			// Glue records — one A/AAAA per configured (or derived) IP per hostname.
+			for _, ip := range ipv4s {
 				for host := range ddrHostnames {
 					resp.Extra = append(resp.Extra, &dns.A{
 						Hdr: dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-						A:   ddrIPv4.To4(),
+						A:   ip.To4(),
 					})
 				}
 			}
-			if ddrIPv6 != nil {
+			for _, ip := range ipv6s {
 				for host := range ddrHostnames {
 					resp.Extra = append(resp.Extra, &dns.AAAA{
 						Hdr:  dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
-						AAAA: ddrIPv6.To16(),
+						AAAA: ip.To16(),
 					})
 				}
 			}
@@ -311,32 +407,97 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
+	// 1b. DDR hostname spoofing — A, AAAA, and HTTPS records for the configured
+	// resolver hostnames (e.g. dns.local.net). All other query types return
+	// NXDOMAIN immediately and are never forwarded upstream. These hostnames are
+	// virtual — they exist only as resolver discovery glue, so leaking MX, TXT,
+	// or other queries upstream serves no purpose and may confuse upstreams.
+	//
+	// HTTPS (TypeHTTPS, RFC 9460): synthesised SVCB-style record with the DoH
+	// endpoint details. Priority 1, target "." (ServiceMode self-reference),
+	// same ALPN/port/path/hints as the SVCB answer on _dns.resolver.arpa.
+	//
+	// NODATA vs NXDOMAIN: A with no effective IPv4, or AAAA with no effective
+	// IPv6, returns NOERROR/empty (NODATA) because the name itself exists.
+	// Unknown types return NXDOMAIN because there is genuinely no such data.
 	if cfg.Server.DDR.Enabled && ddrHostnames[qNameTrimmed] {
-		resp    := new(dns.Msg)
-		handled := false
+		resp := new(dns.Msg)
 		resp.SetReply(r)
+		resp.Authoritative = true
+		label := "DDR SPOOF"
 
-		if q.Qtype == dns.TypeA && ddrIPv4 != nil {
-			resp.Answer = append(resp.Answer, &dns.A{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-				A:   ddrIPv4.To4(),
-			})
-			handled = true
-		} else if q.Qtype == dns.TypeAAAA && ddrIPv6 != nil {
-			resp.Answer = append(resp.Answer, &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
-				AAAA: ddrIPv6.To16(),
-			})
-			handled = true
-		}
+		// Resolve effective addresses once — respects multi-IP config and
+		// falls back to the query's interface address when slices are empty.
+		ipv4s, ipv6s := ddrAddrs(w)
 
-		if handled {
-			w.WriteMsg(resp)
-			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s %s | DDR SPOOF", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+		switch q.Qtype {
+		case dns.TypeA:
+			for _, ip := range ipv4s {
+				resp.Answer = append(resp.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   ip.To4(),
+				})
 			}
-			return
+			// len(ipv4s) == 0 → NOERROR/empty (NODATA). The name exists, just
+			// no A record for this address family. resp already has Rcode NOERROR.
+
+		case dns.TypeAAAA:
+			for _, ip := range ipv6s {
+				resp.Answer = append(resp.Answer, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+					AAAA: ip.To16(),
+				})
+			}
+			// len(ipv6s) == 0 → NOERROR/empty (NODATA), same rationale as A.
+
+		case dns.TypeHTTPS:
+			// HTTPS RR uses the same wire format as SVCB (RFC 9460 §2.1).
+			// miekg/dns represents it as dns.SVCB with Rrtype = TypeHTTPS.
+			// Priority 1 + Target "." = ServiceMode self-reference: the HTTPS
+			// parameters apply to the hostname itself, no further CNAME needed.
+			svcb := &dns.SVCB{
+				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 60},
+				Priority: 1,
+				Target:   ".",
+			}
+			svcb.Value = append(svcb.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
+			svcb.Value = append(svcb.Value, &dns.SVCBPort{Port: ddrDoHPort})
+			svcb.Value = append(svcb.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
+			if len(ipv4s) > 0 {
+				svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
+			}
+			if len(ipv6s) > 0 {
+				svcb.Value = append(svcb.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
+			}
+			resp.Answer = append(resp.Answer, svcb)
+			// Glue records in the additional section — saves the client a
+			// separate A/AAAA lookup for the same hostname.
+			for _, ip := range ipv4s {
+				resp.Extra = append(resp.Extra, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   ip.To4(),
+				})
+			}
+			for _, ip := range ipv6s {
+				resp.Extra = append(resp.Extra, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+					AAAA: ip.To16(),
+				})
+			}
+
+		default:
+			// MX, TXT, PTR, NS, CAA, … — these names are synthetic resolver glue,
+			// not real hostnames. Return NXDOMAIN and stop here. Never forward.
+			resp.SetRcode(r, dns.RcodeNameError)
+			label = "DDR NXDOMAIN"
 		}
+
+		w.WriteMsg(resp)
+		if logQueries {
+			log.Printf("[DNS] [%s] %s -> %s %s | %s",
+				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], label)
+		}
+		return
 	}
 
 	// --- 2. Local Hosts/Leases Interception ---

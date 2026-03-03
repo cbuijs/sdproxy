@@ -1,28 +1,27 @@
 /*
 File: main.go
-Version: 1.21.0
-Last Updated: 2026-03-03 22:00 CET
+Version: 1.22.0
+Last Updated: 2026-03-03 23:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.22.0 - [FEAT] DDR.IPv4 and DDR.IPv6 config fields changed from string to
+           []string to support multiple resolver addresses per address family.
+           ddrIPv4 and ddrIPv6 globals changed from net.IP to []net.IP.
+           Parsing validates address family: IPv4 entries rejected in ipv6 list
+           and vice versa, with a [WARN] log and skip rather than a fatal error.
+           Empty lists are valid — process.go v1.36.0 falls back to the
+           incoming query's interface address at query time via ddrAddrs().
+           Startup now logs the resolved address lists (or a "will use interface
+           address" notice when a list is empty) for easy diagnostics.
   1.21.0 - [PERF] Four feature-presence flags set at startup and used by process.go
            to skip hot-path work when features are unconfigured:
              hasMACRoutes:          true when cfg.Routes has valid MAC entries.
-                                    Gates LookupMAC(), MAC route lookup, and — most
-                                    importantly — InitARP(). Without MAC routes the
-                                    ARP polling goroutine never starts, /proc/net/arp
-                                    is never read, and LookupMAC() is never called.
              hasDomainRoutes:       true when cfg.DomainRoutes is non-empty.
-                                    Gates getDomainRoute() label walk in process.go.
              hasRtypePolicy:        true when cfg.RtypePolicy is non-empty.
-                                    Gates rtypePolicy map lookup in process.go.
              hasClientNameUpstream: true when any upstream URL contains {client-name}.
-                                    Combined with logQueries to gate identity resolution
-                                    and all clientName string building in process.go.
-           Scanning for hasClientNameUpstream reuses the already-built routeUpstreams
-           map — no extra parsing, just a two-level range with an early break.
   1.20.0 - [PERF] Route index table: upstream group names mapped to uint8 indices
            (routeIdxByName). DNSCacheKey.RouteIdx replaces Route string field.
            [PERF] SetGCPercent changed from 20 to 100.
@@ -90,8 +89,14 @@ type Config struct {
 		DDR struct {
 			Enabled   bool     `yaml:"enabled"`
 			Hostnames []string `yaml:"hostnames"`
-			IPv4      string   `yaml:"ipv4"`
-			IPv6      string   `yaml:"ipv6"`
+			// IPv4 and IPv6 are lists of resolver addresses to advertise in DDR
+			// spoofed responses. Multiple addresses are supported — all are included
+			// in SVCB/HTTPS hints and generate individual A/AAAA records.
+			// Empty list: process.go falls back to the local interface address of
+			// each incoming query at query time. Useful for single-homed setups
+			// where the resolver address is always the same as the listener.
+			IPv4 []string `yaml:"ipv4"`
+			IPv6 []string `yaml:"ipv6"`
 		} `yaml:"ddr"`
 
 		UpstreamStaggerMs int `yaml:"upstream_stagger_ms"`
@@ -136,8 +141,13 @@ var (
 	domainRoutes   map[string]string
 	routeUpstreams map[string][]*Upstream
 	ddrHostnames   map[string]bool
-	ddrIPv4        net.IP
-	ddrIPv6        net.IP
+
+	// ddrIPv4 and ddrIPv6 hold the configured resolver addresses for DDR spoofing.
+	// Both are []net.IP so multiple addresses per family are supported.
+	// When a slice is empty, process.go falls back to the incoming query's interface
+	// address at query time via ddrAddrs() — no static config needed for simple setups.
+	ddrIPv4 []net.IP
+	ddrIPv6 []net.IP
 
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
@@ -150,14 +160,6 @@ var (
 
 	// Feature-presence flags — set once at startup, read-only after.
 	// Allow process.go to skip entire hot-path blocks when features are not in use.
-	//
-	// hasMACRoutes: when false, LookupMAC() is never called and InitARP() is never
-	//   started — no ARP goroutine, no /proc/net/arp reads, no per-query atomic load.
-	// hasDomainRoutes: when false, getDomainRoute() label walk is skipped entirely.
-	// hasRtypePolicy: when false, the rtypePolicy map lookup is skipped entirely.
-	// hasClientNameUpstream: combined with logQueries to gate LookupNameByMACOrIP()
-	//   and all clientName string building. When both are false, that whole block
-	//   (atomic load + up to 2 map reads + up to 2 string allocs) is skipped per query.
 	hasMACRoutes          bool
 	hasDomainRoutes       bool
 	hasRtypePolicy        bool
@@ -184,7 +186,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.21.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.22.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -258,12 +260,36 @@ func main() {
 		for _, h := range cfg.Server.DDR.Hostnames {
 			ddrHostnames[strings.ToLower(strings.TrimSuffix(h, "."))] = true
 		}
-		if cfg.Server.DDR.IPv4 != "" {
-			ddrIPv4 = net.ParseIP(cfg.Server.DDR.IPv4)
+
+		// Parse IPv4 list — reject entries that are not valid IPv4 addresses.
+		for _, s := range cfg.Server.DDR.IPv4 {
+			ip := net.ParseIP(s)
+			if ip == nil {
+				log.Printf("[WARN] DDR ipv4: %q is not a valid IP address — skipped", s)
+				continue
+			}
+			v4 := ip.To4()
+			if v4 == nil {
+				log.Printf("[WARN] DDR ipv4: %q is an IPv6 address, put it in ipv6 — skipped", s)
+				continue
+			}
+			ddrIPv4 = append(ddrIPv4, v4)
 		}
-		if cfg.Server.DDR.IPv6 != "" {
-			ddrIPv6 = net.ParseIP(cfg.Server.DDR.IPv6)
+
+		// Parse IPv6 list — reject entries that are IPv4 addresses.
+		for _, s := range cfg.Server.DDR.IPv6 {
+			ip := net.ParseIP(s)
+			if ip == nil {
+				log.Printf("[WARN] DDR ipv6: %q is not a valid IP address — skipped", s)
+				continue
+			}
+			if ip.To4() != nil {
+				log.Printf("[WARN] DDR ipv6: %q is an IPv4 address, put it in ipv4 — skipped", s)
+				continue
+			}
+			ddrIPv6 = append(ddrIPv6, ip)
 		}
+
 		if len(cfg.Server.ListenDoH) > 0 {
 			ddrDoHPort = extractPort(cfg.Server.ListenDoH[0], 443)
 		}
@@ -272,8 +298,22 @@ func main() {
 		} else if len(cfg.Server.ListenDoQ) > 0 {
 			ddrDoTPort = extractPort(cfg.Server.ListenDoQ[0], 853)
 		}
-		log.Printf("[INIT] DDR enabled for %d hostnames (DoH port: %d, DoT/DoQ port: %d)",
+
+		log.Printf("[INIT] DDR enabled for %d hostname(s), DoH port: %d, DoT/DoQ port: %d",
 			len(ddrHostnames), ddrDoHPort, ddrDoTPort)
+
+		// Log the effective address configuration. Empty slices are valid —
+		// process.go falls back to the incoming query's interface address at runtime.
+		if len(ddrIPv4) == 0 {
+			log.Println("[INIT] DDR IPv4: none configured — will use incoming query interface address")
+		} else {
+			log.Printf("[INIT] DDR IPv4: %v", ddrIPv4)
+		}
+		if len(ddrIPv6) == 0 {
+			log.Println("[INIT] DDR IPv6: none configured — will use incoming query interface address")
+		} else {
+			log.Printf("[INIT] DDR IPv6: %v", ddrIPv6)
+		}
 	}
 
 	// 4. Upstream connections

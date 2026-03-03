@@ -1,12 +1,21 @@
 /*
 File: server.go
-Version: 1.15.0
-Last Updated: 2026-03-03 22:00 CET
+Version: 1.16.0
+Last Updated: 2026-03-03 23:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
              targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.16.0 - [FIX] dohResponseWriter and doqResponseWriter now implement a working
+           LocalAddr() instead of returning nil. This enables process.go's ddrAddrs()
+           to fall back to the query's interface address for DDR spoofing when no
+           explicit IPs are configured in the DDR config section.
+           dohResponseWriter gains a localIP string field populated from the HTTP
+           request context key http.LocalAddrContextKey — this is set by net/http
+           for every incoming connection and gives the listener address the TLS/HTTP
+           handshake arrived on. doqResponseWriter gains the same field, populated
+           from conn.LocalAddr() in handleDoQConnection before the stream loop.
   1.15.0 - [PERF] UDP worker pool is now conditional on listen_udp being non-empty.
            When no UDP listeners are configured the goroutine pool and its buffered
            channel are never allocated, saving cfg.Server.UDPWorkers goroutines and
@@ -300,16 +309,30 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	proto       := "DoH"
+
+	// Extract the local listener IP from the HTTP request context.
+	// net/http sets http.LocalAddrContextKey for every incoming connection,
+	// giving us the address the TLS handshake arrived on. Used by ddrAddrs()
+	// in process.go for the DDR interface-IP fallback.
+	var localHost string
+	if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
+		localHost, _, _ = net.SplitHostPort(la.String())
+	}
+
+	proto := "DoH"
 	if r.Proto == "HTTP/3.0" {
 		proto = "DoH3"
 	}
 
-	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host}, msg, host, proto)
+	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host, localIP: localHost}, msg, host, proto)
 }
 
 func handleDoQConnection(conn *quic.Conn) {
-	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	host, _, _      := net.SplitHostPort(conn.RemoteAddr().String())
+	// Capture the local listener address once per connection — reused for
+	// every stream's doqResponseWriter so ddrAddrs() can derive the interface IP.
+	localHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
@@ -335,16 +358,21 @@ func handleDoQConnection(conn *quic.Conn) {
 			if err := msg.Unpack(buf[:length]); err != nil {
 				return
 			}
-			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host}, msg, host, "DoQ")
+			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host, localIP: localHost}, msg, host, "DoQ")
 		}(stream)
 	}
 }
 
 // --- Response Writer Adapters ---
 
+// dohResponseWriter wraps http.ResponseWriter as a dns.ResponseWriter for DoH/DoH3.
+// localIP holds the listener interface address extracted from the HTTP request context
+// and is exposed via LocalAddr() so process.go's ddrAddrs() can use it for the
+// DDR interface-IP fallback when no explicit IPs are configured in ddr.ipv4/ipv6.
 type dohResponseWriter struct {
 	w        http.ResponseWriter
 	remoteIP string
+	localIP  string
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -358,7 +386,12 @@ func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 	_, err = dw.w.Write(packed)
 	return err
 }
-func (dw *dohResponseWriter) LocalAddr() net.Addr          { return nil }
+func (dw *dohResponseWriter) LocalAddr() net.Addr {
+	if dw.localIP == "" {
+		return nil
+	}
+	return &net.IPAddr{IP: net.ParseIP(dw.localIP)}
+}
 func (dw *dohResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
 func (dw *dohResponseWriter) Write(b []byte) (int, error)  { return dw.w.Write(b) }
 func (dw *dohResponseWriter) Close() error                 { return nil }
@@ -366,9 +399,14 @@ func (dw *dohResponseWriter) TsigStatus() error            { return nil }
 func (dw *dohResponseWriter) TsigTimersOnly(bool)          {}
 func (dw *dohResponseWriter) Hijack()                      {}
 
+// doqResponseWriter wraps a QUIC stream as a dns.ResponseWriter for DoQ.
+// localIP holds the listener interface address captured from the QUIC connection's
+// LocalAddr() in handleDoQConnection and is reused for every stream in that
+// connection. Exposed via LocalAddr() for the same DDR fallback purpose as above.
 type doqResponseWriter struct {
 	stream   *quic.Stream
 	remoteIP string
+	localIP  string
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -386,7 +424,12 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	_, err = dw.stream.Write(packed)
 	return err
 }
-func (dw *doqResponseWriter) LocalAddr() net.Addr          { return nil }
+func (dw *doqResponseWriter) LocalAddr() net.Addr {
+	if dw.localIP == "" {
+		return nil
+	}
+	return &net.IPAddr{IP: net.ParseIP(dw.localIP)}
+}
 func (dw *doqResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
 func (dw *doqResponseWriter) Write(b []byte) (int, error)  { return dw.stream.Write(b) }
 func (dw *doqResponseWriter) Close() error                 { return dw.stream.Close() }

@@ -85,8 +85,8 @@ server:
   ddr:
     enabled: true
     hostnames: ["dns.local.net", "doh.local.net"]
-    ipv4: "192.168.1.100"
-    ipv6: ""   # Leave empty to omit IPv6 SVCB hints and glue records
+    ipv4: ""
+    ipv6: ""
 
   # Staggered parallel upstream queries — eliminates "context deadline exceeded".
   # When > 0 and an upstream group has multiple targets, queries are launched in
