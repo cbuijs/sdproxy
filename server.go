@@ -1,12 +1,17 @@
 /*
 File: server.go
-Version: 1.16.0
-Last Updated: 2026-03-03 23:00 CET
+Version: 1.17.0
+Last Updated: 2026-03-04 14:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
              targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.17.0 - [PERF] dohResponseWriter and doqResponseWriter now store localIP as
+           net.IP instead of string. Previously LocalAddr() called net.ParseIP on
+           every invocation. localIP is set once at connection setup time (per HTTP
+           request / per QUIC connection) so the parse cost moves there — one call
+           per connection instead of one call per DDR query on that connection.
   1.16.0 - [FIX] dohResponseWriter and doqResponseWriter now implement a working
            LocalAddr() instead of returning nil. This enables process.go's ddrAddrs()
            to fall back to the query's interface address for DDR spoofing when no
@@ -310,13 +315,15 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 
-	// Extract the local listener IP from the HTTP request context.
-	// net/http sets http.LocalAddrContextKey for every incoming connection,
-	// giving us the address the TLS handshake arrived on. Used by ddrAddrs()
-	// in process.go for the DDR interface-IP fallback.
-	var localHost string
+	// Extract and immediately parse the local listener IP from the HTTP request
+	// context. net/http sets http.LocalAddrContextKey for every incoming connection.
+	// Parsing here (once per request) instead of inside LocalAddr() (once per DDR
+	// query on that connection) moves the net.ParseIP cost to where it fires once.
+	var localIP net.IP
 	if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-		localHost, _, _ = net.SplitHostPort(la.String())
+		if localHost, _, err := net.SplitHostPort(la.String()); err == nil {
+			localIP = net.ParseIP(localHost)
+		}
 	}
 
 	proto := "DoH"
@@ -324,14 +331,18 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 		proto = "DoH3"
 	}
 
-	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host, localIP: localHost}, msg, host, proto)
+	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host, localIP: localIP}, msg, host, proto)
 }
 
 func handleDoQConnection(conn *quic.Conn) {
-	host, _, _      := net.SplitHostPort(conn.RemoteAddr().String())
-	// Capture the local listener address once per connection — reused for
-	// every stream's doqResponseWriter so ddrAddrs() can derive the interface IP.
-	localHost, _, _ := net.SplitHostPort(conn.LocalAddr().String())
+	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+	// Parse the local listener IP once per connection. Stored as net.IP in
+	// doqResponseWriter so LocalAddr() can return it directly without parsing.
+	var localIP net.IP
+	if localHost, _, err := net.SplitHostPort(conn.LocalAddr().String()); err == nil {
+		localIP = net.ParseIP(localHost)
+	}
 
 	for {
 		stream, err := conn.AcceptStream(context.Background())
@@ -358,7 +369,7 @@ func handleDoQConnection(conn *quic.Conn) {
 			if err := msg.Unpack(buf[:length]); err != nil {
 				return
 			}
-			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host, localIP: localHost}, msg, host, "DoQ")
+			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host, localIP: localIP}, msg, host, "DoQ")
 		}(stream)
 	}
 }
@@ -366,13 +377,13 @@ func handleDoQConnection(conn *quic.Conn) {
 // --- Response Writer Adapters ---
 
 // dohResponseWriter wraps http.ResponseWriter as a dns.ResponseWriter for DoH/DoH3.
-// localIP holds the listener interface address extracted from the HTTP request context
-// and is exposed via LocalAddr() so process.go's ddrAddrs() can use it for the
+// localIP holds the listener interface address parsed once at request setup time
+// and exposed via LocalAddr() so process.go's ddrAddrs() can use it for the
 // DDR interface-IP fallback when no explicit IPs are configured in ddr.ipv4/ipv6.
 type dohResponseWriter struct {
 	w        http.ResponseWriter
 	remoteIP string
-	localIP  string
+	localIP  net.IP // pre-parsed in handleDoH, nil when listener addr is unavailable
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -387,10 +398,10 @@ func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 	return err
 }
 func (dw *dohResponseWriter) LocalAddr() net.Addr {
-	if dw.localIP == "" {
+	if dw.localIP == nil {
 		return nil
 	}
-	return &net.IPAddr{IP: net.ParseIP(dw.localIP)}
+	return &net.IPAddr{IP: dw.localIP}
 }
 func (dw *dohResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
 func (dw *dohResponseWriter) Write(b []byte) (int, error)  { return dw.w.Write(b) }
@@ -400,13 +411,13 @@ func (dw *dohResponseWriter) TsigTimersOnly(bool)          {}
 func (dw *dohResponseWriter) Hijack()                      {}
 
 // doqResponseWriter wraps a QUIC stream as a dns.ResponseWriter for DoQ.
-// localIP holds the listener interface address captured from the QUIC connection's
-// LocalAddr() in handleDoQConnection and is reused for every stream in that
-// connection. Exposed via LocalAddr() for the same DDR fallback purpose as above.
+// localIP holds the listener interface address parsed once per QUIC connection in
+// handleDoQConnection and shared across all streams on that connection. Exposed via
+// LocalAddr() for the same DDR fallback purpose as dohResponseWriter.
 type doqResponseWriter struct {
 	stream   *quic.Stream
 	remoteIP string
-	localIP  string
+	localIP  net.IP // pre-parsed in handleDoQConnection, nil when unavailable
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -425,10 +436,10 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	return err
 }
 func (dw *doqResponseWriter) LocalAddr() net.Addr {
-	if dw.localIP == "" {
+	if dw.localIP == nil {
 		return nil
 	}
-	return &net.IPAddr{IP: net.ParseIP(dw.localIP)}
+	return &net.IPAddr{IP: dw.localIP}
 }
 func (dw *doqResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
 func (dw *doqResponseWriter) Write(b []byte) (int, error)  { return dw.stream.Write(b) }

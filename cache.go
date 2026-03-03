@@ -1,7 +1,7 @@
 /*
 File: cache.go
-Version: 1.15.0
-Last Updated: 2026-03-03 23:30 CET
+Version: 1.16.0
+Last Updated: 2026-03-04 14:00 CET
 Description: High-performance, sharded, non-blocking DNS cache.
              Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
              with no answer records) responses per RFC 2308.
@@ -9,6 +9,9 @@ Description: High-performance, sharded, non-blocking DNS cache.
              pseudo-random eviction, reduced shard count.
 
 Changes:
+  1.16.0 - [PERF] Pre-computed cacheMaxPerShard in InitCache. Previously CacheSet
+           recomputed cfg.Cache.Size/shardCount (an integer division) on every
+           single write. Now set once at startup into a package-level var.
   1.15.0 - [FEAT] max_ttl support: caps cached TTLs at a configurable ceiling.
            Applied in CacheSet alongside min_ttl so both floors and ceilings are
            enforced before the expiration timestamp is written — works uniformly
@@ -68,6 +71,11 @@ type cacheShard struct {
 
 var shards [shardCount]*cacheShard
 
+// cacheMaxPerShard is the eviction threshold per shard, computed once in InitCache.
+// CacheSet previously recomputed cfg.Cache.Size/shardCount (integer division) on
+// every write — this eliminates that entirely.
+var cacheMaxPerShard int
+
 func InitCache(maxSize int, minTTL int) {
 	if !cfg.Cache.Enabled {
 		return
@@ -76,6 +84,12 @@ func InitCache(maxSize int, minTTL int) {
 		shards[i] = &cacheShard{
 			items: make(map[DNSCacheKey]cacheItem),
 		}
+	}
+
+	// Pre-compute once — used by CacheSet on every write.
+	cacheMaxPerShard = cfg.Cache.Size / shardCount
+	if cacheMaxPerShard < 1 {
+		cacheMaxPerShard = 1
 	}
 
 	// Background sweeper: reclaims memory from naturally expired items.
@@ -249,17 +263,14 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg) {
 		return
 	}
 
-	expiration  := time.Now().Add(time.Duration(ttl) * time.Second)
-	maxPerShard := cfg.Cache.Size / shardCount
-	if maxPerShard < 1 {
-		maxPerShard = 1
-	}
+	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
 
 	shard := getShard(key)
 	shard.Lock()
 	// Zero-allocation pseudo-random eviction: Go map iteration order is randomised,
 	// so deleting the first key we encounter is statistically fair and allocation-free.
-	if len(shard.items) >= maxPerShard {
+	// cacheMaxPerShard is pre-computed in InitCache — no division on the hot path.
+	if len(shard.items) >= cacheMaxPerShard {
 		for k := range shard.items {
 			delete(shard.items, k)
 			break

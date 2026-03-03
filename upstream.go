@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.20.0
-Last Updated: 2026-03-03 21:30 CET
+Version: 1.21.0
+Last Updated: 2026-03-04 14:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries.
@@ -23,6 +23,13 @@ Description: Manages connections to external DNS upstream providers.
                the natural cadence of DNS queries provides the probing.
 
 Changes:
+  1.21.0 - [PERF] Pre-computed dialHost and dialAddrs fields on Upstream.
+           parseHostPort (which calls url.Parse + allocates "http://"+raw) was
+           called on every Exchange() for UDP, TCP, DoT, and DoQ. These values
+           are entirely static after startup. ParseUpstream now pre-computes them
+           once and stores them in the struct. Exchange() reads a []string field
+           instead of calling url.Parse. Also dropped the targetURL parameter from
+           exchangeDoQ — it was always u.RawURL and the receiver already has it.
   1.20.0 - [LOG] Exchange() prefixes the returned address with the protocol scheme
            (e.g. "udp://1.1.1.1:53", "dot://9.9.9.9:853", "doh://…"). process.go
            logs this value as-is — no changes needed there.
@@ -118,6 +125,18 @@ type Upstream struct {
 
 	doqMu    sync.Mutex
 	doqConns map[string]*doqConnEntry
+
+	// dialHost is the pre-parsed TLS SNI hostname for DoT and DoQ upstreams.
+	// For UDP and TCP it's the bare target hostname. Empty for DoH/DoH3 — those
+	// protocols let http.Transport manage dialing entirely.
+	dialHost string
+
+	// dialAddrs holds the pre-computed dial address(es) for explicit-dial protocols
+	// (UDP, TCP, DoT, DoQ). Computed once in ParseUpstream from RawURL + BootstrapIPs.
+	// Eliminates a parseHostPort (url.Parse + alloc) call on every Exchange().
+	// len==1 for plain upstreams; len==len(BootstrapIPs) when bootstrap IPs are set.
+	// Unused for DoH/DoH3 — dialing is handled inside http.Transport.
+	dialAddrs []string
 
 	// Health tracking — lock-free via atomics.
 	// consFails counts consecutive Exchange failures. Incremented on failure,
@@ -227,20 +246,38 @@ func ParseUpstream(raw string) (*Upstream, error) {
 		return nil, fmt.Errorf("unsupported protocol scheme in: %s", raw)
 	}
 
+	// Pre-compute dial host and addresses for explicit-dial protocols (UDP, TCP, DoT,
+	// DoQ). parseHostPort is called once here at startup instead of on every Exchange.
+	// DoH and DoH3 are excluded — http.Transport owns dialing for those protocols.
+	switch u.Proto {
+	case "udp", "tcp", "dot", "doq":
+		host, port := parseHostPort(u.RawURL, u.Proto)
+		u.dialHost  = host
+		if len(u.BootstrapIPs) > 0 {
+			u.dialAddrs = make([]string, len(u.BootstrapIPs))
+			for i, ip := range u.BootstrapIPs {
+				u.dialAddrs[i] = net.JoinHostPort(ip, port)
+			}
+		} else {
+			u.dialAddrs = []string{net.JoinHostPort(host, port)}
+		}
+	}
+
 	return u, nil
 }
 
 // Exchange forwards a DNS query to this upstream and returns the response.
 // The second return value is a loggable string combining protocol and address:
-//   - UDP/TCP/DoT/DoQ: "proto://ip:port" using the actual IP dialled, e.g.
-//     "udp://1.1.1.1:53" or "dot://9.9.9.9:853". When bootstrap IPs are in use
-//     this shows the real IP rather than the configured hostname.
+//   - UDP/TCP/DoT/DoQ: "proto://ip:port" using the actual IP dialled.
 //   - DoH/DoH3: "doh://…" or "doh3://…" prefixed full HTTPS URL. The actual IP
 //     is opaque inside http.Transport and not surfaceable without invasive hooks.
 //
 // The caller's req is never modified — prepareForwardQuery creates an internal
 // copy. Callers must NOT pre-copy; that would be a redundant deep copy.
 func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
+	// {client-name} substitution only applies to DoH/DoH3 where it appears in the
+	// URL path. For explicit-dial protocols the RawURL is host:port and substitution
+	// there would be a misconfiguration — dialAddrs is always pre-computed correctly.
 	targetURL := u.RawURL
 	if u.hasClientNameTemplate {
 		targetURL = strings.ReplaceAll(u.RawURL, "{client-name}", clientName)
@@ -251,66 +288,48 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 
 	switch u.Proto {
 	case "udp":
-		host, port := parseHostPort(targetURL, u.Proto)
-
-		dialAddrs := []string{net.JoinHostPort(host, port)}
-		if len(u.BootstrapIPs) > 0 {
-			dialAddrs = nil
-			for _, ip := range u.BootstrapIPs {
-				dialAddrs = append(dialAddrs, net.JoinHostPort(ip, port))
-			}
-		}
-
+		// u.dialAddrs is pre-computed in ParseUpstream — no parseHostPort here.
 		client := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
 		var (
 			resp *dns.Msg
 			err  error
 		)
-		for _, dialAddr := range dialAddrs {
+		for _, dialAddr := range u.dialAddrs {
 			resp, _, err = client.ExchangeContext(ctx, fwd, dialAddr)
 			if err == nil && resp != nil {
 				return resp, "udp://"+dialAddr, nil
 			}
 		}
-		return nil, "udp://"+targetURL, err
+		return nil, "udp://"+u.RawURL, err
 
 	case "tcp", "dot":
-		host, port := parseHostPort(targetURL, u.Proto)
-
-		dialAddrs := []string{net.JoinHostPort(host, port)}
-		if len(u.BootstrapIPs) > 0 {
-			dialAddrs = nil
-			for _, ip := range u.BootstrapIPs {
-				dialAddrs = append(dialAddrs, net.JoinHostPort(ip, port))
-			}
-		}
-
+		// u.dialAddrs and u.dialHost are pre-computed in ParseUpstream.
 		var lastErr error
-		for _, dialAddr := range dialAddrs {
-			resp, err := u.exchangeStream(ctx, fwd, dialAddr, host)
+		for _, dialAddr := range u.dialAddrs {
+			resp, err := u.exchangeStream(ctx, fwd, dialAddr, u.dialHost)
 			if err == nil && resp != nil {
 				return resp, u.Proto+"://"+dialAddr, nil
 			}
 			lastErr = err
 		}
-		return nil, u.Proto+"://"+targetURL, lastErr
+		return nil, u.Proto+"://"+u.RawURL, lastErr
 
 	case "doh":
 		// DoH: actual IP is managed by http.Transport (bootstrap DialContext).
-		// We can't surface it without hooking deep into net/http — prefix the URL.
-		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h2Client)
 		// Replace "https://" with "doh://" so the log output is consistent with
 		// the other protocols and the config file scheme names.
+		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h2Client)
 		return resp, "doh://"+strings.TrimPrefix(targetURL, "https://"), err
 
 	case "doh3":
-		// DoH3: same as DoH — actual IP is inside http3.Transport, not surfaceable here.
+		// DoH3: same as DoH — actual IP is inside http3.Transport, not surfaceable.
 		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h3Client)
 		return resp, "doh3://"+strings.TrimPrefix(targetURL, "https://"), err
 
 	case "doq":
-		// DoQ: exchangeDoQ returns the actual IP:port dialled — we prefix the scheme here.
-		resp, dialAddr, err := u.exchangeDoQ(ctx, fwd, targetURL)
+		// exchangeDoQ uses u.RawURL as pool key and u.dialHost/u.dialAddrs for
+		// dialing — no targetURL parameter needed.
+		resp, dialAddr, err := u.exchangeDoQ(ctx, fwd)
 		return resp, "doq://"+dialAddr, err
 
 	default:
@@ -611,41 +630,32 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 
 // --- QUIC (DoQ) ---
 
-// exchangeDoQ returns the DNS response, the actual IP:port that was dialled,
-// and any error. The dial address is threaded up from dialDoQ so that Exchange()
-// can return the real address to the caller for accurate log output.
-func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL string) (*dns.Msg, string, error) {
-	host, port := parseHostPort(targetURL, "doq")
+// exchangeDoQ returns the DNS response, the actual IP:port dialled, and any error.
+// Uses u.RawURL as the connection pool key and u.dialHost/u.dialAddrs for dialing —
+// no targetURL parameter needed since all required values live on the receiver.
+func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg) (*dns.Msg, string, error) {
+	key := u.RawURL // stable pool key — u.RawURL never contains {client-name} for DoQ
 
-	dialAddrs := []string{net.JoinHostPort(host, port)}
-	if len(u.BootstrapIPs) > 0 {
-		dialAddrs = nil
-		for _, ip := range u.BootstrapIPs {
-			dialAddrs = append(dialAddrs, net.JoinHostPort(ip, port))
-		}
-	}
-
-	if conn := u.takeDoQConn(targetURL); conn != nil {
+	if conn := u.takeDoQConn(key); conn != nil {
 		resp, err := u.doqStreamExchange(ctx, conn, req)
 		if err == nil {
-			u.putDoQConn(targetURL, conn)
-			// Re-use path: we don't know which dialAddr the cached conn was opened
-			// on, so fall back to targetURL (host:port). This is a minor inaccuracy
-			// only when bootstrap IPs are set and the connection was already pooled.
-			return resp, targetURL, nil
+			u.putDoQConn(key, conn)
+			// Re-use path: report the raw host:port since the cached conn's original
+			// dial address is not tracked after the initial dial.
+			return resp, key, nil
 		}
 		(*conn).CloseWithError(0, "stale")
 	}
 
-	newConn, dialAddr, err := u.dialDoQ(host, dialAddrs)
+	newConn, dialAddr, err := u.dialDoQ(u.dialHost, u.dialAddrs)
 	if err != nil {
-		return nil, targetURL, err
+		return nil, key, err
 	}
-	u.putDoQConn(targetURL, newConn)
+	u.putDoQConn(key, newConn)
 
 	resp, err := u.doqStreamExchange(ctx, newConn, req)
 	if err != nil {
-		u.removeDoQConn(targetURL)
+		u.removeDoQConn(key)
 		(*newConn).CloseWithError(0, "exchange failed")
 		return nil, dialAddr, err
 	}
@@ -750,6 +760,8 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 
 // --- Shared Helpers ---
 
+// parseHostPort is used only at ParseUpstream time (startup) to pre-compute
+// dialHost and dialAddrs. It is no longer called on the query hot path.
 func parseHostPort(raw, proto string) (string, string) {
 	host, port := raw, ""
 	if parsed, err := url.Parse("http://" + raw); err == nil {
