@@ -1,35 +1,24 @@
 /*
 File: server.go
-Version: 1.14.0
-Last Updated: 2026-03-02 20:00 CET
+Version: 1.15.0
+Last Updated: 2026-03-03 22:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
-             DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory
-             on embedded targets. Supports RFC 8484 GET and POST for DoH.
+             DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
+             targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
-  1.14.0 - [PERF] DoH POST handler: eliminated unnecessary alloc+copy. The old
-           code read into a pool buffer, then called make([]byte, n) + copy() to
-           create a separate slice before unpacking. dns.Msg.Unpack creates
-           independent copies of all fields — it never aliases its input buffer.
-           The pool buffer lives until function return (defer), so unpacking
-           directly from it is safe. Saves one allocation + memcpy per DoH POST.
+  1.15.0 - [PERF] UDP worker pool is now conditional on listen_udp being non-empty.
+           When no UDP listeners are configured the goroutine pool and its buffered
+           channel are never allocated, saving cfg.Server.UDPWorkers goroutines and
+           a (UDPWorkers*10)-deep channel. handleUDP is safe with a nil udpQueue
+           because the select default branch fires immediately — queries are dropped
+           rather than causing a nil-channel block or panic.
+  1.14.0 - [PERF] DoH POST handler: eliminated unnecessary alloc+copy.
   1.13.0 - [FIX]  DoH listener now correctly supports HTTP/1.1 alongside HTTP/2.
-           The shared tlsConf carries non-HTTP ALPN tokens ("doq", "dot") which
-           cause strict HTTP/1.1 clients to reject the TLS handshake. The DoH
-           HTTP server now uses a cloned TLS config with NextProtos restricted
-           to ["h2", "http/1.1"]. Go's net/http stack negotiates between the
-           two automatically — no handler changes required.
-  1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions. The original
-           code registered handleTCP for both plain TCP and DoT, logging "TCP" for
-           all TLS connections. DoT connections now correctly log "DoT".
-           [FIX]  Replaced the always-false TLS detection branch with a proper
-           separate handler registration. miekg/dns doesn't expose TLS state
-           through ResponseWriter, so the only reliable fix is a separate handler.
-           [FIX]  Added clean graceful shutdown via shutdownCh channel. The previous
-           implementation had no way to signal UDP worker goroutines to exit,
-           causing goroutine leaks on SIGTERM. Workers now exit cleanly via select.
-           [PERF] Uses tiered buffer pools: smallBufPool (4KB) for message packing,
-           largeBufPool (64KB) for body reads where message size is unknown.
+           Cloned TLS config with NextProtos restricted to ["h2", "http/1.1"].
+  1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions.
+           [FIX]  Added clean graceful shutdown via shutdownCh channel.
+           [PERF] Tiered buffer pools: smallBufPool (4KB) and largeBufPool (64KB).
   1.11.0 - Added full HTTP GET and POST support for DoH/DoH3 clients.
 */
 
@@ -73,34 +62,39 @@ func Shutdown() {
 }
 
 func StartServers(tlsConf *tls.Config) {
-	// 0. Bounded UDP worker pool with clean shutdown support
-	udpQueue = make(chan udpJob, cfg.Server.UDPWorkers*10)
-	for i := 0; i < cfg.Server.UDPWorkers; i++ {
-		go func() {
-			for {
-				select {
-				case job, ok := <-udpQueue:
-					if !ok {
-						return
-					}
-					var ip string
-					if addr, ok := job.w.RemoteAddr().(*net.UDPAddr); ok {
-						ip = addr.IP.String()
-					}
-					ProcessDNS(job.w, job.r, ip, "UDP")
-				case <-shutdownCh:
-					return
-				}
-			}
-		}()
-	}
-	log.Printf("[LISTEN] UDP Worker Pool: %d routines", cfg.Server.UDPWorkers)
-
 	const (
 		tcpReadTimeout  = 2 * time.Second
 		tcpWriteTimeout = 2 * time.Second
 		tcpIdleTimeout  = 10 * time.Second
 	)
+
+	// 0. Bounded UDP worker pool — only allocated when UDP listeners are configured.
+	// Skipped entirely when listen_udp is empty, saving UDPWorkers goroutines and a
+	// (UDPWorkers*10)-slot channel. handleUDP's select default branch makes a nil
+	// udpQueue safe: incoming jobs are dropped rather than blocking or panicking.
+	if len(cfg.Server.ListenUDP) > 0 {
+		udpQueue = make(chan udpJob, cfg.Server.UDPWorkers*10)
+		for i := 0; i < cfg.Server.UDPWorkers; i++ {
+			go func() {
+				for {
+					select {
+					case job, ok := <-udpQueue:
+						if !ok {
+							return
+						}
+						var ip string
+						if addr, ok := job.w.RemoteAddr().(*net.UDPAddr); ok {
+							ip = addr.IP.String()
+						}
+						ProcessDNS(job.w, job.r, ip, "UDP")
+					case <-shutdownCh:
+						return
+					}
+				}
+			}()
+		}
+		log.Printf("[LISTEN] UDP Worker Pool: %d routines", cfg.Server.UDPWorkers)
+	}
 
 	// 1. DNS over UDP
 	for _, addr := range cfg.Server.ListenUDP {
@@ -119,7 +113,8 @@ func StartServers(tlsConf *tls.Config) {
 		addr := addr
 		go func() {
 			server := &dns.Server{
-				Addr: addr, Net: "tcp",
+				Addr:         addr,
+				Net:          "tcp",
 				Handler:      dns.HandlerFunc(handleTCP),
 				ReadTimeout:  tcpReadTimeout,
 				WriteTimeout: tcpWriteTimeout,
@@ -136,7 +131,8 @@ func StartServers(tlsConf *tls.Config) {
 		addr := addr
 		go func() {
 			server := &dns.Server{
-				Addr: addr, Net: "tcp-tls",
+				Addr:         addr,
+				Net:          "tcp-tls",
 				TLSConfig:    tlsConf,
 				Handler:      dns.HandlerFunc(handleDoT),
 				ReadTimeout:  tcpReadTimeout,
@@ -155,11 +151,16 @@ func StartServers(tlsConf *tls.Config) {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/dns-query", handleDoH)
 
-		dohTLS           := tlsConf.Clone()
-		dohTLS.NextProtos = []string{"h2", "http/1.1"}
+		// Clone the shared TLS config and restrict ALPN to HTTP-only tokens.
+		// The shared tlsConf carries "doq" and "dot" which cause strict HTTP/1.1
+		// clients to reject the handshake — the HTTP server needs its own clone.
+		dohTLS            := tlsConf.Clone()
+		dohTLS.NextProtos  = []string{"h2", "http/1.1"}
 
 		h2Server := &http.Server{
-			Addr: addr, Handler: mux, TLSConfig: dohTLS,
+			Addr:           addr,
+			Handler:        mux,
+			TLSConfig:      dohTLS,
 			ReadTimeout:    tcpReadTimeout,
 			WriteTimeout:   tcpWriteTimeout,
 			IdleTimeout:    tcpIdleTimeout,
@@ -173,7 +174,9 @@ func StartServers(tlsConf *tls.Config) {
 		}()
 
 		h3Server := &http3.Server{
-			Addr: addr, Handler: mux, TLSConfig: tlsConf,
+			Addr:      addr,
+			Handler:   mux,
+			TLSConfig: tlsConf,
 			QUICConfig: &quic.Config{
 				Allow0RTT:          true,
 				MaxIdleTimeout:     tcpIdleTimeout,
@@ -192,8 +195,8 @@ func StartServers(tlsConf *tls.Config) {
 	for _, addr := range cfg.Server.ListenDoQ {
 		addr := addr
 		go func() {
-			doqTLS            := tlsConf.Clone()
-			doqTLS.NextProtos  = []string{"doq"}
+			doqTLS           := tlsConf.Clone()
+			doqTLS.NextProtos = []string{"doq"}
 			listener, err := quic.ListenAddr(addr, doqTLS, &quic.Config{
 				Allow0RTT:          true,
 				MaxIdleTimeout:     tcpIdleTimeout,
@@ -215,6 +218,8 @@ func StartServers(tlsConf *tls.Config) {
 }
 
 func handleUDP(w dns.ResponseWriter, r *dns.Msg) {
+	// udpQueue is nil when no listen_udp addresses are configured.
+	// The default branch drops the query safely without blocking.
 	select {
 	case udpQueue <- udpJob{w: w, r: r}:
 	case <-shutdownCh:
@@ -268,7 +273,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		r.Body.Close()
-		payload = buf[:n] // Safe: Unpack doesn't alias input; pool buf lives until defer
+		payload = buf[:n]
 
 	case http.MethodGet:
 		b64 := r.URL.Query().Get("dns")
@@ -353,13 +358,13 @@ func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 	_, err = dw.w.Write(packed)
 	return err
 }
-func (dw *dohResponseWriter) LocalAddr() net.Addr              { return nil }
-func (dw *dohResponseWriter) RemoteAddr() net.Addr             { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
-func (dw *dohResponseWriter) Write(b []byte) (int, error)      { return dw.w.Write(b) }
-func (dw *dohResponseWriter) Close() error                     { return nil }
-func (dw *dohResponseWriter) TsigStatus() error                { return nil }
-func (dw *dohResponseWriter) TsigTimersOnly(bool)              {}
-func (dw *dohResponseWriter) Hijack()                          {}
+func (dw *dohResponseWriter) LocalAddr() net.Addr          { return nil }
+func (dw *dohResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
+func (dw *dohResponseWriter) Write(b []byte) (int, error)  { return dw.w.Write(b) }
+func (dw *dohResponseWriter) Close() error                 { return nil }
+func (dw *dohResponseWriter) TsigStatus() error            { return nil }
+func (dw *dohResponseWriter) TsigTimersOnly(bool)          {}
+func (dw *dohResponseWriter) Hijack()                      {}
 
 type doqResponseWriter struct {
 	stream   *quic.Stream
@@ -381,11 +386,11 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	_, err = dw.stream.Write(packed)
 	return err
 }
-func (dw *doqResponseWriter) LocalAddr() net.Addr              { return nil }
-func (dw *doqResponseWriter) RemoteAddr() net.Addr             { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
-func (dw *doqResponseWriter) Write(b []byte) (int, error)      { return dw.stream.Write(b) }
-func (dw *doqResponseWriter) Close() error                     { return dw.stream.Close() }
-func (dw *doqResponseWriter) TsigStatus() error                { return nil }
-func (dw *doqResponseWriter) TsigTimersOnly(bool)              {}
-func (dw *doqResponseWriter) Hijack()                          {}
+func (dw *doqResponseWriter) LocalAddr() net.Addr          { return nil }
+func (dw *doqResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
+func (dw *doqResponseWriter) Write(b []byte) (int, error)  { return dw.stream.Write(b) }
+func (dw *doqResponseWriter) Close() error                 { return dw.stream.Close() }
+func (dw *doqResponseWriter) TsigStatus() error            { return nil }
+func (dw *doqResponseWriter) TsigTimersOnly(bool)          {}
+func (dw *doqResponseWriter) Hijack()                      {}
 

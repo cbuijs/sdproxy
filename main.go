@@ -1,42 +1,37 @@
 /*
 File: main.go
-Version: 1.20.0
-Last Updated: 2026-03-03 16:00 CET
+Version: 1.21.0
+Last Updated: 2026-03-03 22:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
-  1.20.0 - [PERF] Route index table: upstream group names are mapped to uint8
-           indices at startup (routeIdxByName). ProcessDNS uses the index in
-           DNSCacheKey.RouteIdx instead of a Route string, eliminating per-lookup
-           string pointer chasing in getShard (cache.go v1.14.0).
-           routeIdxLocal (0) is reserved for local hosts/leases cache entries and
-           never appears in cfg.Upstreams. routeIdxDefault points to "default".
-           getRouteIdx() provides a safe lookup with a "default" fallback.
-           [PERF] Changed SetGCPercent from 20 to 100. GOGC=20 triggered GC every
-           time the live heap grew by 20% — on a 4 MB live heap that's a collection
-           every 0.8 MB of allocation, causing more STW pauses than necessary.
-           GOGC=100 (Go's default) lets the heap breathe between collections.
-           SetMemoryLimit already caps the ceiling, so memory safety is unchanged.
+  1.21.0 - [PERF] Four feature-presence flags set at startup and used by process.go
+           to skip hot-path work when features are unconfigured:
+             hasMACRoutes:          true when cfg.Routes has valid MAC entries.
+                                    Gates LookupMAC(), MAC route lookup, and — most
+                                    importantly — InitARP(). Without MAC routes the
+                                    ARP polling goroutine never starts, /proc/net/arp
+                                    is never read, and LookupMAC() is never called.
+             hasDomainRoutes:       true when cfg.DomainRoutes is non-empty.
+                                    Gates getDomainRoute() label walk in process.go.
+             hasRtypePolicy:        true when cfg.RtypePolicy is non-empty.
+                                    Gates rtypePolicy map lookup in process.go.
+             hasClientNameUpstream: true when any upstream URL contains {client-name}.
+                                    Combined with logQueries to gate identity resolution
+                                    and all clientName string building in process.go.
+           Scanning for hasClientNameUpstream reuses the already-built routeUpstreams
+           map — no extra parsing, just a two-level range with an early break.
+  1.20.0 - [PERF] Route index table: upstream group names mapped to uint8 indices
+           (routeIdxByName). DNSCacheKey.RouteIdx replaces Route string field.
+           [PERF] SetGCPercent changed from 20 to 100.
   1.19.0 - [FEAT] RType Policy config section.
-  1.18.0 - [PERF] Added logging.log_queries config option. Controls whether
-           per-query log lines are emitted in ProcessDNS. log.Printf acquires a
-           global mutex and runs fmt.Sprintf with reflection — with 10 UDP workers
-           all logging on every query this was the single biggest serialisation
-           point under load. When log_queries is false, per-query log lines are
-           suppressed entirely — no mutex, no formatting, no I/O. Error messages
-           and startup/shutdown lines always log regardless. The logQueries global
-           bool is set once at startup and read without locking (immutable after init).
-  1.17.0 - [FEAT] Added identity.poll_interval config field. Controls how often
-           hosts and lease files are checked for changes. Defaults to 30 seconds
-           when omitted or 0; enforced floor of 5 seconds (identity.go).
-  1.16.0 - [FIX]  DDR SVCB port numbers were hardcoded to 443 (DoH) and 853
-           (DoT/DoQ). Ports are now derived from the first configured listener
-           address for each protocol at startup and stored as ddrDoHPort and
-           ddrDoTPort globals.
-  1.15.0 - [PERF] Replaced single 64KB bufPool with tiered smallBufPool (4KB) and
-           largeBufPool (64KB). Added memory_limit_mb config option.
+  1.18.0 - [PERF] logging.log_queries config option.
+  1.17.0 - [FEAT] identity.poll_interval config field.
+  1.16.0 - [FIX]  DDR SVCB port numbers derived from first configured listener.
+  1.15.0 - [PERF] Tiered buffer pools (smallBufPool 4KB, largeBufPool 64KB).
+           Added memory_limit_mb config option.
   1.14.0 - Added DomainRoutes initialisation, DDR spoofing, TLS auto-generation.
 */
 
@@ -103,13 +98,7 @@ type Config struct {
 	} `yaml:"server"`
 
 	Logging struct {
-		StripTime bool `yaml:"strip_time"`
-
-		// LogQueries controls per-query log output in ProcessDNS.
-		// true  = every query is logged with client IP, route, upstream, etc.
-		//         (good for debugging, bad for throughput under high load)
-		// false = per-query lines suppressed; errors and startup lines still log.
-		// Default: true (set explicitly in config or defaults to true below).
+		StripTime  bool  `yaml:"strip_time"`
 		LogQueries *bool `yaml:"log_queries"`
 	} `yaml:"logging"`
 
@@ -130,9 +119,7 @@ type Config struct {
 	DomainRoutes map[string]string      `yaml:"domain_routes"`
 
 	// RtypePolicy maps DNS RR type names to RCODE names (both case-insensitive).
-	// At startup these strings are resolved to uint16/int via dns.StringToType and
-	// dns.StringToRcode and stored in the rtypePolicy global for O(1) hot-path use.
-	// Example: {"ANY": "REFUSED", "HINFO": "NOTIMP", "AXFR": "REFUSED"}
+	// Resolved to uint16/int at startup and stored in rtypePolicy for O(1) hot-path use.
 	RtypePolicy map[string]string `yaml:"rtype_policy"`
 }
 
@@ -143,7 +130,7 @@ type ParsedRoute struct {
 	ClientName string
 }
 
-// Global read-only state (set during init, never written after — inherently thread-safe)
+// Global read-only state — set during init, never written after (inherently thread-safe).
 var (
 	macRoutes      map[string]ParsedRoute
 	domainRoutes   map[string]string
@@ -155,35 +142,35 @@ var (
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
 
-	// rtypePolicy: parsed from cfg.RtypePolicy at startup. Key: DNS qtype (uint16),
-	// value: RCODE (int). O(1) lookup in ProcessDNS step 0.
 	rtypePolicy map[uint16]int
 
-	// routeIdxByName maps upstream group names to uint8 indices for use in
-	// DNSCacheKey.RouteIdx. Assigned once at startup, never written after.
-	//   routeIdxLocal (0)   — reserved for local hosts/leases cache entries
-	//   routeIdxDefault     — index of the "default" upstream group
-	// All other groups are assigned indices starting at 1.
-	routeIdxByName map[string]uint8
-
-	// routeIdxLocal is the fixed index for local-only cache entries.
-	// It is const 0 and never appears in cfg.Upstreams.
-	routeIdxLocal uint8 = 0
-
-	// routeIdxDefault is the index of the "default" upstream group.
-	// Set at startup once routeIdxByName is built.
+	routeIdxByName  map[string]uint8
+	routeIdxLocal   uint8 = 0
 	routeIdxDefault uint8
+
+	// Feature-presence flags — set once at startup, read-only after.
+	// Allow process.go to skip entire hot-path blocks when features are not in use.
+	//
+	// hasMACRoutes: when false, LookupMAC() is never called and InitARP() is never
+	//   started — no ARP goroutine, no /proc/net/arp reads, no per-query atomic load.
+	// hasDomainRoutes: when false, getDomainRoute() label walk is skipped entirely.
+	// hasRtypePolicy: when false, the rtypePolicy map lookup is skipped entirely.
+	// hasClientNameUpstream: combined with logQueries to gate LookupNameByMACOrIP()
+	//   and all clientName string building. When both are false, that whole block
+	//   (atomic load + up to 2 map reads + up to 2 string allocs) is skipped per query.
+	hasMACRoutes          bool
+	hasDomainRoutes       bool
+	hasRtypePolicy        bool
+	hasClientNameUpstream bool
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
 //
-// smallBufPool (4KB): for packing outgoing DNS messages. DNS responses are always
-// small (< 512B plain, < 4KB with EDNS0). Using a 4KB pool here vs 64KB cuts
-// per-buffer memory by 94% on the hot packing path.
+// smallBufPool (4KB): packing outgoing DNS messages. DNS responses are always
+// small (< 512B plain, < 4KB with EDNS0). 94% smaller than a 64KB pool per buffer.
 //
-// largeBufPool (64KB): for reading incoming HTTP bodies and DoQ streams where the
-// payload size is unknown ahead of time. 64KB matches the DNS wire format maximum
-// and ensures correctness for large DNSSEC responses.
+// largeBufPool (64KB): reading incoming HTTP bodies and DoQ streams where payload
+// size is unknown. Matches the DNS wire format maximum for large DNSSEC responses.
 var (
 	smallBufPool = sync.Pool{New: func() any { b := make([]byte, 4096); return &b }}
 	largeBufPool = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
@@ -191,17 +178,13 @@ var (
 
 func main() {
 	// GOGC=100 (Go default): GC when live heap doubles from its post-GC size.
-	// The previous value of 20 triggered GC every time the heap grew 20% —
-	// on a small heap (4-8 MB) that means a collection every ~0.8 MB of allocation,
-	// with measurable STW pauses. GOGC=100 gives the heap room to breathe.
-	// SetMemoryLimit (configured below) already caps the absolute ceiling, so
-	// memory safety is maintained regardless of GOGC.
+	// SetMemoryLimit caps the absolute ceiling so memory safety is unaffected.
 	debug.SetGCPercent(100)
 
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.20.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.21.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -217,14 +200,10 @@ func main() {
 		log.SetFlags(log.Ldate | log.Ltime)
 	}
 
-	// Wire up conditional per-query logging. When false, all per-query log lines
-	// in ProcessDNS are suppressed entirely — no mutex, no fmt.Sprintf, no I/O.
-	// Errors and startup messages always log regardless.
-	// Default: true (when omitted from config) — safe for small networks and debugging.
 	if cfg.Logging.LogQueries != nil {
 		logQueries = *cfg.Logging.LogQueries
 	} else {
-		logQueries = true // Default: log everything — user must opt out
+		logQueries = true
 	}
 	if logQueries {
 		log.Println("[BOOT] Per-query logging enabled (logging.log_queries: true)")
@@ -232,7 +211,6 @@ func main() {
 		log.Println("[BOOT] Per-query logging disabled (logging.log_queries: false)")
 	}
 
-	// Hard memory ceiling — critical on routers with 32-128 MB RAM.
 	if cfg.Server.MemoryLimitMB > 0 {
 		limit := int64(cfg.Server.MemoryLimitMB) * 1024 * 1024
 		debug.SetMemoryLimit(limit)
@@ -243,13 +221,11 @@ func main() {
 		cfg.Server.UDPWorkers = 10
 	}
 
-	// Staggered parallel upstream racing (upstream.go raceExchange).
-	// 0 = sequential (no parallelism). >0 = stagger delay between parallel launches.
 	upstreamStagger = time.Duration(cfg.Server.UpstreamStaggerMs) * time.Millisecond
 	if upstreamStagger > 0 {
-	    log.Printf("[BOOT] Upstream stagger: %s (parallel racing enabled)", upstreamStagger)
+		log.Printf("[BOOT] Upstream stagger: %s (parallel racing enabled)", upstreamStagger)
 	} else {
-	    log.Println("[BOOT] Upstream stagger: 0 (sequential mode)")
+		log.Println("[BOOT] Upstream stagger: 0 (sequential mode)")
 	}
 
 	// 1. MAC-based routes
@@ -264,14 +240,17 @@ func main() {
 			log.Printf("[WARN] Invalid MAC in routes: %s", macStr)
 		}
 	}
+	hasMACRoutes = len(macRoutes) > 0
+	log.Printf("[INIT] MAC routes: %d entries (ARP polling enabled: %v)", len(macRoutes), hasMACRoutes)
 
-	// 2. Domain-based routes (O(1) suffix lookup map)
+	// 2. Domain-based routes
 	domainRoutes = make(map[string]string)
 	for domain, upstream := range cfg.DomainRoutes {
 		clean := strings.ToLower(strings.TrimSuffix(domain, "."))
 		domainRoutes[clean] = upstream
 		log.Printf("[INIT] Domain Route: *.%s -> %s", clean, upstream)
 	}
+	hasDomainRoutes = len(domainRoutes) > 0
 
 	// 3. DDR spoofing
 	if cfg.Server.DDR.Enabled {
@@ -285,7 +264,6 @@ func main() {
 		if cfg.Server.DDR.IPv6 != "" {
 			ddrIPv6 = net.ParseIP(cfg.Server.DDR.IPv6)
 		}
-
 		if len(cfg.Server.ListenDoH) > 0 {
 			ddrDoHPort = extractPort(cfg.Server.ListenDoH[0], 443)
 		}
@@ -294,7 +272,6 @@ func main() {
 		} else if len(cfg.Server.ListenDoQ) > 0 {
 			ddrDoTPort = extractPort(cfg.Server.ListenDoQ[0], 853)
 		}
-
 		log.Printf("[INIT] DDR enabled for %d hostnames (DoH port: %d, DoT/DoQ port: %d)",
 			len(ddrHostnames), ddrDoHPort, ddrDoTPort)
 	}
@@ -319,6 +296,20 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
+	// Scan all upstream groups for {client-name} template usage.
+	// Done after routeUpstreams is fully built — single two-level range with early
+	// break, so no measurable overhead at startup. Avoids re-parsing raw URLs.
+outer:
+	for _, group := range routeUpstreams {
+		for _, up := range group {
+			if up.hasClientNameTemplate {
+				hasClientNameUpstream = true
+				break outer
+			}
+		}
+	}
+	log.Printf("[INIT] {client-name} upstream substitution: %v", hasClientNameUpstream)
+
 	// 5. RType policy
 	rtypePolicy = make(map[uint16]int, len(cfg.RtypePolicy))
 	for typeName, rcodeName := range cfg.RtypePolicy {
@@ -335,19 +326,16 @@ func main() {
 		rtypePolicy[qtype] = rcode
 		log.Printf("[INIT] RType Policy: %s -> %s", dns.TypeToString[qtype], dns.RcodeToString[rcode])
 	}
+	hasRtypePolicy = len(rtypePolicy) > 0
 
-	// 6. Route index table — assigns a uint8 index to every upstream group name.
-	// Index 0 (routeIdxLocal) is reserved for local hosts/leases cache entries and
-	// must not clash with any user-defined group. Indices start at 1 for all groups.
-	// Also indexes any group name referenced in domain_routes or MAC routes that
-	// isn't a key in cfg.Upstreams (config error, but we handle it gracefully).
+	// 6. Route index table
 	routeIdxByName = make(map[string]uint8, len(cfg.Upstreams)+4)
-	routeIdxByName["local"] = routeIdxLocal // index 0 reserved
+	routeIdxByName["local"] = routeIdxLocal
 	nextIdx := uint8(1)
 	assignIdx := func(name string) {
 		if _, exists := routeIdxByName[name]; !exists {
 			routeIdxByName[name] = nextIdx
-			nextIdx++ // wraps at 255; ≥254 upstream groups is not a real concern
+			nextIdx++
 		}
 	}
 	for groupName := range cfg.Upstreams {
@@ -361,12 +349,21 @@ func main() {
 			assignIdx(route.Upstream)
 		}
 	}
-	routeIdxDefault = routeIdxByName["default"] // "default" is guaranteed to exist (fatal check above)
+	routeIdxDefault = routeIdxByName["default"]
 	log.Printf("[INIT] Route index table: %d entries", len(routeIdxByName))
 
 	// 7. Supporting subsystems
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
-	InitARP()
+
+	// ARP polling is Linux-only and only useful when MAC-based routes are configured.
+	// Skipping it saves a goroutine + a /proc/net/arp read every 30s + per-query
+	// atomic loads in process.go on purely IP-routed or non-Linux deployments.
+	if hasMACRoutes {
+		InitARP()
+	} else {
+		log.Println("[ARP] No MAC routes configured — ARP polling disabled.")
+	}
+
 	InitIdentity()
 
 	// 8. TLS
@@ -381,7 +378,6 @@ func main() {
 	// 9. Network listeners
 	StartServers(tlsConfig)
 
-	// Wait for termination signal
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
