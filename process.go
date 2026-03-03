@@ -1,13 +1,25 @@
 /*
 File: process.go
-Version: 1.40.0
-Last Updated: 2026-03-04 00:00 CET
+Version: 1.41.0
+Last Updated: 2026-03-04 12:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.41.0 - [PERF] Merged domain label walk: getDomainRoute and getDomainPolicyRcode
+           replaced by walkDomainMaps, which checks both domainPolicy and domainRoutes
+           in a single O(labels) pass. Previously every query with both features
+           enabled paid for two identical label walks (two strings.IndexByte loops).
+           The pre-computed result is stored before step 0d and reused at step 3 —
+           one walk instead of two, regardless of whether either map matches.
+           [PERF] flattenCNAMEChain: two passes over msg.Answer collapsed into one.
+           Old: scan for CNAME presence, then scan again for minTTL + address RRs.
+           New: single pass sets hasCNAME, minTTL, and addrRRs simultaneously.
+           [PERF] sanitizeID helper: replaces two chained strings.ReplaceAll calls
+           for the clientName IP/MAC fallback with a single in-place byte loop —
+           one allocation instead of two.
   1.40.0 - [FEAT] Domain Policy (step 0d): suffix-based name blocking with a
            configurable RCODE. getDomainPolicyRcode() uses the same label-walk as
            getDomainRoute — one entry covers the apex AND all sub-domains. Fired
@@ -112,39 +124,43 @@ func lowerTrimDot(s string) string {
 	return s[:end]
 }
 
-// getDomainRoute performs zero-allocation suffix matching via label walk.
-// Only called from ProcessDNS when hasDomainRoutes is true.
-func getDomainRoute(qname string) (string, bool) {
-	search := qname
-	for {
-		if upstream, ok := domainRoutes[search]; ok {
-			return upstream, true
+// sanitizeID replaces every '.' and ':' in s with '-' in a single in-place byte
+// pass — one allocation instead of two chained strings.ReplaceAll calls.
+// Used to build the fallback clientName from a raw IP address or MAC string.
+func sanitizeID(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c == '.' || c == ':' {
+			b[i] = '-'
 		}
-		idx := strings.IndexByte(search, '.')
-		if idx < 0 {
-			break
-		}
-		search = search[idx+1:]
 	}
-	return "", false
+	return string(b)
 }
 
-// getDomainPolicyRcode performs suffix matching against domainPolicy via label walk.
+// walkDomainMaps performs a single label walk over qname and checks both
+// domainPolicy and domainRoutes simultaneously — one strings.IndexByte loop
+// instead of two separate walks.
 //
-// The walk is identical to getDomainRoute — it checks the full qname first, then
-// strips labels one by one walking toward the root. This means a single entry in
-// domain_policy covers both the apex and all sub-domains:
+// Policy is checked before routes at every label, consistent with domain_policy
+// firing at step 0d (before domain_routes at step 3) in ProcessDNS. A policy
+// match short-circuits the walk immediately.
 //
-//	"example.com" matches "example.com" and "foo.bar.example.com"
-//	"onion"       matches "onion"       and "anything.onion"
+// Returns:
+//   blocked=true  → domainPolicy matched; rcode is the RCODE to return.
+//   matched=true  → domainRoutes matched; upstream is the target group name.
+//   both false    → no match in either map.
 //
-// Returns the configured RCODE and true on a match, 0 and false otherwise.
-// Only called from ProcessDNS when hasDomainPolicy is true.
-func getDomainPolicyRcode(qname string) (int, bool) {
+// Safe to call even when one or both maps are empty — an empty map lookup
+// returns false instantly. The caller gates on hasDomainPolicy||hasDomainRoutes
+// to skip the loop entirely when both features are disabled.
+func walkDomainMaps(qname string) (rcode int, blocked bool, upstream string, matched bool) {
 	search := qname
 	for {
-		if rcode, ok := domainPolicy[search]; ok {
-			return rcode, true
+		if r, ok := domainPolicy[search]; ok {
+			return r, true, "", false
+		}
+		if u, ok := domainRoutes[search]; ok {
+			return 0, false, u, true
 		}
 		idx := strings.IndexByte(search, '.')
 		if idx < 0 {
@@ -152,7 +168,7 @@ func getDomainPolicyRcode(qname string) (int, bool) {
 		}
 		search = search[idx+1:]
 	}
-	return 0, false
+	return 0, false, "", false
 }
 
 // resolveLocalIdentity returns IPs for a queried hostname — O(1) exact match
@@ -316,9 +332,10 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 		if clientName == "" {
 			if mac != "" {
-				clientName = strings.ReplaceAll(mac, ":", "-")
+				// sanitizeID: single pass, one allocation — replaces two ReplaceAll calls.
+				clientName = sanitizeID(mac)
 			} else {
-				clientName = strings.ReplaceAll(strings.ReplaceAll(clientIP, ".", "-"), ":", "-")
+				clientName = sanitizeID(clientIP)
 			}
 		}
 	}
@@ -388,24 +405,37 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
+	// --- Domain maps pre-computation ---
+	// walkDomainMaps does a single label walk that checks both domainPolicy and
+	// domainRoutes simultaneously. The result is consumed at step 0d (policy) and
+	// step 3 (routing). This replaces two separate O(labels) walks that were
+	// previously done independently at steps 0d and 3.
+	//
+	// Hot-path cost when both features are disabled: one bool OR check (skipped).
+	// Hot-path cost when enabled: one label walk instead of two.
+	var (
+		walkPolicyRcode   int
+		walkPolicyBlocked bool
+		walkRouteUpstream string
+		walkRouteMatched  bool
+	)
+	if hasDomainPolicy || hasDomainRoutes {
+		walkPolicyRcode, walkPolicyBlocked, walkRouteUpstream, walkRouteMatched = walkDomainMaps(qNameTrimmed)
+	}
+
 	// --- 0d. Domain Policy ---
 	// Suffix-based name blocking — one entry covers the apex AND all sub-domains.
 	// Fired before DDR, local identity, domain_routes, and the upstream cache so
 	// blocked names never touch the network regardless of other configuration.
-	// Hot-path cost when disabled: one bool check (hasDomainPolicy == false).
-	// Hot-path cost when enabled: a label walk over the query name (same O(labels)
-	// as getDomainRoute, which already runs on every query with domain_routes).
-	if hasDomainPolicy {
-		if rcode, blocked := getDomainPolicyRcode(qNameTrimmed); blocked {
-			resp := new(dns.Msg)
-			resp.SetRcode(r, rcode)
-			w.WriteMsg(resp)
-			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s %s | DOMAIN POLICY: %s",
-					protocol, clientID, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[rcode])
-			}
-			return
+	if walkPolicyBlocked {
+		resp := new(dns.Msg)
+		resp.SetRcode(r, walkPolicyRcode)
+		w.WriteMsg(resp)
+		if logQueries {
+			log.Printf("[DNS] [%s] %s -> %s %s | DOMAIN POLICY: %s",
+				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[walkPolicyRcode])
 		}
+		return
 	}
 
 	// --- 1. DDR Spoofing & Interception ---
@@ -630,13 +660,13 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 3. Domain Route Interception ---
+	// walkRouteMatched was pre-computed alongside the domain policy check above —
+	// no second label walk needed here.
 	routeOriginType := "CLIENT"
-	if hasDomainRoutes {
-		if domainUpstream, matched := getDomainRoute(qNameTrimmed); matched {
-			routeName       = domainUpstream
-			routeIdx        = getRouteIdx(domainUpstream)
-			routeOriginType = "DOMAIN"
-		}
+	if walkRouteMatched {
+		routeName       = walkRouteUpstream
+		routeIdx        = getRouteIdx(walkRouteUpstream)
+		routeOriginType = "DOMAIN"
 	}
 
 	// --- 4. Cache Lookup ---
@@ -717,6 +747,12 @@ func transformResponse(msg *dns.Msg, qtype uint16) *dns.Msg {
 	return out
 }
 
+// flattenCNAMEChain collapses a CNAME chain in A/AAAA responses into synthesized
+// records directly under the original query name, eliminating intermediate CNAMEs.
+//
+// Single pass over msg.Answer: detects CNAME presence, tracks minimum TTL, and
+// collects address RRs of the requested type — all in one loop instead of two.
+// TTL is set to the minimum across the entire chain (CNAMEs + address records).
 func flattenCNAMEChain(msg *dns.Msg, qtype uint16) *dns.Msg {
 	if msg.Rcode != dns.RcodeSuccess {
 		return msg
@@ -725,30 +761,25 @@ func flattenCNAMEChain(msg *dns.Msg, qtype uint16) *dns.Msg {
 		return msg
 	}
 
+	// Single pass: detect CNAME, track minTTL, and collect address RRs.
+	minTTL   := ^uint32(0)
 	hasCNAME := false
-	for _, rr := range msg.Answer {
-		if rr.Header().Rrtype == dns.TypeCNAME {
-			hasCNAME = true
-			break
-		}
-	}
-	if !hasCNAME {
-		return msg
-	}
-
-	minTTL      := ^uint32(0)
 	var addrRRs []dns.RR
 
 	for _, rr := range msg.Answer {
-		if rr.Header().Ttl < minTTL {
-			minTTL = rr.Header().Ttl
+		h := rr.Header()
+		if h.Ttl < minTTL {
+			minTTL = h.Ttl
 		}
-		if rr.Header().Rrtype == qtype {
+		switch h.Rrtype {
+		case dns.TypeCNAME:
+			hasCNAME = true
+		case qtype:
 			addrRRs = append(addrRRs, rr)
 		}
 	}
 
-	if len(addrRRs) == 0 {
+	if !hasCNAME || len(addrRRs) == 0 {
 		return msg
 	}
 	if minTTL == ^uint32(0) {
