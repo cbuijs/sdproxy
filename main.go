@@ -1,18 +1,25 @@
 /*
 File: main.go
-Version: 1.19.0
-Last Updated: 2026-03-03 14:00 CET
+Version: 1.20.0
+Last Updated: 2026-03-03 16:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
-  1.19.0 - [FEAT] RType Policy: new rtype_policy config section maps DNS query
-           types to immediate RCODE responses (e.g. ANY -> REFUSED). Parsed once
-           at startup from string names (via dns.StringToType / dns.StringToRcode)
-           into rtypePolicy map[uint16]int for O(1) hot-path lookup in process.go.
-           Unknown type or RCODE names emit a [WARN] and are skipped — config
-           errors never crash the daemon. Requires new dns import in main.go.
+  1.20.0 - [PERF] Route index table: upstream group names are mapped to uint8
+           indices at startup (routeIdxByName). ProcessDNS uses the index in
+           DNSCacheKey.RouteIdx instead of a Route string, eliminating per-lookup
+           string pointer chasing in getShard (cache.go v1.14.0).
+           routeIdxLocal (0) is reserved for local hosts/leases cache entries and
+           never appears in cfg.Upstreams. routeIdxDefault points to "default".
+           getRouteIdx() provides a safe lookup with a "default" fallback.
+           [PERF] Changed SetGCPercent from 20 to 100. GOGC=20 triggered GC every
+           time the live heap grew by 20% — on a 4 MB live heap that's a collection
+           every 0.8 MB of allocation, causing more STW pauses than necessary.
+           GOGC=100 (Go's default) lets the heap breathe between collections.
+           SetMemoryLimit already caps the ceiling, so memory safety is unchanged.
+  1.19.0 - [FEAT] RType Policy config section.
   1.18.0 - [PERF] Added logging.log_queries config option. Controls whether
            per-query log lines are emitted in ProcessDNS. log.Printf acquires a
            global mutex and runs fmt.Sprintf with reflection — with 10 UDP workers
@@ -146,10 +153,24 @@ var (
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
 
-	// rtypePolicy is the parsed, hot-path version of cfg.RtypePolicy.
-	// Key: DNS qtype as uint16 (e.g. dns.TypeANY). Value: RCODE as int (e.g. dns.RcodeRefused).
-	// Populated once in main(); read without locking in ProcessDNS (immutable after init).
+	// rtypePolicy: parsed from cfg.RtypePolicy at startup. Key: DNS qtype (uint16),
+	// value: RCODE (int). O(1) lookup in ProcessDNS step 0.
 	rtypePolicy map[uint16]int
+
+	// routeIdxByName maps upstream group names to uint8 indices for use in
+	// DNSCacheKey.RouteIdx. Assigned once at startup, never written after.
+	//   routeIdxLocal (0)   — reserved for local hosts/leases cache entries
+	//   routeIdxDefault     — index of the "default" upstream group
+	// All other groups are assigned indices starting at 1.
+	routeIdxByName map[string]uint8
+
+	// routeIdxLocal is the fixed index for local-only cache entries.
+	// It is const 0 and never appears in cfg.Upstreams.
+	routeIdxLocal uint8 = 0
+
+	// routeIdxDefault is the index of the "default" upstream group.
+	// Set at startup once routeIdxByName is built.
+	routeIdxDefault uint8
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
@@ -167,8 +188,13 @@ var (
 )
 
 func main() {
-	// Aggressive GC tuning: prioritise throughput over GC frequency.
-	debug.SetGCPercent(20)
+	// GOGC=100 (Go default): GC when live heap doubles from its post-GC size.
+	// The previous value of 20 triggered GC every time the heap grew 20% —
+	// on a small heap (4-8 MB) that means a collection every ~0.8 MB of allocation,
+	// with measurable STW pauses. GOGC=100 gives the heap room to breathe.
+	// SetMemoryLimit (configured below) already caps the absolute ceiling, so
+	// memory safety is maintained regardless of GOGC.
+	debug.SetGCPercent(100)
 
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
@@ -282,8 +308,7 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
-	// 5. RType policy — parse string names to uint16/int for O(1) hot-path lookup.
-	// Unknown type or RCODE names are warned and skipped; they never crash the daemon.
+	// 5. RType policy
 	rtypePolicy = make(map[uint16]int, len(cfg.RtypePolicy))
 	for typeName, rcodeName := range cfg.RtypePolicy {
 		qtype, ok := dns.StringToType[strings.ToUpper(typeName)]
@@ -300,12 +325,40 @@ func main() {
 		log.Printf("[INIT] RType Policy: %s -> %s", dns.TypeToString[qtype], dns.RcodeToString[rcode])
 	}
 
-	// 6. Supporting subsystems
+	// 6. Route index table — assigns a uint8 index to every upstream group name.
+	// Index 0 (routeIdxLocal) is reserved for local hosts/leases cache entries and
+	// must not clash with any user-defined group. Indices start at 1 for all groups.
+	// Also indexes any group name referenced in domain_routes or MAC routes that
+	// isn't a key in cfg.Upstreams (config error, but we handle it gracefully).
+	routeIdxByName = make(map[string]uint8, len(cfg.Upstreams)+4)
+	routeIdxByName["local"] = routeIdxLocal // index 0 reserved
+	nextIdx := uint8(1)
+	assignIdx := func(name string) {
+		if _, exists := routeIdxByName[name]; !exists {
+			routeIdxByName[name] = nextIdx
+			nextIdx++ // wraps at 255; ≥254 upstream groups is not a real concern
+		}
+	}
+	for groupName := range cfg.Upstreams {
+		assignIdx(groupName)
+	}
+	for _, upstream := range cfg.DomainRoutes {
+		assignIdx(upstream)
+	}
+	for _, route := range cfg.Routes {
+		if route.Upstream != "" {
+			assignIdx(route.Upstream)
+		}
+	}
+	routeIdxDefault = routeIdxByName["default"] // "default" is guaranteed to exist (fatal check above)
+	log.Printf("[INIT] Route index table: %d entries", len(routeIdxByName))
+
+	// 7. Supporting subsystems
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	InitARP()
 	InitIdentity()
 
-	// 7. TLS
+	// 8. TLS
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
 	var tlsConfig *tls.Config
 	if needsTLS {
@@ -314,7 +367,7 @@ func main() {
 		log.Println("[TLS] No encrypted listeners configured — skipping TLS.")
 	}
 
-	// 8. Network listeners
+	// 9. Network listeners
 	StartServers(tlsConfig)
 
 	// Wait for termination signal

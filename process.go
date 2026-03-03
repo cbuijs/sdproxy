@@ -1,19 +1,21 @@
 /*
 File: process.go
-Version: 1.30.0
-Last Updated: 2026-03-03 14:00 CET
+Version: 1.31.0
+Last Updated: 2026-03-03 16:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
-  1.30.0 - [FEAT] RType Policy (step 0): query types can be mapped to an immediate
-           RCODE via rtype_policy in config.yaml (e.g. ANY -> REFUSED, HINFO ->
-           NOTIMP). Fires before AAAA filter, strict PTR, DDR, local interception,
-           and upstream. Cost is a single map lookup on a uint16 key — essentially
-           free. Parsed once at startup into rtypePolicy map[uint16]int.
-  1.29.0 - [FEAT] Local NXDOMAIN for non-A/AAAA/PTR queries on locally known names.
+  1.31.0 - [PERF] Replaced separate LookupNameByMAC + LookupNameByIP calls with
+           a single LookupNameByMACOrIP call (identity.go v1.21.0). Reduces identity
+           resolution from two identMu RLock/RUnlock cycles to one per query.
+           Added routeIdx uint8 tracking alongside routeName — used in all
+           DNSCacheKey construction so the key contains a uint8 rather than a
+           string (see cache.go v1.14.0). getRouteIdx() provides a safe map lookup
+           with a "default" fallback for routes that aren't in the index table.
+  1.30.0 - [FEAT] RType Policy (step 0): immediate RCODE by query type.
            If a hostname resolves locally (has A/AAAA records in hosts/leases) but
            the client asks for a different type (MX, TXT, SRV, NS, …), we return
            NXDOMAIN immediately instead of forwarding upstream. This prevents
@@ -64,6 +66,17 @@ import (
 // fmt.Sprintf, no I/O. Errors and startup messages always log regardless.
 var logQueries bool
 
+// getRouteIdx returns the uint8 index for a route name, falling back to
+// routeIdxDefault when the name isn't in the table. The fallback handles
+// the edge case of a domain_route or MAC route pointing at a non-existent
+// upstream group without panicking or producing a wrong cache partition.
+func getRouteIdx(name string) uint8 {
+	if idx, ok := routeIdxByName[name]; ok {
+		return idx
+	}
+	return routeIdxDefault
+}
+
 // getDomainRoute performs ultra-fast zero-allocation suffix matching.
 // Walks the domain label by label using index arithmetic — avoids the
 // []string allocation that strings.Split or strings.Join would incur.
@@ -112,33 +125,28 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	// Resolves: MAC from ARP table, route override from MAC config, and the
 	// human-readable client name via the priority chain:
 	//   1. Explicit MAC route config override
-	//   2. MAC -> name (dnsmasq leases)
-	//   3. IP -> name (hosts files / leases)
+	//   2. MAC -> name  \  combined under one identMu.RLock in LookupNameByMACOrIP
+	//   3. IP  -> name  /  (was two separate lock cycles — now one)
 	//   4. Fallback: hyphenated MAC or hyphenated IP
-	// Cost: 2-3 RLock + map lookups. Negligible vs any network I/O.
-	mac        := LookupMAC(clientIP)
-	routeName  := "default"
-	clientName := ""
+	mac          := LookupMAC(clientIP)                    // arpMu:   1 RLock cycle
+	identityName := LookupNameByMACOrIP(mac, clientIP)     // identMu: 1 RLock cycle (was 2)
+	routeName    := "default"
+	routeIdx     := routeIdxDefault
+	clientName   := ""
 
 	if mac != "" {
 		if routeInfo, exists := macRoutes[mac]; exists {
 			if routeInfo.Upstream != "" {
 				routeName = routeInfo.Upstream
+				routeIdx  = getRouteIdx(routeName)
 			}
 			if routeInfo.ClientName != "" {
 				clientName = routeInfo.ClientName
 			}
 		}
 	}
-	if clientName == "" && mac != "" {
-		if name, ok := LookupNameByMAC(mac); ok {
-			clientName = name
-		}
-	}
 	if clientName == "" {
-		if name, ok := LookupNameByIP(clientIP); ok {
-			clientName = name
-		}
+		clientName = identityName
 	}
 	if clientName == "" {
 		if mac != "" {
@@ -293,7 +301,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 2. Local Hosts/Leases Interception (A, AAAA, PTR — and NXDOMAIN for everything else) ---
-	localCacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, Route: "local"}
+	localCacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdxLocal}
 	if cachedResp := CacheGet(localCacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
 		w.WriteMsg(cachedResp)
@@ -385,12 +393,13 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	// Overrides the client-based route if the queried domain matches a configured suffix.
 	routeOriginType := "CLIENT"
 	if domainUpstream, matched := getDomainRoute(qNameTrimmed); matched {
-		routeName       = domainUpstream
-		routeOriginType = "DOMAIN"
+		routeName        = domainUpstream
+		routeIdx         = getRouteIdx(domainUpstream)
+		routeOriginType  = "DOMAIN"
 	}
 
 	// --- 4. Cache Lookup ---
-	cacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, Route: routeName}
+	cacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdx}
 	if cachedResp := CacheGet(cacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
 		w.WriteMsg(cachedResp)

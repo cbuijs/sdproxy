@@ -1,7 +1,7 @@
 /*
 File: cache.go
-Version: 1.13.0
-Last Updated: 2026-03-02 20:00 CET
+Version: 1.14.0
+Last Updated: 2026-03-03 16:00 CET
 Description: High-performance, sharded, non-blocking DNS cache.
              Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
              with no answer records) responses per RFC 2308.
@@ -9,47 +9,46 @@ Description: High-performance, sharded, non-blocking DNS cache.
              pseudo-random eviction, reduced shard count.
 
 Changes:
-  1.13.0 - [PERF] CacheGet: consolidated two time.Now() calls into one. The old
-           code called time.Now() explicitly for the expiry check and then again
-           implicitly via time.Until() for remaining TTL calculation. On some
-           embedded targets (MIPS, older ARM) time.Now() is a real syscall, not a
-           vDSO fast-path. Single call, reused for both checks.
-  1.12.0 - [FIX]  Negative responses (NXDOMAIN, NOERROR/empty) were not cached —
-           CacheSet rejected anything with Rcode != RcodeSuccess. Every negative
-           answer hit upstream on every query. Now caches NXDOMAIN and empty
-           NOERROR per RFC 2308 using the SOA minimum TTL from the authority
-           section. Falls back to cfg.Cache.MinTTL when no SOA is present.
-           SERVFAIL and other error codes are intentionally not cached as they
-           indicate transient upstream failures.
-  1.11.0 - [PERF] Replaced fmt.Sprintf string cache key with a plain comparable
-           struct (DNSCacheKey). fmt.Sprintf involves reflection and heap allocation
-           on every cache lookup. Go map lookups on comparable structs use direct
-           field comparison — zero allocation, no reflection, faster hashing.
-           [PERF] Increased background sweep interval from 10s to 60s. Expired
-           entries are already filtered at CacheGet time, so the sweeper only
-           affects memory reclamation, not correctness. 60s halves idle wakeups.
+  1.14.0 - [PERF] Replaced maphash.Hash shard selector with inline FNV-1a.
+           maphash required creating a Hash struct, calling SetSeed, and invoking
+           WriteString/Write methods on every cache operation. FNV-1a is pure
+           arithmetic — no struct, no seed, no method calls, zero setup cost.
+           Hash-DOS resistance (maphash's main advantage) is irrelevant for a
+           private resolver; FNV-1a distribution is more than adequate for 16 shards.
+           [PERF] Replaced DNSCacheKey.Route string with RouteIdx uint8. A string
+           field in a map key requires Go to hash its backing bytes via a pointer
+           chase. A uint8 is hashed inline with the rest of the struct — no pointer
+           chase, smaller key (struct shrinks ~15 bytes), faster map operations.
+           Route indices are assigned once at startup in main.go (routeIdxByName).
+  1.13.0 - [PERF] CacheGet: consolidated two time.Now() calls into one.
+  1.12.0 - [FIX]  Negative responses (NXDOMAIN, NOERROR/empty) now cached per RFC 2308.
+  1.11.0 - [PERF] Struct-based DNSCacheKey, 60s sweep interval.
   1.10.0 - Initial sharded cache with pseudo-random eviction.
 */
 
 package main
 
 import (
-	"hash/maphash"
 	"sync"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-// DNSCacheKey replaces the fmt.Sprintf string key — zero allocation, no reflection.
-// All fields are comparable so Go uses direct field comparison for map lookups.
-// Route is baked in to prevent cross-contamination between upstream partitions
-// (e.g. "local_network" answers must not bleed into "default" cached responses).
+// DNSCacheKey is the map key for all cache lookups.
+//
+// RouteIdx replaces the previous Route string field. Route names are a small
+// fixed set assigned at startup (see routeIdxByName in main.go). Storing an
+// index instead of a string pointer eliminates the per-lookup pointer chase
+// when Go hashes the struct key, and shrinks the struct by ~15 bytes.
+//
+// RouteIdx 0 is always reserved for "local" (hosts/leases answers). All other
+// indices are assigned to upstream group names starting at 1.
 type DNSCacheKey struct {
-	Name   string
-	Qtype  uint16
-	Qclass uint16
-	Route  string
+	Name     string
+	Qtype    uint16
+	Qclass   uint16
+	RouteIdx uint8
 }
 
 // MEMORY OPTIMISATION: 16 shards is sufficient for a home router.
@@ -66,16 +65,12 @@ type cacheShard struct {
 	items map[DNSCacheKey]cacheItem
 }
 
-var (
-	shards [shardCount]*cacheShard
-	seed   maphash.Seed
-)
+var shards [shardCount]*cacheShard
 
 func InitCache(maxSize int, minTTL int) {
 	if !cfg.Cache.Enabled {
 		return
 	}
-	seed = maphash.MakeSeed()
 	for i := range shards {
 		shards[i] = &cacheShard{
 			items: make(map[DNSCacheKey]cacheItem),
@@ -103,18 +98,31 @@ func InitCache(maxSize int, minTTL int) {
 	}()
 }
 
-// getShard hashes the struct fields via maphash.
-// Name first (highest entropy for DNS workloads), then type/class, then route.
+// getShard maps a cache key to a shard using FNV-1a.
+//
+// FNV-1a replaces maphash.Hash. The previous implementation created a Hash
+// struct, called SetSeed, then WriteString/Write on every call. FNV-1a is
+// purely arithmetic — no object, no seed lookup, no method dispatch — which
+// matters on MIPS/ARM routers where every function call has non-trivial cost.
+//
+// Name is hashed first (highest entropy in DNS workloads). Qtype and Qclass
+// are mixed together in one step. RouteIdx is a single byte — cheap XOR.
 func getShard(key DNSCacheKey) *cacheShard {
-	var h maphash.Hash
-	h.SetSeed(seed)
-	h.WriteString(key.Name)
-	var tmp [4]byte
-	tmp[0], tmp[1] = byte(key.Qtype>>8), byte(key.Qtype)
-	tmp[2], tmp[3] = byte(key.Qclass>>8), byte(key.Qclass)
-	h.Write(tmp[:])
-	h.WriteString(key.Route)
-	return shards[h.Sum64()&(shardCount-1)]
+	const (
+		basis uint64 = 14695981039346656037
+		prime uint64 = 1099511628211
+	)
+	h := basis
+	for i := 0; i < len(key.Name); i++ {
+		h ^= uint64(key.Name[i])
+		h *= prime
+	}
+	// Fold Qtype and Qclass into a single 32-bit word, then mix once.
+	h ^= uint64(key.Qtype)<<16 | uint64(key.Qclass)
+	h *= prime
+	h ^= uint64(key.RouteIdx)
+	h *= prime
+	return shards[h&(shardCount-1)]
 }
 
 func CacheGet(key DNSCacheKey) *dns.Msg {
@@ -145,7 +153,7 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 	if remaining == 0 {
 		return nil
 	}
-	// Update TTLs in the answer section to reflect remaining cache lifetime
+	// Update TTLs in the answer section to reflect remaining cache lifetime.
 	for _, rr := range msg.Answer {
 		rr.Header().Ttl = remaining
 	}
@@ -180,19 +188,16 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg) {
 	//   minimize_answer is enabled and Ns section has been stripped).
 	var ttl uint32
 	if msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0 {
-		// Positive response — minimum TTL across all answer records
-		ttl = ^uint32(0) // max uint32 as starting value
+		ttl = ^uint32(0)
 		for _, rr := range msg.Answer {
 			if rr.Header().Ttl < ttl {
 				ttl = rr.Header().Ttl
 			}
 		}
 	} else {
-		// Negative response (NXDOMAIN or NOERROR/NODATA) — use SOA minimum
 		ttl = 0
 		for _, rr := range msg.Ns {
 			if soa, ok := rr.(*dns.SOA); ok {
-				// RFC 2308 §5: negative TTL = min(SOA TTL, SOA MINIMUM field)
 				soaTTL := soa.Hdr.Ttl
 				if soa.Minttl < soaTTL {
 					soaTTL = soa.Minttl
@@ -202,14 +207,10 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg) {
 			}
 		}
 		if ttl == 0 {
-			// No SOA in authority section — fall back to configured minimum.
-			// This is the normal path when minimize_answer is enabled since
-			// the Ns section is stripped before CacheSet is called.
 			ttl = uint32(cfg.Cache.MinTTL)
 		}
 	}
 
-	// Never cache below the configured floor
 	if int(ttl) < cfg.Cache.MinTTL {
 		ttl = uint32(cfg.Cache.MinTTL)
 	}
