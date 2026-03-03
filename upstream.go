@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.18.0
-Last Updated: 2026-03-03 20:00 CET
+Version: 1.20.0
+Last Updated: 2026-03-03 21:30 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries.
@@ -23,6 +23,17 @@ Description: Manages connections to external DNS upstream providers.
                the natural cadence of DNS queries provides the probing.
 
 Changes:
+  1.20.0 - [LOG] Exchange() prefixes the returned address with the protocol scheme
+           (e.g. "udp://1.1.1.1:53", "dot://9.9.9.9:853", "doh://…"). process.go
+           logs this value as-is — no changes needed there.
+  1.19.0 - [LOG] Exchange() now returns the actual IP:port dialled for UDP, TCP, DoT,
+           and DoQ instead of the raw configured URL. This makes the UPSTREAM field in
+           log lines show the real address used — useful when bootstrap IPs are
+           configured and the URL contains a hostname rather than an IP.
+           For DoH/DoH3 the HTTPS URL is kept as-is: the actual IP is transparent
+           inside http.Transport and not surfaceable without invasive hooks.
+           dialDoQ() now returns the successful dialAddr alongside the connection so
+           exchangeDoQ() and Exchange() can thread it through to the caller.
   1.18.0 - [FEAT] raceExchange: staggered parallel upstream queries. Launches
            upstreams with a configurable delay (upstream_stagger_ms) between them.
            First good response wins, context.WithCancel aborts the rest. Sequential
@@ -220,6 +231,13 @@ func ParseUpstream(raw string) (*Upstream, error) {
 }
 
 // Exchange forwards a DNS query to this upstream and returns the response.
+// The second return value is a loggable string combining protocol and address:
+//   - UDP/TCP/DoT/DoQ: "proto://ip:port" using the actual IP dialled, e.g.
+//     "udp://1.1.1.1:53" or "dot://9.9.9.9:853". When bootstrap IPs are in use
+//     this shows the real IP rather than the configured hostname.
+//   - DoH/DoH3: "doh://…" or "doh3://…" prefixed full HTTPS URL. The actual IP
+//     is opaque inside http.Transport and not surfaceable without invasive hooks.
+//
 // The caller's req is never modified — prepareForwardQuery creates an internal
 // copy. Callers must NOT pre-copy; that would be a redundant deep copy.
 func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
@@ -251,10 +269,10 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		for _, dialAddr := range dialAddrs {
 			resp, _, err = client.ExchangeContext(ctx, fwd, dialAddr)
 			if err == nil && resp != nil {
-				return resp, targetURL, nil
+				return resp, "udp://"+dialAddr, nil
 			}
 		}
-		return nil, targetURL, err
+		return nil, "udp://"+targetURL, err
 
 	case "tcp", "dot":
 		host, port := parseHostPort(targetURL, u.Proto)
@@ -271,23 +289,29 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		for _, dialAddr := range dialAddrs {
 			resp, err := u.exchangeStream(ctx, fwd, dialAddr, host)
 			if err == nil && resp != nil {
-				return resp, targetURL, nil
+				return resp, u.Proto+"://"+dialAddr, nil
 			}
 			lastErr = err
 		}
-		return nil, targetURL, lastErr
+		return nil, u.Proto+"://"+targetURL, lastErr
 
 	case "doh":
+		// DoH: actual IP is managed by http.Transport (bootstrap DialContext).
+		// We can't surface it without hooking deep into net/http — prefix the URL.
 		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h2Client)
-		return resp, targetURL, err
+		// Replace "https://" with "doh://" so the log output is consistent with
+		// the other protocols and the config file scheme names.
+		return resp, "doh://"+strings.TrimPrefix(targetURL, "https://"), err
 
 	case "doh3":
+		// DoH3: same as DoH — actual IP is inside http3.Transport, not surfaceable here.
 		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h3Client)
-		return resp, targetURL, err
+		return resp, "doh3://"+strings.TrimPrefix(targetURL, "https://"), err
 
 	case "doq":
-		resp, err := u.exchangeDoQ(ctx, fwd, targetURL)
-		return resp, targetURL, err
+		// DoQ: exchangeDoQ returns the actual IP:port dialled — we prefix the scheme here.
+		resp, dialAddr, err := u.exchangeDoQ(ctx, fwd, targetURL)
+		return resp, "doq://"+dialAddr, err
 
 	default:
 		return nil, targetURL, errors.New("unknown protocol")
@@ -298,34 +322,37 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 
 // raceResult is the channel payload for raceExchange goroutines.
 type raceResult struct {
-	msg *dns.Msg
-	url string
-	up  *Upstream
-	err error
+	msg  *dns.Msg
+	addr string // actual IP:port or URL used (from Exchange second return value)
+	up   *Upstream
+	err  error
 }
 
 // raceExchange sends a DNS query to an upstream group using staggered parallelism.
 //
 // ALGORITHM (Happy Eyeballs for DNS):
-//   1. Launch upstream[0] immediately.
-//   2. Wait upstreamStagger (e.g. 150ms). If a response arrives during the wait,
-//      return it immediately (fast path — typical for healthy upstreams).
-//   3. If no response yet, launch upstream[1] in parallel. Repeat for each upstream.
-//   4. First successful response wins. context.WithCancel aborts the losers.
+//  1. Launch upstream[0] immediately.
+//  2. Wait upstreamStagger (e.g. 150ms). If a response arrives during the wait,
+//     return it immediately (fast path — typical for healthy upstreams).
+//  3. If no response yet, launch upstream[1] in parallel. Repeat for each upstream.
+//  4. First successful response wins. context.WithCancel aborts the losers.
 //
 // HEALTH-AWARE STAGGER:
-//   If the *previous* upstream is unhealthy (>=3 consecutive failures), the stagger
-//   wait is skipped entirely — the next upstream fires at t=0 alongside the sick one.
-//   This means a dead primary adds zero latency from the second query onward.
+//
+//	If the *previous* upstream is unhealthy (>=3 consecutive failures), the stagger
+//	wait is skipped entirely — the next upstream fires at t=0 alongside the sick one.
+//	This means a dead primary adds zero latency from the second query onward.
 //
 // SEQUENTIAL FALLBACK:
-//   When upstreamStagger is 0 or the group has only one target, queries are sent
-//   sequentially with no goroutine overhead (same as pre-v1.18.0 behaviour).
+//
+//	When upstreamStagger is 0 or the group has only one target, queries are sent
+//	sequentially with no goroutine overhead (same as pre-v1.18.0 behaviour).
 //
 // GOROUTINE SAFETY:
-//   The channel is buffered to len(upstreams), so losing goroutines can always
-//   send their result without blocking even after the winner returns. They'll be
-//   GC'd after their transport timeout fires or context cancellation propagates.
+//
+//	The channel is buffered to len(upstreams), so losing goroutines can always
+//	send their result without blocking even after the winner returns. They'll be
+//	GC'd after their transport timeout fires or context cancellation propagates.
 func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
 	n := len(upstreams)
 	if n == 0 {
@@ -361,7 +388,7 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 					launched--
 					if r.err == nil && r.msg != nil {
 						r.up.recordSuccess()
-						return r.msg, r.url, nil
+						return r.msg, r.addr, nil
 					}
 					r.up.recordFailure()
 					// Previous upstream failed fast (e.g. connection refused) —
@@ -375,8 +402,8 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 
 		launched++
 		go func(u *Upstream) {
-			msg, aURL, err := u.Exchange(ctx, req, clientName)
-			ch <- raceResult{msg, aURL, u, err}
+			msg, addr, err := u.Exchange(ctx, req, clientName)
+			ch <- raceResult{msg, addr, u, err}
 		}(up)
 	}
 
@@ -386,7 +413,7 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 		r := <-ch
 		if r.err == nil && r.msg != nil {
 			r.up.recordSuccess()
-			return r.msg, r.url, nil
+			return r.msg, r.addr, nil
 		}
 		r.up.recordFailure()
 		lastErr = r.err
@@ -400,10 +427,10 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 func sequentialExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
 	var lastErr error
 	for _, up := range upstreams {
-		resp, aURL, err := up.Exchange(context.Background(), req, clientName)
+		resp, addr, err := up.Exchange(context.Background(), req, clientName)
 		if err == nil && resp != nil {
 			up.recordSuccess()
-			return resp, aURL, nil
+			return resp, addr, nil
 		}
 		up.recordFailure()
 		lastErr = err
@@ -584,7 +611,10 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 
 // --- QUIC (DoQ) ---
 
-func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL string) (*dns.Msg, error) {
+// exchangeDoQ returns the DNS response, the actual IP:port that was dialled,
+// and any error. The dial address is threaded up from dialDoQ so that Exchange()
+// can return the real address to the caller for accurate log output.
+func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL string) (*dns.Msg, string, error) {
 	host, port := parseHostPort(targetURL, "doq")
 
 	dialAddrs := []string{net.JoinHostPort(host, port)}
@@ -595,19 +625,21 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL stri
 		}
 	}
 
-	conn := u.takeDoQConn(targetURL)
-	if conn != nil {
+	if conn := u.takeDoQConn(targetURL); conn != nil {
 		resp, err := u.doqStreamExchange(ctx, conn, req)
 		if err == nil {
 			u.putDoQConn(targetURL, conn)
-			return resp, nil
+			// Re-use path: we don't know which dialAddr the cached conn was opened
+			// on, so fall back to targetURL (host:port). This is a minor inaccuracy
+			// only when bootstrap IPs are set and the connection was already pooled.
+			return resp, targetURL, nil
 		}
 		(*conn).CloseWithError(0, "stale")
 	}
 
-	newConn, err := u.dialDoQ(host, dialAddrs)
+	newConn, dialAddr, err := u.dialDoQ(host, dialAddrs)
 	if err != nil {
-		return nil, err
+		return nil, targetURL, err
 	}
 	u.putDoQConn(targetURL, newConn)
 
@@ -615,9 +647,9 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, targetURL stri
 	if err != nil {
 		u.removeDoQConn(targetURL)
 		(*newConn).CloseWithError(0, "exchange failed")
-		return nil, err
+		return nil, dialAddr, err
 	}
-	return resp, nil
+	return resp, dialAddr, nil
 }
 
 func (u *Upstream) takeDoQConn(key string) *quic.Conn {
@@ -651,7 +683,10 @@ func (u *Upstream) removeDoQConn(key string) {
 	u.doqMu.Unlock()
 }
 
-func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, error) {
+// dialDoQ tries each dialAddr in order and returns the successful connection
+// alongside the address that was actually used. The address is returned so
+// callers can log the real IP:port rather than the configured hostname.
+func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, string, error) {
 	tlsConf            := getHardenedTLSConfig()
 	tlsConf.ServerName  = host
 	tlsConf.NextProtos  = []string{"doq"}
@@ -664,11 +699,11 @@ func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, error) 
 			MaxIncomingStreams: 10,
 		})
 		if err == nil {
-			return conn, nil
+			return conn, dialAddr, nil
 		}
 		lastErr = err
 	}
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
 func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *dns.Msg) (*dns.Msg, error) {
