@@ -1,12 +1,18 @@
 /*
 File: main.go
-Version: 1.18.0
-Last Updated: 2026-03-02 20:00 CET
+Version: 1.19.0
+Last Updated: 2026-03-03 14:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.19.0 - [FEAT] RType Policy: new rtype_policy config section maps DNS query
+           types to immediate RCODE responses (e.g. ANY -> REFUSED). Parsed once
+           at startup from string names (via dns.StringToType / dns.StringToRcode)
+           into rtypePolicy map[uint16]int for O(1) hot-path lookup in process.go.
+           Unknown type or RCODE names emit a [WARN] and are skipped — config
+           errors never crash the daemon. Requires new dns import in main.go.
   1.18.0 - [PERF] Added logging.log_queries config option. Controls whether
            per-query log lines are emitted in ProcessDNS. log.Printf acquires a
            global mutex and runs fmt.Sprintf with reflection — with 10 UDP workers
@@ -50,6 +56,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/miekg/dns"
 	"gopkg.in/yaml.v3"
 )
 
@@ -112,6 +119,12 @@ type Config struct {
 	Upstreams    map[string][]string    `yaml:"upstreams"`
 	Routes       map[string]RouteConfig `yaml:"routes"`
 	DomainRoutes map[string]string      `yaml:"domain_routes"`
+
+	// RtypePolicy maps DNS RR type names to RCODE names (both case-insensitive).
+	// At startup these strings are resolved to uint16/int via dns.StringToType and
+	// dns.StringToRcode and stored in the rtypePolicy global for O(1) hot-path use.
+	// Example: {"ANY": "REFUSED", "HINFO": "NOTIMP", "AXFR": "REFUSED"}
+	RtypePolicy map[string]string `yaml:"rtype_policy"`
 }
 
 var cfg Config
@@ -132,6 +145,11 @@ var (
 
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
+
+	// rtypePolicy is the parsed, hot-path version of cfg.RtypePolicy.
+	// Key: DNS qtype as uint16 (e.g. dns.TypeANY). Value: RCODE as int (e.g. dns.RcodeRefused).
+	// Populated once in main(); read without locking in ProcessDNS (immutable after init).
+	rtypePolicy map[uint16]int
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
@@ -264,12 +282,30 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
-	// 5. Supporting subsystems
+	// 5. RType policy — parse string names to uint16/int for O(1) hot-path lookup.
+	// Unknown type or RCODE names are warned and skipped; they never crash the daemon.
+	rtypePolicy = make(map[uint16]int, len(cfg.RtypePolicy))
+	for typeName, rcodeName := range cfg.RtypePolicy {
+		qtype, ok := dns.StringToType[strings.ToUpper(typeName)]
+		if !ok {
+			log.Printf("[WARN] rtype_policy: unknown RR type %q — skipped", typeName)
+			continue
+		}
+		rcode, ok := dns.StringToRcode[strings.ToUpper(rcodeName)]
+		if !ok {
+			log.Printf("[WARN] rtype_policy: unknown RCODE %q for type %s — skipped", rcodeName, typeName)
+			continue
+		}
+		rtypePolicy[qtype] = rcode
+		log.Printf("[INIT] RType Policy: %s -> %s", dns.TypeToString[qtype], dns.RcodeToString[rcode])
+	}
+
+	// 6. Supporting subsystems
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	InitARP()
 	InitIdentity()
 
-	// 6. TLS
+	// 7. TLS
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
 	var tlsConfig *tls.Config
 	if needsTLS {
@@ -278,7 +314,7 @@ func main() {
 		log.Println("[TLS] No encrypted listeners configured — skipping TLS.")
 	}
 
-	// 7. Network listeners
+	// 8. Network listeners
 	StartServers(tlsConfig)
 
 	// Wait for termination signal

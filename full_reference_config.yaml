@@ -104,6 +104,36 @@ logging:
   # timestamps, avoiding duplicate timestamp output in logs.
   strip_time: false
 
+# QUERY-TYPE POLICY
+# Maps specific DNS RR query types to an immediate RCODE — no cache lookup,
+# no identity check, no upstream forwarding. Fired at step 0 in ProcessDNS,
+# before AAAA filter, strict PTR, DDR spoofing, local identity, and routing.
+# Cost on the hot path: one map lookup on a uint16 key.
+#
+# Keys:   RR type names, case-insensitive. Any type known to miekg/dns works —
+#         A, AAAA, MX, TXT, ANY, AXFR, IXFR, HINFO, CAA, NAPTR, SPF, …
+# Values: RCODE names, case-insensitive.
+#         NOERROR, FORMERR, SERVFAIL, NXDOMAIN, NOTIMP, REFUSED, …
+#
+# Unknown type or RCODE names are logged as [WARN] and skipped at startup —
+# a config typo never crashes the daemon.
+#
+# Omit the section entirely to apply no type-based policy (default behaviour).
+#
+# Recommended hardening set for a home/office stub resolver:
+#   ANY:  REFUSED — RFC 8482 explicitly allows resolvers to refuse ANY queries.
+#                   ANY is the classic amplification vector; there is no
+#                   legitimate reason a stub client needs it answered.
+#   AXFR: REFUSED — Zone transfer requests make no sense on a forwarding resolver.
+#   IXFR: REFUSED — Same rationale as AXFR.
+#   HINFO: NOTIMP — Historical host-info record, no modern legitimate use case.
+#                   NOTIMP ("not implemented") is the semantically correct signal.
+rtype_policy:
+  ANY:   "REFUSED"
+  AXFR:  "REFUSED"
+  IXFR:  "REFUSED"
+  HINFO: "NOTIMP"
+
 cache:
   enabled: true
 

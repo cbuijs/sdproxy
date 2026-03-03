@@ -1,13 +1,29 @@
 /*
 File: process.go
-Version: 1.28.0
-Last Updated: 2026-03-02 21:00 CET
+Version: 1.30.0
+Last Updated: 2026-03-03 14:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.30.0 - [FEAT] RType Policy (step 0): query types can be mapped to an immediate
+           RCODE via rtype_policy in config.yaml (e.g. ANY -> REFUSED, HINFO ->
+           NOTIMP). Fires before AAAA filter, strict PTR, DDR, local interception,
+           and upstream. Cost is a single map lookup on a uint16 key — essentially
+           free. Parsed once at startup into rtypePolicy map[uint16]int.
+  1.29.0 - [FEAT] Local NXDOMAIN for non-A/AAAA/PTR queries on locally known names.
+           If a hostname resolves locally (has A/AAAA records in hosts/leases) but
+           the client asks for a different type (MX, TXT, SRV, NS, …), we return
+           NXDOMAIN immediately instead of forwarding upstream. This prevents
+           pointless upstream traffic and avoids leaking internal hostnames.
+           Technically RFC-correct would be NODATA (RCODE=NOERROR + empty answer),
+           because the name *does* exist — it just has no records of that type.
+           NXDOMAIN is deliberately chosen here: it is more decisive, stops client
+           retries, and is appropriate for local-only names that will never have
+           MX/TXT/SRV records anywhere. The NXDOMAIN response is cached under the
+           "local" route key just like A/AAAA/PTR local answers.
   1.28.0 - [FEAT] Per-query log lines now include the resolved client name next
            to the client IP: "192.168.1.42 (my-laptop) -> example.com. A | ...".
            Identity resolution (MAC lookup, client name chain) moved to the top of
@@ -140,6 +156,22 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		clientID = clientIP + " (" + clientName + ")"
 	}
 
+	// --- 0. RType Policy ---
+	// Blanket per-query-type RCODE policy configured via rtype_policy in config.yaml.
+	// Fired before everything else (AAAA filter, strict PTR, DDR, local identity,
+	// upstream) — cost is one map lookup on a uint16 key, essentially free.
+	// clientID is already set above so log lines are fully annotated.
+	if rcode, blocked := rtypePolicy[q.Qtype]; blocked {
+		resp := new(dns.Msg)
+		resp.SetRcode(r, rcode)
+		w.WriteMsg(resp)
+		if logQueries {
+			log.Printf("[DNS] [%s] %s -> %s %s | RTYPE POLICY: %s",
+				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[rcode])
+		}
+		return
+	}
+
 	// --- 0a. AAAA Filter ---
 	if q.Qtype == dns.TypeAAAA && cfg.Server.FilterAAAA {
 		resp := new(dns.Msg)
@@ -260,7 +292,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
-	// --- 2. Local Hosts/Leases Interception (A, AAAA, PTR) ---
+	// --- 2. Local Hosts/Leases Interception (A, AAAA, PTR — and NXDOMAIN for everything else) ---
 	localCacheKey := DNSCacheKey{Name: q.Name, Qtype: q.Qtype, Qclass: q.Qclass, Route: "local"}
 	if cachedResp := CacheGet(localCacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
@@ -319,6 +351,31 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			w.WriteMsg(resp)
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL PTR", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+			}
+			return
+		}
+	} else {
+		// Any other query type (MX, TXT, SRV, NS, CNAME, HTTPS, …):
+		// If the name is known locally it will never have these record types
+		// upstream either — return NXDOMAIN immediately.
+		//
+		// Strict RFC note: when a name exists but lacks records of the requested
+		// type, NODATA (RCODE=NOERROR, empty answer) is technically more correct.
+		// NXDOMAIN is chosen deliberately here because:
+		//   - Local-only names (router, laptop, NAS, …) genuinely don't exist in
+		//     any public or upstream zone — NXDOMAIN is not misleading.
+		//   - NXDOMAIN is final: clients stop retrying and don't fall back to
+		//     other resolvers. NODATA sometimes triggers a second upstream query.
+		//   - It prevents leaking internal hostnames to upstream resolvers.
+		if localIPs := resolveLocalIdentity(qNameTrimmed); len(localIPs) > 0 {
+			resp := new(dns.Msg)
+			resp.SetRcode(r, dns.RcodeNameError)
+			resp.Authoritative = true
+			CacheSet(localCacheKey, resp)
+			w.WriteMsg(resp)
+			if logQueries {
+				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL NXDOMAIN (name is local-only)",
+					protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 			}
 			return
 		}
