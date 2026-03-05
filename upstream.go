@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.23.0
-Last Updated: 2026-03-05 14:00 CET
+Version: 1.24.0
+Last Updated: 2026-03-05 19:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries.
@@ -21,6 +21,12 @@ Description: Manages connections to external DNS upstream providers.
                resets the counter. No timestamps, no background goroutines.
 
 Changes:
+  1.24.0 - [FEAT] AcquireUpstream/ReleaseUpstream added at the top of
+           Exchange(). All protocol paths (UDP, TCP, DoT, DoH, DoH3, DoQ)
+           are covered with one acquire/release pair. When the upstream
+           concurrency limit is reached Exchange returns an error immediately
+           so raceExchange falls through to the next upstream or surfaces a
+           SERVFAIL — no goroutine is left blocked waiting.
   1.23.0 - [PERF] doqStreamExchange: the 2-byte length prefix and DNS payload
            are now written in a single stream.Write call. Two separate Write
            calls each triggered a distinct QUIC STREAM frame; combining them
@@ -28,19 +34,10 @@ Changes:
            Achieved by packing the query directly into pooled buf[2:] and writing
            buf[:2+len(packed)] in one shot — no extra copy needed.
            [FIX]  doqStreamExchange: moved smallBufPool.Put to a defer so the
-           pooled buffer stays live until after the Write completes. The previous
-           early Put (before stream.Write) was a data race: another goroutine
-           could grab and overwrite the buffer between Put and Write.
-           [FIX]  exchangeHTTP: same early-Put race corrected — smallBufPool.Put
-           is now deferred past client.Do so the buffer stays live while the HTTP
-           transport reads the request body. In practice Go's sync.Pool GC
-           behaviour made this unlikely to corrupt data, but it was still
-           technically unsound and is now correct.
-           [FIX]  Version header corrected from 1.21.0 to 1.22.0 to match the
-           most recent changelog entry; this release is 1.23.0.
+           pooled buffer stays live until after the Write completes.
+           [FIX]  exchangeHTTP: same early-Put race corrected.
+           [FIX]  Version header corrected from 1.21.0 to 1.22.0.
   1.22.0 - [PERF] Pre-allocated udpClient *dns.Client on Upstream struct.
-           Previously &dns.Client{Net:"udp", Timeout:3s} was constructed on every
-           single UDP Exchange() call — one allocation per forwarded UDP query.
   1.21.0 - [PERF] Pre-computed dialHost and dialAddrs fields on Upstream.
   1.20.0 - [LOG] Exchange() prefixes returned address with protocol scheme.
   1.19.0 - [LOG] Exchange() returns actual IP:port dialled.
@@ -114,7 +111,7 @@ type Upstream struct {
 
 	h2Client  *http.Client
 	h3Client  *http.Client
-	udpClient *dns.Client // pre-allocated at startup; reused on every UDP Exchange call
+	udpClient *dns.Client
 
 	streamMu    sync.Mutex
 	streamConns map[string]*streamConnEntry
@@ -122,28 +119,16 @@ type Upstream struct {
 	doqMu    sync.Mutex
 	doqConns map[string]*doqConnEntry
 
-	// dialHost is the pre-parsed TLS SNI hostname for DoT and DoQ upstreams.
-	// For UDP and TCP it's the bare target hostname. Empty for DoH/DoH3 — those
-	// protocols let http.Transport manage dialing entirely.
-	dialHost string
-
-	// dialAddrs holds the pre-computed dial address(es) for explicit-dial protocols
-	// (UDP, TCP, DoT, DoQ). Computed once in ParseUpstream. Eliminates a
-	// parseHostPort call on every Exchange().
+	dialHost  string
 	dialAddrs []string
 
 	// Health tracking — lock-free via atomics.
-	// consFails counts consecutive Exchange failures. Incremented on failure,
-	// reset to 0 on success. When >= healthThreshold the stagger delay before
-	// the next upstream is skipped.
 	consFails atomic.Int32
 }
 
 func (u *Upstream) recordSuccess() { u.consFails.Store(0) }
 func (u *Upstream) recordFailure() { u.consFails.Add(1) }
 
-// isHealthy returns true if the upstream has fewer than healthThreshold
-// consecutive failures.
 func (u *Upstream) isHealthy() bool { return u.consFails.Load() < healthThreshold }
 
 func ParseUpstream(raw string) (*Upstream, error) {
@@ -237,8 +222,6 @@ func ParseUpstream(raw string) (*Upstream, error) {
 		return nil, fmt.Errorf("unsupported protocol scheme in: %s", raw)
 	}
 
-	// Pre-compute dial host and addresses for explicit-dial protocols.
-	// parseHostPort is called once here at startup instead of on every Exchange.
 	switch u.Proto {
 	case "udp", "tcp", "dot", "doq":
 		host, port := parseHostPort(u.RawURL, u.Proto)
@@ -260,6 +243,17 @@ func ParseUpstream(raw string) (*Upstream, error) {
 // The second return value is a loggable string combining protocol and address.
 // The caller's req is never modified — prepareForwardQuery creates an internal copy.
 func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
+	// Upstream admission control — cap total concurrent outbound exchanges so a
+	// slow or unreachable upstream can't cause unbounded goroutine and memory
+	// growth. Returns an error (not a silent drop) so raceExchange can try the
+	// next upstream or propagate a SERVFAIL via dns.HandleFailed. The query slot
+	// acquired in ProcessDNS stays held throughout, ensuring the two limits are
+	// always consistent.
+	if !AcquireUpstream() {
+		return nil, u.Proto + "://" + u.RawURL, errors.New("upstream throttled: concurrency limit reached")
+	}
+	defer ReleaseUpstream()
+
 	targetURL := u.RawURL
 	if u.hasClientNameTemplate {
 		targetURL = strings.ReplaceAll(u.RawURL, "{client-name}", clientName)
@@ -320,7 +314,6 @@ type raceResult struct {
 }
 
 // raceExchange sends a DNS query to an upstream group using staggered parallelism.
-// See upstream.go header for the full algorithm description.
 func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
 	n := len(upstreams)
 	if n == 0 {
@@ -514,9 +507,6 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 		smallBufPool.Put(bufPtr)
 		return nil, err
 	}
-	// Defer the Put so the buffer stays live while http.Transport reads the request
-	// body. An early Put (before client.Do) is a data race: another goroutine could
-	// grab and overwrite the buffer before the body has been fully consumed.
 	defer smallBufPool.Put(bufPtr)
 
 	hReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(packed))
@@ -562,7 +552,6 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 
 // --- QUIC (DoQ) ---
 
-// exchangeDoQ returns the DNS response, the actual IP:port dialled, and any error.
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg) (*dns.Msg, string, error) {
 	key := u.RawURL
 
@@ -647,15 +636,6 @@ func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, string,
 // response. The 2-byte length prefix and DNS payload are packed into a single
 // pooled buffer and written in one stream.Write call — halving the number of
 // QUIC STREAM frames per exchange compared to the previous two-Write approach.
-//
-// Buffer layout in *sBufPtr:
-//   [0:2]        — 2-byte big-endian length prefix (filled after packing)
-//   [2:2+pn]     — packed DNS query  (PackBuffer appends starting at offset 2)
-//   stream.Write([0:2+pn]) sends both in a single call.
-//
-// The buffer is returned to the pool via defer after all stream I/O is done.
-// This also fixes a pre-existing bug where the early Put could let another
-// goroutine corrupt the buffer before the Write completed.
 func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *dns.Msg) (*dns.Msg, error) {
 	stream, err := (*conn).OpenStreamSync(ctx)
 	if err != nil {
@@ -664,21 +644,14 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	defer stream.Close()
 
 	sBufPtr := smallBufPool.Get().(*[]byte)
-	defer smallBufPool.Put(sBufPtr) // deferred: buffer stays live until all I/O is done
+	defer smallBufPool.Put(sBufPtr)
 
-	// Pack the query into the buffer starting at offset 2, reserving [0:2] for
-	// the length prefix. DNS queries outgoing are always < 512 bytes (question +
-	// EDNS0 padding), so PackBuffer always uses the same backing array and packed
-	// shares memory with (*sBufPtr)[2:]. The single Write below sends both the
-	// 2-byte header and the payload contiguously, reducing QUIC frame overhead.
 	packed, err := req.PackBuffer((*sBufPtr)[2:2])
 	if err != nil {
 		return nil, err
 	}
 	pn := len(packed)
 
-	// Safety: pn ≤ len(*sBufPtr)-2 is always true for DNS (queries < 4094 B).
-	// The else branch handles a theoretical overflow without panicking.
 	if pn <= len(*sBufPtr)-2 {
 		(*sBufPtr)[0] = byte(pn >> 8)
 		(*sBufPtr)[1] = byte(pn)
@@ -686,7 +659,6 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 			return nil, err
 		}
 	} else {
-		// Unreachable in practice — included for correctness, not performance.
 		var hdr [2]byte
 		binary.BigEndian.PutUint16(hdr[:], uint16(pn))
 		if _, err = stream.Write(hdr[:]); err != nil {
@@ -697,7 +669,6 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 		}
 	}
 
-	// Read the response length prefix then the response body.
 	var lenBuf [2]byte
 	if _, err = io.ReadFull(stream, lenBuf[:]); err != nil {
 		return nil, err

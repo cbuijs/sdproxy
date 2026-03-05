@@ -1,29 +1,23 @@
 /*
 File: main.go
-Version: 1.25.1
-Last Updated: 2026-03-03 23:45 CET
+Version: 1.27.0
+Last Updated: 2026-03-05 19:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.27.0 - [FEAT] InitThrottle() called after InitIdentity(). Derives initial
+           query and upstream concurrency limits from udp_workers and starts
+           the 500 ms AIMD pressure monitor. No new config keys needed.
   1.26.1 - [FEAT] Pre-pack policy RCODE response templates for zero-alloc
            policy fast-paths.
   1.25.0 - [FEAT] domain_policy config section: maps domain suffixes (and all
            their sub-domains) to an immediate RCODE. Parsed into domainPolicy
            map[string]int at startup. Hot-path gated via hasDomainPolicy bool.
            Processed in ProcessDNS at new step 0d — before DDR, local identity,
-           domain_routes, and the cache. Complements rtype_policy (which blocks
-           by query type) with name-based blocking.
-  1.24.0 - [FEAT] block_obsolete_qtypes config flag. When enabled, all obsolete,
-           withdrawn, experimental-never-standardised, and IANA-reserved RR types
-           are injected into rtypePolicy with NOTIMP at startup. User-defined
-           rtype_policy entries always take precedence. A companion runtime check
-           (blockUnknownQtypes flag, read by process.go) blocks completely
-           unrecognised type numbers — IANA unassigned gaps that have no name and
-           therefore cannot be addressed via rtype_policy at all.
-           The full list of blocked types and their RFC justifications is in the
-           obsoleteQtypes map below.
+           domain_routes, and the cache.
+  1.24.0 - [FEAT] block_obsolete_qtypes config flag.
   1.23.0 - [FEAT] Cache.MaxTTL config field — caps cached response TTLs.
   1.22.0 - [FEAT] DDR.IPv4/IPv6 changed to []string for multiple addresses.
   1.21.0 - [PERF] Four feature-presence flags set at startup for hot-path gating.
@@ -97,12 +91,8 @@ type Config struct {
 		DDR struct {
 			Enabled   bool     `yaml:"enabled"`
 			Hostnames []string `yaml:"hostnames"`
-			// IPv4 and IPv6 are lists of resolver addresses to advertise in DDR
-			// spoofed responses. Multiple addresses are supported.
-			// Empty list: falls back to the local interface address of each incoming
-			// query at query time.
-			IPv4 []string `yaml:"ipv4"`
-			IPv6 []string `yaml:"ipv6"`
+			IPv4      []string `yaml:"ipv4"`
+			IPv6      []string `yaml:"ipv6"`
 		} `yaml:"ddr"`
 
 		UpstreamStaggerMs int `yaml:"upstream_stagger_ms"`
@@ -116,13 +106,8 @@ type Config struct {
 	Cache struct {
 		Enabled bool `yaml:"enabled"`
 		Size    int  `yaml:"size"`
-		// MinTTL is the floor applied to all cached response TTLs (seconds).
-		// Prevents thrashing for records with very short TTLs.
-		// Also used as the fallback negative cache TTL when no SOA is available.
-		MinTTL int `yaml:"min_ttl"`
-		// MaxTTL is the ceiling applied to all cached response TTLs (seconds).
-		// 0 = disabled (no ceiling). Must be >= MinTTL when non-zero.
-		MaxTTL int `yaml:"max_ttl"`
+		MinTTL  int  `yaml:"min_ttl"`
+		MaxTTL  int  `yaml:"max_ttl"`
 	} `yaml:"cache"`
 
 	Identity struct {
@@ -134,18 +119,8 @@ type Config struct {
 	Upstreams    map[string][]string    `yaml:"upstreams"`
 	Routes       map[string]RouteConfig `yaml:"routes"`
 	DomainRoutes map[string]string      `yaml:"domain_routes"`
-
-	// RtypePolicy maps DNS RR type names to RCODE names (both case-insensitive).
-	// Resolved to uint16/int at startup and stored in rtypePolicy for O(1) hot-path use.
-	RtypePolicy map[string]string `yaml:"rtype_policy"`
-
-	// DomainPolicy maps domain suffixes to RCODE names (both case-insensitive).
-	// A single entry covers the apex AND all sub-domains — "example.com" blocks
-	// both "example.com" and "foo.bar.example.com". Suffix matching via label walk,
-	// same algorithm as domain_routes. Stored in domainPolicy (map[string]int)
-	// for efficient hot-path lookups. Checked at step 0d in ProcessDNS — before
-	// DDR, local identity, domain_routes, and the upstream cache.
-	DomainPolicy map[string]string `yaml:"domain_policy"`
+	RtypePolicy  map[string]string      `yaml:"rtype_policy"`
+	DomainPolicy map[string]string      `yaml:"domain_policy"`
 }
 
 var cfg Config
@@ -158,57 +133,45 @@ type ParsedRoute struct {
 // obsoleteQtypes maps IANA RR type numbers to a short label for every type that
 // is obsolete, withdrawn, experimental-and-never-standardised, or IANA-reserved
 // with no published specification.
-//
-// These are injected into rtypePolicy (NOTIMP) at startup when
-// block_obsolete_qtypes: true. Using numeric keys means this map compiles
-// regardless of which constants miekg/dns exposes for older/obscure types.
-//
-// Sources: IANA "Domain Name System (DNS) Parameters" registry,
-//          and the RFCs cited per entry.
 var obsoleteQtypes = map[uint16]string{
-	3:   "MD",       // Obsolete — use MX (RFC 974)
-	4:   "MF",       // Obsolete — use MX (RFC 974)
-	7:   "MB",       // Experimental, never standardised (RFC 1035 §3.3.3)
-	8:   "MG",       // Experimental, never standardised (RFC 1035 §3.3.6)
-	9:   "MR",       // Experimental, never standardised (RFC 1035 §3.3.8)
-	10:  "NULL",     // Experimental (RFC 1035 §3.3.10)
-	11:  "WKS",      // Deprecated (RFC 1123 §4.2.2)
-	14:  "MINFO",    // Experimental, never standardised (RFC 1035 §3.3.7)
-	19:  "X25",      // Obsolete (RFC 1183)
-	20:  "ISDN",     // Obsolete (RFC 1183)
-	21:  "RT",       // Obsolete (RFC 1183)
-	22:  "NSAP",     // Obsolete (RFC 1706)
-	23:  "NSAP-PTR", // Obsolete (RFC 1348, superseded by RFC 1637, then RFC 1706)
-	24:  "SIG",      // Obsolete — superseded by RRSIG (RFC 4034)
-	25:  "KEY",      // Obsolete — superseded by DNSKEY (RFC 4034)
-	26:  "PX",       // Obsolete (RFC 2163)
-	27:  "GPOS",     // Withdrawn (RFC 1712)
-	30:  "NXT",      // Obsolete — superseded by NSEC (RFC 4034)
-	31:  "EID",      // Nimrod EID, never standardised (Patton 1995)
-	32:  "NIMLOC",   // Nimrod Locator, never standardised (Patton 1995)
-	34:  "ATMA",     // ATM Address, never deployed (ATMDOC)
-	38:  "A6",       // Historic — superseded by AAAA (RFC 6563)
-	40:  "SINK",     // Kitchen Sink, never published as RFC (Eastlake draft)
-	99:  "SPF",      // Deprecated — use TXT instead (RFC 7208 §3.1)
-	100: "UINFO",    // IANA reserved, no published specification
-	101: "UID",      // IANA reserved, no published specification
-	102: "GID",      // IANA reserved, no published specification
-	103: "UNSPEC",   // IANA reserved, no published specification
-	253: "MAILB",    // Meta-qtype for obsolete MB/MG/MR — all three are obsolete
-	254: "MAILA",    // Meta-qtype for obsolete MD/MF — both are obsolete
+	3:   "MD",
+	4:   "MF",
+	7:   "MB",
+	8:   "MG",
+	9:   "MR",
+	10:  "NULL",
+	11:  "WKS",
+	14:  "MINFO",
+	19:  "X25",
+	20:  "ISDN",
+	21:  "RT",
+	22:  "NSAP",
+	23:  "NSAP-PTR",
+	24:  "SIG",
+	25:  "KEY",
+	26:  "PX",
+	27:  "GPOS",
+	30:  "NXT",
+	31:  "EID",
+	32:  "NIMLOC",
+	34:  "ATMA",
+	38:  "A6",
+	40:  "SINK",
+	99:  "SPF",
+	100: "UINFO",
+	101: "UID",
+	102: "GID",
+	103: "UNSPEC",
+	253: "MAILB",
+	254: "MAILA",
 }
 
-// Global read-only state — set during init, never written after (inherently thread-safe).
 var (
 	macRoutes      map[string]ParsedRoute
 	domainRoutes   map[string]string
 	routeUpstreams map[string][]*Upstream
 	ddrHostnames   map[string]bool
 
-	// ddrIPv4 and ddrIPv6 hold the configured resolver addresses for DDR spoofing.
-	// Both are []net.IP so multiple addresses per family are supported.
-	// When a slice is empty, process.go falls back to the incoming query's interface
-	// address at query time via ddrAddrs().
 	ddrIPv4 []net.IP
 	ddrIPv6 []net.IP
 
@@ -216,47 +179,33 @@ var (
 	ddrDoTPort uint16 = 853
 
 	rtypePolicy  map[uint16]int
-	domainPolicy map[string]int // normalized suffix -> RCODE
+	domainPolicy map[string]int
 
 	routeIdxByName  map[string]uint8
 	routeIdxLocal   uint8 = 0
 	routeIdxDefault uint8
 
-	// Feature-presence flags — set once at startup, read-only after.
-	// Allow process.go to skip entire hot-path blocks when features are not in use.
 	hasMACRoutes          bool
 	hasDomainRoutes       bool
 	hasRtypePolicy        bool
-	hasDomainPolicy       bool // true when domain_policy has at least one entry
+	hasDomainPolicy       bool
 	hasClientNameUpstream bool
-	// blockUnknownQtypes enables the per-query check for type numbers that
-	// miekg/dns doesn't recognise (unassigned IANA slots). Set when
-	// block_obsolete_qtypes: true. Named obsolete types are already handled by
-	// rtypePolicy injection; this flag catches numeric gaps that have no name.
-	blockUnknownQtypes bool
+	blockUnknownQtypes    bool
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
-//
-// smallBufPool (4KB): packing outgoing DNS messages. DNS responses are always
-// small (< 512B plain, < 4KB with EDNS0).
-//
-// largeBufPool (64KB): reading incoming HTTP bodies and DoQ streams where payload
-// size is unknown. Matches the DNS wire format maximum for large DNSSEC responses.
 var (
 	smallBufPool = sync.Pool{New: func() any { b := make([]byte, 4096); return &b }}
 	largeBufPool = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
 )
 
 func main() {
-	// GOGC=100 (Go default): GC when live heap doubles from its post-GC size.
-	// SetMemoryLimit caps the absolute ceiling so memory safety is unaffected.
 	debug.SetGCPercent(100)
 
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.25.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.27.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -402,7 +351,6 @@ func main() {
 		log.Fatal("[FATAL] 'default' upstream group is required but missing or empty.")
 	}
 
-	// Scan all upstream groups for {client-name} template usage.
 outer:
 	for _, group := range routeUpstreams {
 		for _, up := range group {
@@ -414,8 +362,7 @@ outer:
 	}
 	log.Printf("[INIT] {client-name} upstream substitution: %v", hasClientNameUpstream)
 
-	// 5. RType policy — load user-defined type->RCODE mappings first.
-	// Obsolete type injection (step 6) runs after this so user entries take precedence.
+	// 5. RType policy
 	rtypePolicy = make(map[uint16]int, len(cfg.RtypePolicy)+len(obsoleteQtypes))
 	for typeName, rcodeName := range cfg.RtypePolicy {
 		qtype, ok := dns.StringToType[strings.ToUpper(typeName)]
@@ -432,9 +379,7 @@ outer:
 		log.Printf("[INIT] RType Policy: %s -> %s", dns.TypeToString[qtype], dns.RcodeToString[rcode])
 	}
 
-	// 5b. Domain policy — suffix-based name blocking, independent of query type.
-	// Entries are normalised to lowercase with trailing dots stripped, matching
-	// the same form that ProcessDNS passes to getDomainPolicyRcode() via lowerTrimDot.
+	// 5b. Domain policy
 	domainPolicy = make(map[string]int, len(cfg.DomainPolicy))
 	for domainStr, rcodeName := range cfg.DomainPolicy {
 		clean := strings.ToLower(strings.TrimSuffix(domainStr, "."))
@@ -452,17 +397,14 @@ outer:
 	}
 	hasDomainPolicy = len(domainPolicy) > 0
 
-	// 6. Obsolete qtype blocking — inject after user rtype_policy so user wins on conflicts.
-	// Named obsolete types land in rtypePolicy (checked at step 0 in ProcessDNS, zero extra
-	// hot-path cost). The blockUnknownQtypes flag covers IANA unassigned gaps — type numbers
-	// that have no name and therefore can't be targeted by rtype_policy at all.
+	// 6. Obsolete qtype blocking
 	if cfg.Server.BlockObsoleteQtypes {
 		added := 0
 		for qtype, label := range obsoleteQtypes {
 			if _, userSet := rtypePolicy[qtype]; !userSet {
 				rtypePolicy[qtype] = dns.RcodeNotImplemented
 				added++
-				_ = label // label used only when building a debug summary below
+				_ = label
 			}
 		}
 		blockUnknownQtypes = true
@@ -472,7 +414,6 @@ outer:
 	}
 	hasRtypePolicy = len(rtypePolicy) > 0
 
-	// Pre-pack policy RCODE response templates for zero-alloc policy fast-paths.
 	buildPolicyRespCache()
 
 	// 7. Route index table
@@ -499,7 +440,7 @@ outer:
 	routeIdxDefault = routeIdxByName["default"]
 	log.Printf("[INIT] Route index table: %d entries", len(routeIdxByName))
 
-	// 8. Cache — log effective TTL bounds for easy diagnostics.
+	// 8. Cache
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	if cfg.Cache.Enabled {
 		if cfg.Cache.MaxTTL > 0 {
@@ -517,6 +458,11 @@ outer:
 	}
 
 	InitIdentity()
+
+	// Adaptive admission control — self-calibrating AIMD throttle.
+	// Derives initial concurrency limits from udp_workers and monitors goroutine
+	// count + heap pressure every 500 ms. No configuration needed.
+	InitThrottle()
 
 	// 9. TLS
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0
@@ -538,7 +484,6 @@ outer:
 	Shutdown()
 }
 
-// extractPort parses the port number from a "host:port" listener address string.
 func extractPort(addr string, fallback uint16) uint16 {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
