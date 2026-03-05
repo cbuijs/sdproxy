@@ -1,6 +1,6 @@
 /*
 File: process.go
-Version: 1.43.0
+Version: 1.44.0
 Last Updated: 2026-03-05 19:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
@@ -8,6 +8,11 @@ Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.44.0 - [FEAT] IncrQueryTotal() called after AcquireQuery to feed the
+           miss-rate signal in throttle.go. IncrUpstreamCall() called at
+           step 6 (just before raceExchange) to count cache misses. Together
+           these let the throttler compute Δupstream/Δqueries per 500 ms
+           window — a leading indicator of upstream saturation.
   1.43.0 - [FEAT] Adaptive admission control: AcquireQuery/ReleaseQuery calls
            added at ProcessDNS entry point (after the question-count guard).
            Queries exceeding the pressure-adjusted queryLimit are silently
@@ -306,6 +311,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 	defer ReleaseQuery()
+	IncrQueryTotal() // feeds miss-rate signal in throttle.go
 
 	// --- OpCode guard ---
 	// Only QUERY (0) is supported. All other opcodes require authoritative server
@@ -699,6 +705,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 6. Upstream Forwarding ---
+	// IncrUpstreamCall counts this as a cache miss for the throttle miss-rate
+	// signal. Called here rather than inside Exchange() so stagger races
+	// (which call Exchange() multiple times per query) count as one miss, not
+	// several — keeping the ratio meaningful as "queries needing upstream".
+	IncrUpstreamCall()
 	finalResp, upstreamUsed, lastErr := raceExchange(upstreams, r, clientName)
 
 	// --- 7. Handle Error ---
