@@ -1,7 +1,7 @@
 /*
 File: throttle.go
-Version: 1.0.0
-Last Updated: 2026-03-05 19:00 CET
+Version: 1.1.0
+Last Updated: 2026-03-05 21:00 CET
 Description: Adaptive, zero-configuration admission control for sdproxy.
              Monitors goroutine count and heap pressure every 500 ms, then
              adjusts two independent concurrency limits via AIMD to keep the
@@ -10,11 +10,10 @@ Description: Adaptive, zero-configuration admission control for sdproxy.
              TWO LIMITS
              ──────────────────────────────────────────────────────────────
              queryLimit    – max concurrent ProcessDNS invocations.
-                             Excess queries are silently dropped — no response
-                             is written. The client times out normally and
-                             retries, without any error state being set on
-                             its end. Safer than SERVFAIL which some
-                             resolvers treat as a permanent failure signal.
+                             Excess queries are silently dropped — no
+                             response is written. The client times out
+                             normally and retries without any error state
+                             being set on its end.
              upstreamLimit – max concurrent outbound DNS exchanges across
                              all upstream groups. Prevents connection-table
                              exhaustion and goroutine-stack memory explosion
@@ -31,14 +30,27 @@ Description: Adaptive, zero-configuration admission control for sdproxy.
 
                30% goroutine spike
                      (current − baseline) / (baseline × 8).
-                     Baseline is the average goroutine count during the
-                     first 30 s of uptime ("warm but idle"). Each goroutine
-                     has a ~2–8 KB initial stack; spikes matter on routers.
+                     Baseline is a continuous EMA (α=0.02, τ≈25 s) of the
+                     goroutine count, updated only while heap pressure is
+                     below 40%. This means:
+                       • The baseline includes all library goroutines
+                         (quic-go, http2, miekg/dns) at normal load —
+                         runtime.NumGoroutine() is process-wide and
+                         cannot be filtered by package.
+                       • The baseline naturally adapts as traffic patterns
+                         change over time (more DoH clients = more http2
+                         goroutines = higher baseline = no false alarms).
+                       • The baseline freezes during pressure events so
+                         the spike signal stays meaningful when it matters.
+                     Contrast with v1.0.0 which used a one-shot 30 s
+                     startup window when the server was idle — that
+                     baseline was always too low because no library
+                     goroutines had been spawned yet.
 
                20% upstream fill ratio
                      activeUpstream / upstreamLimit.
-                     Feeds back directly: rising upstream pressure is a
-                     leading indicator of slow upstreams before heap spikes.
+                     Leading indicator: upstream saturation predicts heap
+                     and goroutine spikes before they materialise.
 
              AIMD RESPONSE TABLE
              ──────────────────────────────────────────────────────────────
@@ -55,9 +67,19 @@ Description: Adaptive, zero-configuration admission control for sdproxy.
              AcquireQuery / AcquireUpstream are lock-free CAS loops.
              Expected cost per query: two atomic ops (acquire + release).
              The monitor goroutine calls runtime.ReadMemStats every 500 ms
-             (brief STW, ~1 µs); all query goroutines are unaffected.
+             (brief STW pause, ~1 µs on Go ≥ 1.15); query goroutines are
+             not affected.
 
 Changes:
+  1.1.0 - [FIX]  Replaced one-shot 30 s startup goroutine baseline with a
+           continuous EMA (α=0.02, τ≈25 s) updated only while heap pressure
+           is below 40%. The old baseline was learned while the server was
+           idle, so it never included quic-go/http2/miekg goroutines and
+           caused false goroutine-spike alarms under normal load.
+           The EMA approach makes the baseline self-calibrating: it tracks
+           "what normal looks like right now" and freezes automatically
+           during pressure events. Removed baselineLearned flag and
+           gorSamples accumulator — simpler and more correct.
   1.0.0 - Initial implementation.
 */
 
@@ -79,38 +101,44 @@ import (
 // four; keeping them together avoids a second cache-line fetch.
 type throttler struct {
 	// ── Hot path ─────────────────────────────────────────────────────────
-	// Read and written on every query and every upstream exchange.
 	activeQueries  atomic.Int32 // queries currently inside ProcessDNS
 	activeUpstream atomic.Int32 // upstream exchanges currently in-flight
 	queryLimit     atomic.Int32 // current max for activeQueries
 	upstreamLimit  atomic.Int32 // current max for activeUpstream
 
 	// ── Pressure signal ───────────────────────────────────────────────────
-	// Written by the monitor goroutine; read by the rate-limited log line.
 	pressureScore atomic.Int32 // 0–100, updated every 500 ms
 
 	// ── Drop counters ─────────────────────────────────────────────────────
-	// Incremented when Acquire returns false; never reset.
-	// Reported in the pressure log line so trends are visible without noise.
 	droppedQueries  atomic.Int64
 	droppedUpstream atomic.Int64
 
-	// ── Baseline learning ─────────────────────────────────────────────────
-	// Goroutine count averaged over the first 30 s of uptime.
-	// Written once when baselineLearned flips to true; read-only after that.
-	goroutineBaseline atomic.Int32
-	baselineLearned   atomic.Bool
+	// ── Goroutine baseline — continuous EMA ───────────────────────────────
+	// Updated every 500 ms tick, but ONLY when heap pressure is below 40%.
+	// Stored as a fixed-point integer (actual value × 100) so it can live in
+	// an atomic without a mutex. The monitor goroutine is the only writer;
+	// computePressure reads it. Using ×100 gives two decimal places of
+	// precision for the EMA without needing float64.
+	//
+	// Why freeze on pressure? When the server is under load the goroutine
+	// count is elevated — updating the baseline then would permanently raise
+	// it and blind the spike detector to genuine problems. Freezing preserves
+	// the "what normal looks like" reference.
+	goroutineBaselineX100 atomic.Int64 // baseline × 100; 0 = not yet set
 
 	// ── Initial limits ────────────────────────────────────────────────────
-	// Snapshotted at InitThrottle time. Used as the recovery ceiling and to
-	// compute the absolute floor. Plain int32 — written once, no sync needed.
 	initQueryLimit    int32
 	initUpstreamLimit int32
 }
 
-// thr is the package-level singleton. Direct access (no pointer indirection)
-// keeps the hot-path CAS ops as cheap as possible.
 var thr throttler
+
+// emaAlpha is the EMA smoothing factor. At a 500 ms tick rate:
+//   τ = tick_interval / α = 500 ms / 0.02 = 25 s
+// So the baseline tracks a ~25 s exponential moving average of the goroutine
+// count during healthy periods — long enough to ignore short bursts, short
+// enough to adapt to genuine shifts in library goroutine counts over minutes.
+const emaAlpha = float64(0.02)
 
 // InitThrottle derives initial limits from the worker count and launches the
 // background pressure monitor. Call once from main() after cfg is populated.
@@ -120,9 +148,6 @@ func InitThrottle() {
 		workers = 10
 	}
 
-	// Start generous: allow 4× workers concurrent queries and 2× workers
-	// concurrent upstream exchanges. The monitor backs these off under pressure
-	// and restores them (up to 1.5× these values) once resources free up.
 	thr.initQueryLimit    = workers * 4
 	thr.initUpstreamLimit = workers * 2
 
@@ -141,7 +166,6 @@ func InitThrottle() {
 // immediately without writing any response (silent drop). The client will
 // time out and retry naturally; no error state is set on the client side.
 // Non-blocking: uses a CAS loop with no channels and no mutexes.
-// Expected fast-path cost: one Load + one successful CAS = ~2 atomic ops.
 func AcquireQuery() bool {
 	limit := thr.queryLimit.Load()
 	for {
@@ -153,13 +177,10 @@ func AcquireQuery() bool {
 		if thr.activeQueries.CompareAndSwap(cur, cur+1) {
 			return true
 		}
-		// CAS missed: another goroutine changed the counter; retry immediately.
-		// Contention windows are nanosecond-scale on a DNS proxy — no sleep needed.
 	}
 }
 
 // ReleaseQuery releases a slot previously acquired by AcquireQuery.
-// Always defer this immediately after a successful AcquireQuery.
 func ReleaseQuery() { thr.activeQueries.Add(-1) }
 
 // AcquireUpstream reserves one upstream-exchange slot.
@@ -184,117 +205,109 @@ func AcquireUpstream() bool {
 func ReleaseUpstream() { thr.activeUpstream.Add(-1) }
 
 // monitorLoop runs in a dedicated goroutine. Every 500 ms it:
-//  1. Samples goroutine count and heap stats.
-//  2. Computes a 0–100 pressure score.
-//  3. Adjusts queryLimit and upstreamLimit via AIMD.
-//  4. Emits a log line at most once per 10 s when pressure is elevated.
+//  1. Samples goroutine count and heap stats via runtime.ReadMemStats.
+//  2. Updates the EMA goroutine baseline when heap is healthy (< 40 % pressure).
+//  3. Computes a 0–100 pressure score.
+//  4. Adjusts queryLimit and upstreamLimit via AIMD.
+//  5. Emits a log line at most once per 10 s when pressure is elevated.
 func (t *throttler) monitorLoop() {
 	const (
-		sampleInterval = 500 * time.Millisecond
-		baselineWindow = 30 * time.Second  // collect goroutine samples for this long
-		lowWater       = 40                // score below which limits grow
-		highWater      = 65                // score above which limits shrink
-		criticalMark   = 85                // score triggering aggressive halving
-		logCooldown    = 10 * time.Second  // minimum gap between [THROTTLE] pressure lines
+		sampleInterval  = 500 * time.Millisecond
+		highWater       = 65  // score above which limits shrink
+		criticalMark    = 85  // score triggering aggressive halving
+		lowWater        = 40  // score below which limits grow
+		baselineFreezeP = 0.40 // heap pressure fraction above which EMA freezes
+		logCooldown     = 10 * time.Second
 	)
 
-	ticker := time.NewTicker(sampleInterval)
+	ticker  := time.NewTicker(sampleInterval)
 	defer ticker.Stop()
 
-	start      := time.Now()
-	lastLog    := time.Time{}
-	gorSamples := make([]int, 0, 64) // accumulates goroutine counts during baseline window
+	var lastLog time.Time
 
 	workers := int32(cfg.Server.UDPWorkers)
 	if workers <= 0 {
 		workers = 10
 	}
-	// Absolute floor — limits never drop below these regardless of pressure,
-	// so the proxy always has headroom equal to its own worker pool.
 	minQ  := max(workers, 4)
 	minUp := max(workers/2, 2)
 
 	for range ticker.C {
 
-		// ── 1. Goroutine baseline learning ────────────────────────────────
-		//
-		// We learn what "normal" looks like over the first 30 s rather than
-		// hard-coding a threshold. This makes the signal self-calibrating for
-		// both tiny 32-MB routers and full-size Linux boxes.
 		goroutines := int32(runtime.NumGoroutine())
-		if !t.baselineLearned.Load() {
-			gorSamples = append(gorSamples, int(goroutines))
-			if time.Since(start) >= baselineWindow && len(gorSamples) > 0 {
-				sum := 0
-				for _, v := range gorSamples {
-					sum += v
-				}
-				baseline := int32(sum / len(gorSamples))
-				if baseline < 5 {
-					baseline = 5
-				}
-				t.goroutineBaseline.Store(baseline)
-				t.baselineLearned.Store(true)
-				gorSamples = nil // release backing array; no longer needed
-				log.Printf("[THROTTLE] Goroutine baseline learned: %d (from %d samples over 30 s)",
-					baseline, len(gorSamples)+1)
-			}
-		}
 
-		// ── 2. Heap memory snapshot ───────────────────────────────────────
-		//
-		// runtime.ReadMemStats causes a brief stop-the-world (~1 µs in Go ≥1.15).
-		// Calling it once per 500 ms from a background goroutine is negligible.
-		// We read HeapInuse (memory committed to in-use spans) and NextGC
-		// (heap size target for the next GC cycle — a natural capacity signal).
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 
-		// ── 3. Pressure score ─────────────────────────────────────────────
-		score := t.computePressure(goroutines, ms.HeapInuse, ms.NextGC)
+		// ── 1. Compute heap pressure first — needed for EMA freeze decision ─
+		memP := t.computeMemPressure(ms.HeapInuse, ms.NextGC)
+
+		// ── 2. EMA goroutine baseline update ─────────────────────────────────
+		//
+		// Only update when heap is healthy. This ensures the baseline reflects
+		// "normal operating goroutine count" (which includes all library
+		// goroutines from quic-go, http2, miekg, etc. at typical load) and
+		// not a burst or pressure event.
+		//
+		// First sample: store directly (no prior data to average with).
+		// Subsequent samples: apply EMA with α=0.02.
+		//
+		// Stored as int64 × 100 to keep fixed-point precision in an atomic.
+		if memP < baselineFreezeP {
+			prev := t.goroutineBaselineX100.Load()
+			gorX100 := int64(goroutines) * 100
+			if prev == 0 {
+				// First sample — set directly so the baseline is immediately useful.
+				t.goroutineBaselineX100.Store(gorX100)
+			} else {
+				// EMA: new = prev×(1−α) + current×α
+				newVal := int64(float64(prev)*(1-emaAlpha) + float64(gorX100)*emaAlpha)
+				if newVal < 500 { // floor: 5.00 goroutines × 100
+					newVal = 500
+				}
+				t.goroutineBaselineX100.Store(newVal)
+			}
+		}
+		// When memP >= baselineFreezeP: baseline stays frozen at its last
+		// healthy value so the goroutine spike signal remains calibrated.
+
+		// ── 3. Full pressure score ────────────────────────────────────────────
+		score := t.computePressure(goroutines, memP)
 		t.pressureScore.Store(int32(score))
 
-		// ── 4. AIMD limit adjustment ──────────────────────────────────────
+		// ── 4. AIMD limit adjustment ──────────────────────────────────────────
 		prevQ  := t.queryLimit.Load()
 		prevUp := t.upstreamLimit.Load()
 		var newQ, newUp int32
 
 		switch {
 		case score >= criticalMark:
-			// Router is under serious pressure — halve both limits immediately.
-			newQ  = max(prevQ/2,                             minQ)
-			newUp = max(prevUp/2,                            minUp)
+			newQ  = max(prevQ/2,                              minQ)
+			newUp = max(prevUp/2,                             minUp)
 
 		case score >= highWater:
-			// Sustained elevated pressure — reduce by 20 % (multiplicative decrease).
 			newQ  = max(int32(float32(prevQ) *0.80), minQ)
 			newUp = max(int32(float32(prevUp)*0.80), minUp)
 
 		case score <= lowWater:
-			// Resources are healthy — grow by 1 (additive increase).
-			// Cap at 1.5× the initial value to stay conservative during recovery.
 			newQ  = min(prevQ+1,  t.initQueryLimit+t.initQueryLimit/2)
 			newUp = min(prevUp+1, t.initUpstreamLimit+t.initUpstreamLimit/2)
 
 		default:
-			// Score is between the watermarks — hold steady.
 			newQ, newUp = prevQ, prevUp
 		}
 
 		t.queryLimit.Store(newQ)
 		t.upstreamLimit.Store(newUp)
 
-		// ── 5. Rate-limited pressure log ──────────────────────────────────
-		//
-		// Only emitted when pressure is elevated and enough time has passed
-		// since the last line. Keeps logs quiet during normal operation while
-		// giving clear visibility during incidents.
+		// ── 5. Rate-limited pressure log ──────────────────────────────────────
 		if score >= highWater && time.Since(lastLog) >= logCooldown {
+			baselineReal := float64(t.goroutineBaselineX100.Load()) / 100.0
 			log.Printf(
-				"[THROTTLE] pressure=%d/100 goroutines=%d heap=%s nextGC=%s | "+
+				"[THROTTLE] pressure=%d/100 goroutines=%d (baseline=%.1f) heap=%s nextGC=%s | "+
 					"query: limit=%d active=%d dropped=%d | "+
 					"upstream: limit=%d active=%d dropped=%d",
-				score, goroutines, fmtBytes(ms.HeapInuse), fmtBytes(ms.NextGC),
+				score, goroutines, baselineReal, fmtBytes(ms.HeapInuse), fmtBytes(ms.NextGC),
 				newQ,  t.activeQueries.Load(),  t.droppedQueries.Load(),
 				newUp, t.activeUpstream.Load(), t.droppedUpstream.Load(),
 			)
@@ -303,51 +316,73 @@ func (t *throttler) monitorLoop() {
 	}
 }
 
-// computePressure blends three resource signals into a single 0–100 integer.
-// All three components are clamped to [0, 1] before weighting so no single
-// signal can dominate beyond its assigned weight.
-func (t *throttler) computePressure(goroutines int32, heapInuse, nextGC uint64) int {
-
-	// ── Heap pressure (weight 0.50) ───────────────────────────────────────
-	//
-	// Primary signal. Two sub-cases:
-	//   a) memory_limit_mb is set  → pressure against 80% of the hard ceiling.
-	//      We leave a 20% GC runway before we hit the wall, so we start
-	//      throttling while the GC can still keep up rather than after.
-	//   b) no hard limit           → HeapInuse / NextGC.
-	//      When heap approaches the GC trigger target, allocations slow down;
-	//      this catches the same moment from the GC scheduler's perspective.
-	var memP float32
+// computeMemPressure returns the heap pressure as a 0–1 float32.
+// Extracted from computePressure so monitorLoop can use it for the EMA freeze
+// decision before the full blended score is available.
+//
+// Two cases:
+//   a) memory_limit_mb configured → pressure against 80% of the hard ceiling.
+//      We start throttling with a 20% GC runway still available.
+//   b) no hard limit → HeapInuse / NextGC.
+//      Pressure rises as the heap approaches the GC trigger target.
+func (t *throttler) computeMemPressure(heapInuse, nextGC uint64) float64 {
 	if cfg.Server.MemoryLimitMB > 0 {
-		limit := float32(cfg.Server.MemoryLimitMB) * 1024 * 1024 * 0.80
+		limit := float64(cfg.Server.MemoryLimitMB) * 1024 * 1024 * 0.80
 		if limit > 0 {
-			memP = float32(heapInuse) / limit
+			p := float64(heapInuse) / limit
+			if p > 1.0 {
+				return 1.0
+			}
+			return p
 		}
-	} else if nextGC > 0 {
-		memP = float32(heapInuse) / float32(nextGC)
 	}
-	if memP > 1.0 {
-		memP = 1.0
+	if nextGC > 0 {
+		p := float64(heapInuse) / float64(nextGC)
+		if p > 1.0 {
+			return 1.0
+		}
+		return p
 	}
+	return 0
+}
 
-	// ── Goroutine pressure (weight 0.30) ──────────────────────────────────
+// computePressure blends three resource signals into a single 0–100 integer.
+//
+//   50% heap  — direct memory ceiling signal (see computeMemPressure)
+//   30% goroutine spike — (current − EMA baseline) / (baseline × 8)
+//   20% upstream fill  — activeUpstream / upstreamLimit
+//
+// All components are clamped to [0, 1] before weighting. memP is passed in
+// from monitorLoop to avoid calling computeMemPressure twice per tick.
+func (t *throttler) computePressure(goroutines int32, memP float64) int {
+
+	// ── Goroutine spike (weight 0.30) ─────────────────────────────────────
 	//
-	// Scales from 0 at the learned baseline to 1.0 at baseline×8.
-	// Example: baseline of 30 → full goroutine pressure at 240 goroutines.
-	// Each blocked goroutine holds a 2–8 KB stack; a spike to 8× baseline
-	// on a 32 MB router is genuinely critical.
+	// Baseline is the EMA of goroutine count during healthy periods (see
+	// monitorLoop). Because the EMA is updated only under low heap pressure,
+	// it naturally includes the steady-state goroutines spawned by quic-go,
+	// http2, and miekg at normal load — no manual baseline tuning needed.
 	//
-	// Before the baseline is learned (first 30 s) we use a conservative
-	// fallback: 0 below 50 goroutines, full pressure at 500.
-	var gorP float32
-	baseline := t.goroutineBaseline.Load()
-	if t.baselineLearned.Load() && baseline > 0 {
-		if goroutines > baseline {
-			gorP = float32(goroutines-baseline) / float32(baseline*8)
+	// Scale: 0 at baseline, 1.0 at baseline × 9 (i.e. 8× above baseline).
+	// Example: EMA baseline of 80 goroutines → full goroutine pressure at 720.
+	// That's a genuine crisis on any router. Moderate load that adds 20–30
+	// goroutines above baseline scores well below 1.0 and doesn't trigger
+	// unnecessary throttling.
+	//
+	// Before the first EMA sample (goroutineBaselineX100 == 0) we use a
+	// conservative static fallback to avoid dividing by zero.
+	var gorP float64
+	baseX100 := t.goroutineBaselineX100.Load()
+	if baseX100 > 0 {
+		baseline := float64(baseX100) / 100.0
+		if float64(goroutines) > baseline {
+			gorP = (float64(goroutines) - baseline) / (baseline * 8)
 		}
 	} else {
+		// Static fallback during first tick before any EMA sample exists.
+		// 0 below 50 goroutines, full pressure at 500.
 		if goroutines > 50 {
-			gorP = float32(goroutines-50) / 450.0
+			gorP = float64(goroutines-50) / 450.0
 		}
 	}
 	if gorP > 1.0 {
@@ -355,14 +390,9 @@ func (t *throttler) computePressure(goroutines int32, heapInuse, nextGC uint64) 
 	}
 
 	// ── Upstream fill ratio (weight 0.20) ─────────────────────────────────
-	//
-	// Leading indicator: upstream exchanges saturating their limit predicts
-	// an imminent goroutine and heap spike before it shows in the other two
-	// signals. Weighting it at 20% gives early warning without over-reacting
-	// to momentary bursts.
-	var upP float32
+	var upP float64
 	if ul := t.upstreamLimit.Load(); ul > 0 {
-		upP = float32(t.activeUpstream.Load()) / float32(ul)
+		upP = float64(t.activeUpstream.Load()) / float64(ul)
 	}
 	if upP > 1.0 {
 		upP = 1.0
