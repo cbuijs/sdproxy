@@ -188,8 +188,14 @@ func InitThrottle() {
 		workers = 10
 	}
 
+	// queryLimit: 4× workers gives comfortable headroom for burst traffic.
+	// upstreamLimit: 8× workers instead of 2× — DoH over a fast fiber
+	// connection benefits from more concurrent in-flight exchanges because
+	// each one sits idle waiting for an RTT. The AIMD back-off will reduce
+	// this automatically if memory pressure rises; the higher starting point
+	// just raises the ceiling for the happy path.
 	thr.initQueryLimit    = workers * 4
-	thr.initUpstreamLimit = workers * 2
+	thr.initUpstreamLimit = workers * 8
 	thr.startTime         = time.Now()
 
 	thr.queryLimit.Store(thr.initQueryLimit)
