@@ -1,12 +1,14 @@
 /*
 File: main.go
-Version: 1.25.0
+Version: 1.25.1
 Last Updated: 2026-03-03 23:45 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.26.1 - [FEAT] Pre-pack policy RCODE response templates for zero-alloc
+           policy fast-paths.
   1.25.0 - [FEAT] domain_policy config section: maps domain suffixes (and all
            their sub-domains) to an immediate RCODE. Parsed into domainPolicy
            map[string]int at startup. Hot-path gated via hasDomainPolicy bool.
@@ -469,6 +471,9 @@ outer:
 		log.Println("[INIT] Obsolete qtype blocking: disabled (block_obsolete_qtypes: false)")
 	}
 	hasRtypePolicy = len(rtypePolicy) > 0
+
+	// Pre-pack policy RCODE response templates for zero-alloc policy fast-paths.
+	buildPolicyRespCache()
 
 	// 7. Route index table
 	routeIdxByName = make(map[string]uint8, len(cfg.Upstreams)+4)

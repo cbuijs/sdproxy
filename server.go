@@ -1,37 +1,29 @@
 /*
 File: server.go
-Version: 1.17.0
-Last Updated: 2026-03-04 14:00 CET
+Version: 1.18.0
+Last Updated: 2026-03-05 14:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
              targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.18.0 - [PERF] UDP handling extracted to platform-specific files.
+           On Linux (server_udp_linux.go): each worker opens its own socket on the
+           same address via SO_REUSEPORT. The kernel distributes incoming UDP
+           packets across sockets at the NIC level — no shared channel, no mutex,
+           no goroutine wake-ups. Workers call ProcessDNS directly.
+           On other platforms (server_udp_stub.go): original channel-based pool
+           is retained unchanged.
+           StartServers now calls startUDPServers(addrs, workers) which is defined
+           in the platform-specific file, keeping server.go platform-agnostic.
   1.17.0 - [PERF] dohResponseWriter and doqResponseWriter now store localIP as
-           net.IP instead of string. Previously LocalAddr() called net.ParseIP on
-           every invocation. localIP is set once at connection setup time (per HTTP
-           request / per QUIC connection) so the parse cost moves there — one call
-           per connection instead of one call per DDR query on that connection.
-  1.16.0 - [FIX] dohResponseWriter and doqResponseWriter now implement a working
-           LocalAddr() instead of returning nil. This enables process.go's ddrAddrs()
-           to fall back to the query's interface address for DDR spoofing when no
-           explicit IPs are configured in the DDR config section.
-           dohResponseWriter gains a localIP string field populated from the HTTP
-           request context key http.LocalAddrContextKey — this is set by net/http
-           for every incoming connection and gives the listener address the TLS/HTTP
-           handshake arrived on. doqResponseWriter gains the same field, populated
-           from conn.LocalAddr() in handleDoQConnection before the stream loop.
-  1.15.0 - [PERF] UDP worker pool is now conditional on listen_udp being non-empty.
-           When no UDP listeners are configured the goroutine pool and its buffered
-           channel are never allocated, saving cfg.Server.UDPWorkers goroutines and
-           a (UDPWorkers*10)-deep channel. handleUDP is safe with a nil udpQueue
-           because the select default branch fires immediately — queries are dropped
-           rather than causing a nil-channel block or panic.
+           net.IP instead of string.
+  1.16.0 - [FIX] dohResponseWriter and doqResponseWriter now implement LocalAddr().
+  1.15.0 - [PERF] UDP worker pool conditional on listen_udp being non-empty.
   1.14.0 - [PERF] DoH POST handler: eliminated unnecessary alloc+copy.
   1.13.0 - [FIX]  DoH listener now correctly supports HTTP/1.1 alongside HTTP/2.
-           Cloned TLS config with NextProtos restricted to ["h2", "http/1.1"].
-  1.12.0 - [FIX]  Separated handleTCP and handleDoT handler functions.
-           [FIX]  Added clean graceful shutdown via shutdownCh channel.
+  1.12.0 - [FIX]  Separated handleTCP and handleDoT.
+           [FIX]  Graceful shutdown via shutdownCh channel.
            [PERF] Tiered buffer pools: smallBufPool (4KB) and largeBufPool (64KB).
   1.11.0 - Added full HTTP GET and POST support for DoH/DoH3 clients.
 */
@@ -56,18 +48,16 @@ import (
 	"github.com/quic-go/quic-go/http3"
 )
 
-type udpJob struct {
-	w dns.ResponseWriter
-	r *dns.Msg
-}
-
 var (
-	udpQueue     chan udpJob
-	shutdownCh   = make(chan struct{}) // Closed by Shutdown() to signal all workers
+	// shutdownCh is closed by Shutdown() to signal goroutines to exit cleanly.
+	// On Linux the SO_REUSEPORT UDP workers don't monitor this channel (they run
+	// inside dns.Server.ActivateAndServe), but it is still used by the non-Linux
+	// channel-based UDP workers in server_udp_stub.go.
+	shutdownCh   = make(chan struct{})
 	shutdownOnce sync.Once
 )
 
-// Shutdown signals all UDP worker goroutines to exit cleanly.
+// Shutdown signals all channel-based UDP worker goroutines to exit cleanly.
 // Safe to call multiple times (sync.Once). Call from main() on SIGTERM.
 func Shutdown() {
 	shutdownOnce.Do(func() {
@@ -82,45 +72,10 @@ func StartServers(tlsConf *tls.Config) {
 		tcpIdleTimeout  = 10 * time.Second
 	)
 
-	// 0. Bounded UDP worker pool — only allocated when UDP listeners are configured.
-	// Skipped entirely when listen_udp is empty, saving UDPWorkers goroutines and a
-	// (UDPWorkers*10)-slot channel. handleUDP's select default branch makes a nil
-	// udpQueue safe: incoming jobs are dropped rather than blocking or panicking.
-	if len(cfg.Server.ListenUDP) > 0 {
-		udpQueue = make(chan udpJob, cfg.Server.UDPWorkers*10)
-		for i := 0; i < cfg.Server.UDPWorkers; i++ {
-			go func() {
-				for {
-					select {
-					case job, ok := <-udpQueue:
-						if !ok {
-							return
-						}
-						var ip string
-						if addr, ok := job.w.RemoteAddr().(*net.UDPAddr); ok {
-							ip = addr.IP.String()
-						}
-						ProcessDNS(job.w, job.r, ip, "UDP")
-					case <-shutdownCh:
-						return
-					}
-				}
-			}()
-		}
-		log.Printf("[LISTEN] UDP Worker Pool: %d routines", cfg.Server.UDPWorkers)
-	}
-
-	// 1. DNS over UDP
-	for _, addr := range cfg.Server.ListenUDP {
-		addr := addr
-		go func() {
-			server := &dns.Server{Addr: addr, Net: "udp", Handler: dns.HandlerFunc(handleUDP)}
-			log.Printf("[LISTEN] UDP on %s", addr)
-			if err := server.ListenAndServe(); err != nil {
-				log.Fatalf("[FATAL] UDP failed on %s: %v", addr, err)
-			}
-		}()
-	}
+	// 1. DNS over UDP — platform-specific implementation.
+	//    Linux:      SO_REUSEPORT per-worker (server_udp_linux.go)
+	//    Other:      channel-based pool (server_udp_stub.go)
+	startUDPServers(cfg.Server.ListenUDP, cfg.Server.UDPWorkers)
 
 	// 2. DNS over TCP
 	for _, addr := range cfg.Server.ListenTCP {
@@ -168,8 +123,8 @@ func StartServers(tlsConf *tls.Config) {
 		// Clone the shared TLS config and restrict ALPN to HTTP-only tokens.
 		// The shared tlsConf carries "doq" and "dot" which cause strict HTTP/1.1
 		// clients to reject the handshake — the HTTP server needs its own clone.
-		dohTLS            := tlsConf.Clone()
-		dohTLS.NextProtos  = []string{"h2", "http/1.1"}
+		dohTLS           := tlsConf.Clone()
+		dohTLS.NextProtos = []string{"h2", "http/1.1"}
 
 		h2Server := &http.Server{
 			Addr:           addr,
@@ -231,16 +186,6 @@ func StartServers(tlsConf *tls.Config) {
 	}
 }
 
-func handleUDP(w dns.ResponseWriter, r *dns.Msg) {
-	// udpQueue is nil when no listen_udp addresses are configured.
-	// The default branch drops the query safely without blocking.
-	select {
-	case udpQueue <- udpJob{w: w, r: r}:
-	case <-shutdownCh:
-	default:
-	}
-}
-
 func handleTCP(w dns.ResponseWriter, r *dns.Msg) {
 	var ip string
 	if addr, ok := w.RemoteAddr().(*net.TCPAddr); ok {
@@ -265,10 +210,10 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
-		// largeBufPool: incoming body size is unknown (could be a large DNS request).
-		// dns.Msg.Unpack creates independent copies of all fields — it never aliases
-		// its input buffer. The pool buffer lives until function return (defer), so
-		// unpacking directly from it is safe. No need to alloc+copy out of the pool.
+		// largeBufPool: incoming body size is unknown. dns.Msg.Unpack creates
+		// independent copies of all fields — it never aliases its input buffer.
+		// The pool buffer lives until function return (defer), so unpacking
+		// directly from it is safe. No need to alloc+copy out of the pool.
 		bufPtr := largeBufPool.Get().(*[]byte)
 		buf    := *bufPtr
 		defer largeBufPool.Put(bufPtr)
@@ -316,9 +261,8 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	host, _, _ := net.SplitHostPort(r.RemoteAddr)
 
 	// Extract and immediately parse the local listener IP from the HTTP request
-	// context. net/http sets http.LocalAddrContextKey for every incoming connection.
-	// Parsing here (once per request) instead of inside LocalAddr() (once per DDR
-	// query on that connection) moves the net.ParseIP cost to where it fires once.
+	// context. Parsing here (once per request) instead of inside LocalAddr()
+	// (once per DDR query) moves the net.ParseIP cost where it fires once.
 	var localIP net.IP
 	if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
 		if localHost, _, err := net.SplitHostPort(la.String()); err == nil {
@@ -337,8 +281,8 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 func handleDoQConnection(conn *quic.Conn) {
 	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-	// Parse the local listener IP once per connection. Stored as net.IP in
-	// doqResponseWriter so LocalAddr() can return it directly without parsing.
+	// Parse the local listener IP once per connection, stored as net.IP in
+	// doqResponseWriter so LocalAddr() returns it without re-parsing.
 	var localIP net.IP
 	if localHost, _, err := net.SplitHostPort(conn.LocalAddr().String()); err == nil {
 		localIP = net.ParseIP(localHost)
@@ -378,12 +322,11 @@ func handleDoQConnection(conn *quic.Conn) {
 
 // dohResponseWriter wraps http.ResponseWriter as a dns.ResponseWriter for DoH/DoH3.
 // localIP holds the listener interface address parsed once at request setup time
-// and exposed via LocalAddr() so process.go's ddrAddrs() can use it for the
-// DDR interface-IP fallback when no explicit IPs are configured in ddr.ipv4/ipv6.
+// and exposed via LocalAddr() for ddrAddrs() in process.go.
 type dohResponseWriter struct {
 	w        http.ResponseWriter
 	remoteIP string
-	localIP  net.IP // pre-parsed in handleDoH, nil when listener addr is unavailable
+	localIP  net.IP
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -403,12 +346,12 @@ func (dw *dohResponseWriter) LocalAddr() net.Addr {
 	}
 	return &net.IPAddr{IP: dw.localIP}
 }
-func (dw *dohResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
-func (dw *dohResponseWriter) Write(b []byte) (int, error)  { return dw.w.Write(b) }
-func (dw *dohResponseWriter) Close() error                 { return nil }
-func (dw *dohResponseWriter) TsigStatus() error            { return nil }
-func (dw *dohResponseWriter) TsigTimersOnly(bool)          {}
-func (dw *dohResponseWriter) Hijack()                      {}
+func (dw *dohResponseWriter) RemoteAddr() net.Addr        { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
+func (dw *dohResponseWriter) Write(b []byte) (int, error) { return dw.w.Write(b) }
+func (dw *dohResponseWriter) Close() error                { return nil }
+func (dw *dohResponseWriter) TsigStatus() error           { return nil }
+func (dw *dohResponseWriter) TsigTimersOnly(bool)         {}
+func (dw *dohResponseWriter) Hijack()                     {}
 
 // doqResponseWriter wraps a QUIC stream as a dns.ResponseWriter for DoQ.
 // localIP holds the listener interface address parsed once per QUIC connection in
@@ -417,7 +360,7 @@ func (dw *dohResponseWriter) Hijack()                      {}
 type doqResponseWriter struct {
 	stream   *quic.Stream
 	remoteIP string
-	localIP  net.IP // pre-parsed in handleDoQConnection, nil when unavailable
+	localIP  net.IP
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -441,10 +384,10 @@ func (dw *doqResponseWriter) LocalAddr() net.Addr {
 	}
 	return &net.IPAddr{IP: dw.localIP}
 }
-func (dw *doqResponseWriter) RemoteAddr() net.Addr         { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
-func (dw *doqResponseWriter) Write(b []byte) (int, error)  { return dw.stream.Write(b) }
-func (dw *doqResponseWriter) Close() error                 { return dw.stream.Close() }
-func (dw *doqResponseWriter) TsigStatus() error            { return nil }
-func (dw *doqResponseWriter) TsigTimersOnly(bool)          {}
-func (dw *doqResponseWriter) Hijack()                      {}
+func (dw *doqResponseWriter) RemoteAddr() net.Addr        { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
+func (dw *doqResponseWriter) Write(b []byte) (int, error) { return dw.stream.Write(b) }
+func (dw *doqResponseWriter) Close() error                { return dw.stream.Close() }
+func (dw *doqResponseWriter) TsigStatus() error           { return nil }
+func (dw *doqResponseWriter) TsigTimersOnly(bool)         {}
+func (dw *doqResponseWriter) Hijack()                     {}
 

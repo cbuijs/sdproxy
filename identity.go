@@ -1,7 +1,7 @@
 /*
 File: identity.go
-Version: 1.23.0
-Last Updated: 2026-03-04 16:00 CET
+Version: 1.24.0
+Last Updated: 2026-03-05 14:00 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
@@ -25,26 +25,18 @@ Description: Parses /etc/hosts and dnsmasq lease files to extract short hostname
                read(), and parse() entirely.
 
 Changes:
-  1.23.0 - [PERF] storeEntry: dropped strings.ToLower on ARPA key — dns.ReverseAddr
-           already returns lowercase for both IPv4 (decimal digits) and IPv6 (hex
-           nibbles). Replaced strings.TrimSuffix(arpa, ".") with arpa[:len(arpa)-1]
-           since dns.ReverseAddr always appends "." unconditionally. Both calls were
-           doing redundant work on every parsed entry.
-           [PERF] storeEntry now computes shortName before the sink guard and returns
-           it. parseLeasesBytes was repeating the identical strings.IndexByte dot-search
-           to build the MAC->name mapping. Using the returned value eliminates the
-           duplicate. storeEntry returns "" only when net.ParseIP fails (invalid IP),
-           in which case parseLeasesBytes skips the MAC entry too — correct behaviour
-           since a lease with an unparseable IP is malformed.
+  1.24.0 - [PERF] LookupIPsByNameLower: new variant of LookupIPsByName that skips
+           the strings.ToLower call. nameToIPs keys are always stored lowercase
+           (storeEntry uses strings.ToLower on insert). callers that have already
+           normalised via lowerTrimDot — specifically resolveLocalIdentity in
+           process.go — can call this directly and save a full byte scan per
+           A/AAAA query that reaches the local-identity check.
+  1.23.0 - [PERF] storeEntry: dropped redundant strings.ToLower on ARPA key and
+           replaced strings.TrimSuffix with direct slice.
+           [PERF] storeEntry returns shortName, eliminating duplicate dot-search
+           in parseLeasesBytes.
   1.22.0 - [PERF] Replaced sync.RWMutex + 4 global maps with atomic.Pointer to
-           an immutable identitySnapshot struct. Eliminates identMu entirely —
-           readers pay zero lock overhead. On the hot path ProcessDNS called
-           LookupNameByMACOrIP on every query under RLock; now it's a single
-           atomic pointer load + two map reads. On a 10-worker UDP pool this
-           removes 10 concurrent mutex acquisitions per query burst.
-           The old LookupNameByMACOrIP combined two lookups under one RLock
-           (v1.21.0). That optimisation is now moot — atomic loads are cheaper
-           than even a single uncontended RLock.
+           an immutable identitySnapshot struct.
   1.21.0 - [PERF] LookupNameByMACOrIP: combined MAC+IP under single RLock.
   1.20.0 - [PERF] LookupIPsBySuffix: single RLock for entire suffix walk.
   1.19.0 - [FEAT] Poll interval configurable via identity.poll_interval.
@@ -162,9 +154,20 @@ func LookupNameByMACOrIP(mac, ip string) string {
 	return snap.ipToName[ip]
 }
 
-// LookupIPsByName returns all IPs mapped to a full hostname (case-insensitive). O(1).
+// LookupIPsByName returns all IPs mapped to a full hostname. O(1).
+// Applies strings.ToLower to name before the map lookup. When the caller has
+// already normalised via lowerTrimDot, use LookupIPsByNameLower to skip the
+// redundant byte scan.
 func LookupIPsByName(name string) []net.IP {
 	return identSnap.Load().nameToIPs[strings.ToLower(name)]
+}
+
+// LookupIPsByNameLower is identical to LookupIPsByName but skips the
+// strings.ToLower call. Only call this when name is already lowercase — e.g.
+// after lowerTrimDot in ProcessDNS. Saves a full byte scan on every A/AAAA
+// query that reaches the local-identity check.
+func LookupIPsByNameLower(name string) []net.IP {
+	return identSnap.Load().nameToIPs[name]
 }
 
 // LookupIPsBySuffix walks the query name label by label and returns the IPs of
@@ -396,8 +399,8 @@ func isSinkIP(ip net.IP) bool {
 }
 
 // storeEntry populates all four maps in pf for a single IP+hostname pair and
-// returns the shortName (first label of rawName). Returns "" when ip is unparseable
-// — callers can use this as a validity signal to skip further processing.
+// returns the shortName (first label of rawName). Returns "" when ip is
+// unparseable — callers use this as a validity signal to skip further work.
 //
 // shortName is computed before the sink guard so it is always available to the
 // caller regardless of whether the IP is loopback/unspecified. Sink IPs still
@@ -430,9 +433,8 @@ func storeEntry(ip, rawName string, pf *parsedFile) string {
 		pf.nameToIPs[fullKey] = append(pf.nameToIPs[fullKey], parsedIP)
 
 		if arpa, err := dns.ReverseAddr(ip); err == nil {
-			// dns.ReverseAddr: always lowercase (IPv4 = decimal, IPv6 = hex nibbles
-			// via fmt.Sprintf %x), always "." terminated. Slice is cheaper than
-			// strings.TrimSuffix and strings.ToLower is a guaranteed no-op here.
+			// dns.ReverseAddr: always lowercase, always "." terminated.
+			// Slicing off the trailing dot is faster than strings.TrimSuffix.
 			key := arpa[:len(arpa)-1]
 			pf.arpaToNames[key] = append(pf.arpaToNames[key], rawName)
 		}
