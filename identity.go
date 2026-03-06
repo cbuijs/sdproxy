@@ -1,7 +1,7 @@
 /*
 File: identity.go
-Version: 1.24.0
-Last Updated: 2026-03-05 14:00 CET
+Version: 1.25.1
+Last Updated: 2026-03-06 19:25 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
@@ -25,6 +25,11 @@ Description: Parses /etc/hosts and dnsmasq lease files to extract short hostname
                read(), and parse() entirely.
 
 Changes:
+  1.25.1 - [LOG] filterNullIPs now returns and logs the specific list of
+           cleaned hostnames.
+  1.25.0 - [FEAT] filterNullIPs added: when a hostname has multiple IPs including
+           a NULL-IP (0.0.0.0 or ::), the NULL-IP is removed unless it's the
+           only IP. Resolves blocklist vs local-override conflicts. Logs cleanup.
   1.24.0 - [PERF] LookupIPsByNameLower: new variant of LookupIPsByName that skips
            the strings.ToLower call. nameToIPs keys are always stored lowercase
            (storeEntry uses strings.ToLower on insert). callers that have already
@@ -230,6 +235,13 @@ func pollIdentity() {
 
 	if !anyChanged {
 		return
+	}
+
+	// Filter out NULL IPs (0.0.0.0 or ::) from hostnames that also have other
+	// valid IPs mapped to them. This intelligently overrides generic blocklists
+	// with user-defined local redirects.
+	if cleanedNames := filterNullIPs(freshName); len(cleanedNames) > 0 {
+		log.Printf("[IDENTITY] Cleaned %d hostnames: removed NULL-IPs (0.0.0.0 or ::) because valid alternate IPs were present: %s", len(cleanedNames), strings.Join(cleanedNames, ", "))
 	}
 
 	// Atomic swap — readers see the old snapshot until this completes,
@@ -456,5 +468,53 @@ func splitLine(data []byte) (line, rest []byte) {
 		line = line[:len(line)-1]
 	}
 	return line, data[idx+1:]
+}
+
+// filterNullIPs scans the provided name-to-IPs map and removes unspecified
+// (NULL) IPs — 0.0.0.0 or :: — from any hostname that also has at least one
+// valid (specified) IP. If a hostname ONLY maps to NULL IPs, they are kept.
+//
+// This perfectly resolves conflicts when combining generic blocklists (which map
+// ads/trackers to 0.0.0.0) with local user overrides (which map the same domain
+// to a real IP for a local proxy or sinkhole). By stripping the generic NULL IP,
+// the DNS response correctly steers the client exclusively to the local service.
+//
+// Returns a slice of the distinct hostnames that had NULL-IPs pruned.
+func filterNullIPs(nameToIPs map[string][]net.IP) []string {
+	var cleanedNames []string
+	for name, ips := range nameToIPs {
+		// Optimization: If there's 1 or 0 IPs, there's nothing to filter.
+		if len(ips) <= 1 {
+			continue
+		}
+
+		hasNull := false
+		hasValid := false
+
+		// Pass 1: Determine if this hostname has a mix of NULL and valid IPs.
+		for _, ip := range ips {
+			if ip.IsUnspecified() { // Checks for 0.0.0.0 or ::
+				hasNull = true
+			} else {
+				hasValid = true
+			}
+		}
+
+		// Only perform the filtering allocation if we actually have a mix.
+		// If a hostname only has NULL IPs, hasValid will be false, and we
+		// correctly skip filtering, keeping the NULL blocklist intact.
+		if hasNull && hasValid {
+			// Pass 2: Allocate a new slice and transfer only valid IPs.
+			filtered := make([]net.IP, 0, len(ips))
+			for _, ip := range ips {
+				if !ip.IsUnspecified() {
+					filtered = append(filtered, ip)
+				}
+			}
+			nameToIPs[name] = filtered
+			cleanedNames = append(cleanedNames, name)
+		}
+	}
+	return cleanedNames
 }
 
