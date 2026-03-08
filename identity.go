@@ -1,7 +1,7 @@
 /*
 File: identity.go
-Version: 1.25.1
-Last Updated: 2026-03-06 19:25 CET
+Version: 1.26.0
+Last Updated: 2026-03-08 14:00 CET
 Description: Parses /etc/hosts and dnsmasq lease files to extract short hostnames
              for {client-name} substitution and local A/AAAA/PTR resolution.
 
@@ -25,6 +25,19 @@ Description: Parses /etc/hosts and dnsmasq lease files to extract short hostname
                read(), and parse() entirely.
 
 Changes:
+  1.26.0 - [FIX] parseHostsBytes: now processes ALL hostname tokens per line.
+           Previously only the first alias was stored; subsequent aliases (e.g.
+           "mydevice.local" in "1.2.3.4 mydevice mydevice.local") were silently
+           dropped — a regression for any hosts file with multi-name entries.
+           [FIX] parseHostsBytes: inline # comments are now stripped before name
+           parsing. Previously "1.2.3.4 router # main router" stored "#" as a
+           hostname, polluting nameToIPs and arpaToNames with junk entries.
+           [FIX] filterNullIPs: now also cleans arpaToNames for each null IP that
+           is removed. Previously, filtering nameToIPs left arpaToNames intact —
+           PTR queries for 0.0.0.0 or :: still resolved to the hostname even
+           after the forward lookup had been corrected, creating an inconsistency
+           that could confuse some DNS clients. Signature updated to accept
+           arpaToNames; pollIdentity call-site updated accordingly.
   1.25.1 - [LOG] filterNullIPs now returns and logs the specific list of
            cleaned hostnames.
   1.25.0 - [FEAT] filterNullIPs added: when a hostname has multiple IPs including
@@ -32,7 +45,7 @@ Changes:
            only IP. Resolves blocklist vs local-override conflicts. Logs cleanup.
   1.24.0 - [PERF] LookupIPsByNameLower: new variant of LookupIPsByName that skips
            the strings.ToLower call. nameToIPs keys are always stored lowercase
-           (storeEntry uses strings.ToLower on insert). callers that have already
+           (storeEntry uses strings.ToLower on insert). Callers that have already
            normalised via lowerTrimDot — specifically resolveLocalIdentity in
            process.go — can call this directly and save a full byte scan per
            A/AAAA query that reaches the local-identity check.
@@ -179,7 +192,7 @@ func LookupIPsByNameLower(name string) []net.IP {
 // the first matching parent domain found in nameToIPs.
 // Single atomic load for the entire walk — pure CPU, no I/O, no blocking.
 func LookupIPsBySuffix(qname string) []net.IP {
-	snap := identSnap.Load()
+	snap   := identSnap.Load()
 	search := qname
 	for {
 		idx := strings.IndexByte(search, '.')
@@ -238,10 +251,12 @@ func pollIdentity() {
 	}
 
 	// Filter out NULL IPs (0.0.0.0 or ::) from hostnames that also have other
-	// valid IPs mapped to them. This intelligently overrides generic blocklists
-	// with user-defined local redirects.
-	if cleanedNames := filterNullIPs(freshName); len(cleanedNames) > 0 {
-		log.Printf("[IDENTITY] Cleaned %d hostnames: removed NULL-IPs (0.0.0.0 or ::) because valid alternate IPs were present: %s", len(cleanedNames), strings.Join(cleanedNames, ", "))
+	// valid IPs mapped to them — intelligently overrides generic blocklists with
+	// user-defined local redirects. Also cleans arpaToNames to keep reverse
+	// lookups consistent with the corrected forward map (bug fix v1.26.0).
+	if cleanedNames := filterNullIPs(freshName, freshARPA); len(cleanedNames) > 0 {
+		log.Printf("[IDENTITY] Cleaned %d hostnames: removed NULL-IPs (0.0.0.0 or ::) because valid alternate IPs were present: %s",
+			len(cleanedNames), strings.Join(cleanedNames, ", "))
 	}
 
 	// Atomic swap — readers see the old snapshot until this completes,
@@ -317,6 +332,19 @@ func mergePartial(
 	}
 }
 
+// parseHostsBytes parses a hosts-file byte slice into a parsedFile.
+//
+// BUG FIX (v1.26.0 — two fixes):
+//
+//  1. ALL hostname tokens per line are now processed, not just the first.
+//     Standard /etc/hosts allows multiple space-separated aliases on one line:
+//       192.168.1.100  mydevice  mydevice.local  mydevice.lan
+//     Previously only "mydevice" would be stored; all aliases were silently dropped.
+//
+//  2. Inline comments (everything from the first '#' to end-of-line) are now
+//     stripped before name parsing. Previously a line like:
+//       192.168.1.1  router  # main gateway
+//     would store "#" as a valid hostname and corrupt nameToIPs/arpaToNames.
 func parseHostsBytes(data []byte) *parsedFile {
 	pf := &parsedFile{
 		ipToName:    make(map[string]string),
@@ -335,25 +363,39 @@ func parseHostsBytes(data []byte) *parsedFile {
 			continue
 		}
 
+		// Strip inline comment — everything from the first '#' onwards is noise.
+		if ci := bytes.IndexByte(line, '#'); ci >= 0 {
+			line = bytes.TrimRight(line[:ci], " \t")
+		}
+		if len(line) == 0 {
+			continue
+		}
+
+		// First token is the IP address.
 		ipEnd := bytes.IndexAny(line, " \t")
 		if ipEnd < 0 {
-			continue
+			continue // IP with no hostname — nothing to store
 		}
-		ipBytes := line[:ipEnd]
-		line     = bytes.TrimLeft(line[ipEnd:], " \t")
+		ipStr := string(line[:ipEnd])
+		line = bytes.TrimLeft(line[ipEnd:], " \t")
 
-		nameEnd := bytes.IndexAny(line, " \t")
-		var nameBytes []byte
-		if nameEnd < 0 {
-			nameBytes = line
-		} else {
-			nameBytes = line[:nameEnd]
+		// All remaining tokens are hostnames/aliases — store every one of them.
+		// /etc/hosts allows multiple aliases per line (hosts(5) manpage).
+		for len(line) > 0 {
+			nameEnd := bytes.IndexAny(line, " \t")
+			var name []byte
+			if nameEnd < 0 {
+				name = line
+				line = nil
+			} else {
+				name = line[:nameEnd]
+				line = bytes.TrimLeft(line[nameEnd:], " \t")
+			}
+			if len(name) == 0 {
+				break
+			}
+			storeEntry(ipStr, string(name), pf)
 		}
-		if len(nameBytes) == 0 {
-			continue
-		}
-
-		storeEntry(string(ipBytes), string(nameBytes), pf)
 	}
 	return pf
 }
@@ -470,51 +512,82 @@ func splitLine(data []byte) (line, rest []byte) {
 	return line, data[idx+1:]
 }
 
-// filterNullIPs scans the provided name-to-IPs map and removes unspecified
-// (NULL) IPs — 0.0.0.0 or :: — from any hostname that also has at least one
-// valid (specified) IP. If a hostname ONLY maps to NULL IPs, they are kept.
+// filterNullIPs removes unspecified-address IPs (0.0.0.0 or ::) from nameToIPs
+// for any hostname that also has at least one valid (non-unspecified) IP, and
+// removes the corresponding reverse entries from arpaToNames to keep forward
+// and reverse lookups consistent.
 //
-// This perfectly resolves conflicts when combining generic blocklists (which map
-// ads/trackers to 0.0.0.0) with local user overrides (which map the same domain
-// to a real IP for a local proxy or sinkhole). By stripping the generic NULL IP,
-// the DNS response correctly steers the client exclusively to the local service.
+// BUG FIX (v1.26.0): previous versions only cleaned nameToIPs. After that fix
+// a PTR query for 0.0.0.0 / :: still resolved to the hostname because
+// arpaToNames was not cleaned. This caused a forward/reverse inconsistency that
+// could confuse DNS clients doing round-trip validation.
 //
-// Returns a slice of the distinct hostnames that had NULL-IPs pruned.
-func filterNullIPs(nameToIPs map[string][]net.IP) []string {
-	var cleanedNames []string
+// Use case: a blocklist maps ads to 0.0.0.0, and a user adds a hosts entry
+// mapping the same domain to a real local IP. filterNullIPs detects the mix,
+// removes the 0.0.0.0 from both forward and reverse maps, leaving only the
+// real IP visible to clients.
+//
+// Hostnames that ONLY map to NULL IPs are left untouched (the block is valid).
+//
+// Returns the distinct hostnames that had NULL-IPs pruned (for logging).
+func filterNullIPs(nameToIPs map[string][]net.IP, arpaToNames map[string][]string) []string {
+	var cleaned []string
+
 	for name, ips := range nameToIPs {
-		// Optimization: If there's 1 or 0 IPs, there's nothing to filter.
 		if len(ips) <= 1 {
-			continue
+			continue // nothing to filter: 0 or 1 IPs means no mixed case
 		}
 
-		hasNull := false
-		hasValid := false
-
-		// Pass 1: Determine if this hostname has a mix of NULL and valid IPs.
+		// Pass 1: determine whether this hostname has a mix of null and valid IPs.
+		hasNull, hasValid := false, false
 		for _, ip := range ips {
-			if ip.IsUnspecified() { // Checks for 0.0.0.0 or ::
+			if ip.IsUnspecified() {
 				hasNull = true
 			} else {
 				hasValid = true
 			}
 		}
+		if !hasNull || !hasValid {
+			continue // pure-null (blocklist) or pure-valid — leave untouched
+		}
 
-		// Only perform the filtering allocation if we actually have a mix.
-		// If a hostname only has NULL IPs, hasValid will be false, and we
-		// correctly skip filtering, keeping the NULL blocklist intact.
-		if hasNull && hasValid {
-			// Pass 2: Allocate a new slice and transfer only valid IPs.
-			filtered := make([]net.IP, 0, len(ips))
-			for _, ip := range ips {
-				if !ip.IsUnspecified() {
-					filtered = append(filtered, ip)
+		// Pass 2: build the filtered forward slice and collect ARPA keys to clean.
+		// Allocation only happens for hostnames that actually need filtering.
+		filtered  := make([]net.IP, 0, len(ips))
+		nullARPAs := make([]string, 0, 2) // 0.0.0.0 and :: at most
+		for _, ip := range ips {
+			if ip.IsUnspecified() {
+				// Derive the ARPA key for this null IP so we can clean arpaToNames.
+				if arpa, err := dns.ReverseAddr(ip.String()); err == nil {
+					nullARPAs = append(nullARPAs, arpa[:len(arpa)-1]) // strip trailing dot
+				}
+			} else {
+				filtered = append(filtered, ip)
+			}
+		}
+		nameToIPs[name] = filtered
+
+		// Clean arpaToNames: remove this hostname from every null-IP ARPA key.
+		// nameToIPs keys are always lowercase (storeEntry lowercases on insert),
+		// so name is already lowercase — compare case-insensitively against the
+		// raw names stored in arpaToNames (storeEntry stores rawName there).
+		for _, arpaKey := range nullARPAs {
+			names := arpaToNames[arpaKey]
+			kept  := names[:0] // reuse backing array — avoids an allocation
+			for _, n := range names {
+				if strings.ToLower(n) != name {
+					kept = append(kept, n)
 				}
 			}
-			nameToIPs[name] = filtered
-			cleanedNames = append(cleanedNames, name)
+			if len(kept) == 0 {
+				delete(arpaToNames, arpaKey)
+			} else {
+				arpaToNames[arpaKey] = kept
+			}
 		}
+
+		cleaned = append(cleaned, name)
 	}
-	return cleanedNames
+	return cleaned
 }
 

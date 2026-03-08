@@ -1,12 +1,22 @@
 /*
 File: server.go
-Version: 1.18.0
-Last Updated: 2026-03-05 14:00 CET
+Version: 1.19.0
+Last Updated: 2026-03-08 14:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
              targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.19.0 - [FIX] dohResponseWriter.WriteMsg: moved smallBufPool.Put to AFTER
+           w.Write(packed). Previously the buffer was returned to the pool before
+           the HTTP layer had finished reading the packed slice — which shares the
+           pool buffer's backing array for any message < 4 KB (i.e. virtually all
+           DNS responses). A concurrent goroutine could Get+overwrite the buffer
+           mid-write, producing garbled DoH/DoH3 responses. Identical root-cause
+           to the exchangeHTTP fix in upstream.go v1.23.0.
+           [FIX] doqResponseWriter.WriteMsg: same pool-before-write race fixed.
+           Previously smallBufPool.Put was called before stream.Write(packed),
+           risking corruption of the DoQ response frame under concurrency.
   1.18.0 - [PERF] UDP handling extracted to platform-specific files.
            On Linux (server_udp_linux.go): each worker opens its own socket on the
            same address via SO_REUSEPORT. The kernel distributes incoming UDP
@@ -329,17 +339,26 @@ type dohResponseWriter struct {
 	localIP  net.IP
 }
 
+// WriteMsg packs msg into a pooled buffer and writes it to the HTTP response.
+//
+// BUG FIX (v1.19.0): the pool buffer is returned AFTER w.Write(packed) completes.
+// msg.PackBuffer returns a slice that shares the backing array of the pool buffer
+// when the packed size fits (< 4 KB — true for virtually all DNS messages).
+// Returning the buffer to the pool before Write finishes allowed a concurrent
+// goroutine to Get+overwrite the data mid-write, producing garbled responses.
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 	bufPtr := smallBufPool.Get().(*[]byte)
 	packed, err := msg.PackBuffer((*bufPtr)[:0])
-	smallBufPool.Put(bufPtr)
 	if err != nil {
+		smallBufPool.Put(bufPtr) // safe: packed is nil on error, nothing references the buffer
 		return err
 	}
 	dw.w.Header().Set("Content-Type", "application/dns-message")
-	_, err = dw.w.Write(packed)
+	_, err = dw.w.Write(packed)  // Write BEFORE Put — buffer is still owned here
+	smallBufPool.Put(bufPtr)      // safe now: HTTP layer has consumed all of packed
 	return err
 }
+
 func (dw *dohResponseWriter) LocalAddr() net.Addr {
 	if dw.localIP == nil {
 		return nil
@@ -363,21 +382,32 @@ type doqResponseWriter struct {
 	localIP  net.IP
 }
 
+// WriteMsg packs msg into a pooled buffer and writes it to the QUIC stream with
+// the RFC 9250 two-byte length prefix.
+//
+// BUG FIX (v1.19.0): same pool-before-write race as dohResponseWriter.WriteMsg.
+// The buffer is now returned to the pool only after BOTH stream.Write calls
+// that reference packed have completed. The length header (lenBuf) is
+// stack-allocated and is always safe to write independently.
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	bufPtr := smallBufPool.Get().(*[]byte)
 	packed, err := msg.PackBuffer((*bufPtr)[:0])
-	smallBufPool.Put(bufPtr)
 	if err != nil {
+		smallBufPool.Put(bufPtr) // safe: packed is nil on error
 		return err
 	}
+	// lenBuf is stack-allocated — no dependency on the pool buffer.
 	var lenBuf [2]byte
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
-	if _, err := dw.stream.Write(lenBuf[:]); err != nil {
+	if _, err = dw.stream.Write(lenBuf[:]); err != nil {
+		smallBufPool.Put(bufPtr)
 		return err
 	}
-	_, err = dw.stream.Write(packed)
+	_, err = dw.stream.Write(packed) // packed references pool buffer — Write BEFORE Put
+	smallBufPool.Put(bufPtr)          // safe now: both writes referencing packed are done
 	return err
 }
+
 func (dw *doqResponseWriter) LocalAddr() net.Addr {
 	if dw.localIP == nil {
 		return nil

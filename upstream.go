@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.24.0
-Last Updated: 2026-03-05 19:00 CET
+Version: 1.25.0
+Last Updated: 2026-03-08 14:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries.
@@ -21,6 +21,17 @@ Description: Manages connections to external DNS upstream providers.
                resets the counter. No timestamps, no background goroutines.
 
 Changes:
+  1.25.0 - [FIX] exchangeDoQ: new connection now stored in pool ONLY after a
+           successful doqStreamExchange. Previously putDoQConn was called before
+           the exchange — on failure removeDoQConn raced with concurrent
+           putDoQConn calls from other goroutines, potentially evicting a valid
+           replacement connection they had just stored.
+           [FIX] doqConnEntry: added dialAddr string field. takeDoQConn now
+           returns the full *doqConnEntry so the reused-connection path returns
+           the actual dialled IP:port for logging instead of falling back to
+           u.RawURL (the hostname). putDoQConn signature updated to accept
+           dialAddr. removeDoQConn retained for completeness but no longer
+           called from exchangeDoQ.
   1.24.0 - [FEAT] AcquireUpstream/ReleaseUpstream added at the top of
            Exchange(). All protocol paths (UDP, TCP, DoT, DoH, DoH3, DoQ)
            are covered with one acquire/release pair. When the upstream
@@ -45,10 +56,6 @@ Changes:
            [FEAT] Per-upstream health tracking via atomic.Int32.
   1.17.0 - [PERF] prepareForwardQuery: eliminated first Pack() via wire-size estimate.
   1.16.0 - [PERF] Eliminated redundant dns.Msg.Copy() on the hot path.
-  1.15.0 - [PERF] Connection reuse for TCP/DoT/DoQ upstreams.
-  1.14.0 - [FEAT] EDNS0 stripping and RFC 7830/8467 padding.
-  1.13.0 - [PERF] hasClientNameTemplate, baseTLSConf, tiered buffer pools.
-  1.12.0 - Exchange returns actual resolved URL for accurate logging.
 */
 
 package main
@@ -96,9 +103,17 @@ type streamConnEntry struct {
 	idleAt time.Time
 }
 
+// doqConnEntry caches a live QUIC connection between queries.
+//
+// dialAddr holds the actual IP:port that was successfully dialled (e.g.
+// "9.9.9.9:853"). It is stored alongside the connection so that the
+// reused-connection path in exchangeDoQ can return the real address for
+// logging — previously this path returned u.RawURL (the hostname) because
+// the dialled address was not preserved anywhere.
 type doqConnEntry struct {
-	conn   *quic.Conn
-	idleAt time.Time
+	conn     *quic.Conn
+	idleAt   time.Time
+	dialAddr string // actual IP:port dialled, e.g. "9.9.9.9:853"
 }
 
 type Upstream struct {
@@ -123,6 +138,9 @@ type Upstream struct {
 	dialAddrs []string
 
 	// Health tracking — lock-free via atomics.
+	// consFails counts consecutive failures. Reset to 0 on any success.
+	// isHealthy() returns false once consFails >= healthThreshold, causing
+	// raceExchange to skip the stagger delay before the next upstream.
 	consFails atomic.Int32
 }
 
@@ -314,6 +332,10 @@ type raceResult struct {
 }
 
 // raceExchange sends a DNS query to an upstream group using staggered parallelism.
+// When upstreamStagger > 0 and the group has more than one upstream, each upstream
+// is launched after a delay. If the previous upstream responds in time, the race
+// ends early; otherwise the next upstream starts and they run concurrently.
+// First success wins; all others are canceled via the shared context.
 func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
 	n := len(upstreams)
 	if n == 0 {
@@ -454,8 +476,8 @@ func (u *Upstream) putStreamConn(addr string, conn *dns.Conn) {
 
 func (u *Upstream) dialStream(addr, tlsHost string) (*dns.Conn, error) {
 	if u.Proto == "dot" {
-		tlsConf            := u.baseTLSConf.Clone()
-		tlsConf.ServerName  = tlsHost
+		tlsConf           := u.baseTLSConf.Clone()
+		tlsConf.ServerName = tlsHost
 		return dns.DialTimeoutWithTLS("tcp-tls", addr, tlsConf, streamTimeout)
 	}
 	return dns.DialTimeout("tcp", addr, streamTimeout)
@@ -507,6 +529,9 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 		smallBufPool.Put(bufPtr)
 		return nil, err
 	}
+	// defer Put: packed shares the pool buffer's backing array. The buffer must
+	// stay live until http.NewRequestWithContext has consumed packed into the
+	// request body reader — which happens synchronously inside client.Do.
 	defer smallBufPool.Put(bufPtr)
 
 	hReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(packed))
@@ -552,34 +577,53 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 
 // --- QUIC (DoQ) ---
 
+// exchangeDoQ tries a cached QUIC connection first, dials fresh on miss/stale,
+// and stores the connection in the pool ONLY after a successful exchange.
+//
+// BUG FIX (v1.25.0): the previous implementation called putDoQConn BEFORE
+// doqStreamExchange. On exchange failure removeDoQConn raced with any concurrent
+// goroutine that had already replaced the pool entry via putDoQConn — the
+// concurrent goroutine's valid connection would be silently evicted. The fix
+// defers the putDoQConn call to the success path only, so the pool never holds
+// a connection that is mid-flight or known-bad.
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg) (*dns.Msg, string, error) {
 	key := u.RawURL
 
-	if conn := u.takeDoQConn(key); conn != nil {
-		resp, err := u.doqStreamExchange(ctx, conn, req)
+	// Try cached connection.
+	if entry := u.takeDoQConn(key); entry != nil {
+		resp, err := u.doqStreamExchange(ctx, entry.conn, req)
 		if err == nil {
-			u.putDoQConn(key, conn)
-			return resp, key, nil
+			// Successful reuse — return connection to pool with its dialled address.
+			u.putDoQConn(key, entry.conn, entry.dialAddr)
+			return resp, entry.dialAddr, nil
 		}
-		(*conn).CloseWithError(0, "stale")
+		// Stale — close and fall through to fresh dial.
+		(*entry.conn).CloseWithError(0, "stale")
 	}
 
+	// Dial a fresh connection.
 	newConn, dialAddr, err := u.dialDoQ(u.dialHost, u.dialAddrs)
 	if err != nil {
-		return nil, key, err
+		return nil, u.RawURL, err
 	}
-	u.putDoQConn(key, newConn)
 
+	// Exchange FIRST — pool ONLY after success. This eliminates the race where
+	// a concurrent goroutine takes the connection mid-exchange, and makes
+	// removeDoQConn unnecessary (no partial pool state can exist).
 	resp, err := u.doqStreamExchange(ctx, newConn, req)
 	if err != nil {
-		u.removeDoQConn(key)
 		(*newConn).CloseWithError(0, "exchange failed")
 		return nil, dialAddr, err
 	}
+	u.putDoQConn(key, newConn, dialAddr)
 	return resp, dialAddr, nil
 }
 
-func (u *Upstream) takeDoQConn(key string) *quic.Conn {
+// takeDoQConn pops a cached connection entry from the pool.
+// Returns nil when the pool is empty or the entry has exceeded doqIdleMax.
+// Returns the full *doqConnEntry (not just the conn) so the caller has access
+// to dialAddr for accurate logging on the reused-connection path.
+func (u *Upstream) takeDoQConn(key string) *doqConnEntry {
 	u.doqMu.Lock()
 	entry := u.doqConns[key]
 	delete(u.doqConns, key)
@@ -592,30 +636,37 @@ func (u *Upstream) takeDoQConn(key string) *quic.Conn {
 		(*entry.conn).CloseWithError(0, "idle timeout")
 		return nil
 	}
-	return entry.conn
+	return entry
 }
 
-func (u *Upstream) putDoQConn(key string, conn *quic.Conn) {
+// putDoQConn stores a QUIC connection in the pool after a successful exchange.
+// dialAddr is the actual IP:port that was dialled — preserved for logging on reuse.
+// If an old entry exists (two goroutines racing to store), the old connection is
+// closed first so we don't leak QUIC connections.
+func (u *Upstream) putDoQConn(key string, conn *quic.Conn, dialAddr string) {
 	u.doqMu.Lock()
 	if old := u.doqConns[key]; old != nil {
 		(*old.conn).CloseWithError(0, "replaced")
 	}
-	u.doqConns[key] = &doqConnEntry{conn: conn, idleAt: time.Now()}
+	u.doqConns[key] = &doqConnEntry{conn: conn, idleAt: time.Now(), dialAddr: dialAddr}
 	u.doqMu.Unlock()
 }
 
+// removeDoQConn evicts a connection from the pool by key.
+// No longer called from exchangeDoQ (the pool-before-exchange pattern is gone)
+// but retained for any future callers that need explicit eviction.
 func (u *Upstream) removeDoQConn(key string) {
 	u.doqMu.Lock()
 	delete(u.doqConns, key)
 	u.doqMu.Unlock()
 }
 
-// dialDoQ tries each dialAddr in order and returns the successful connection
-// alongside the address that was actually used.
+// dialDoQ tries each dialAddr in order and returns the first successful QUIC
+// connection alongside the address that was actually used.
 func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, string, error) {
-	tlsConf            := getHardenedTLSConfig()
-	tlsConf.ServerName  = host
-	tlsConf.NextProtos  = []string{"doq"}
+	tlsConf           := getHardenedTLSConfig()
+	tlsConf.ServerName = host
+	tlsConf.NextProtos = []string{"doq"}
 
 	var lastErr error
 	for _, dialAddr := range dialAddrs {
@@ -644,8 +695,9 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	defer stream.Close()
 
 	sBufPtr := smallBufPool.Get().(*[]byte)
-	defer smallBufPool.Put(sBufPtr)
+	defer smallBufPool.Put(sBufPtr) // deferred: buffer must stay live until Write returns
 
+	// Pack directly into buf[2:] so the length prefix can be prepended in-place.
 	packed, err := req.PackBuffer((*sBufPtr)[2:2])
 	if err != nil {
 		return nil, err
@@ -653,12 +705,14 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	pn := len(packed)
 
 	if pn <= len(*sBufPtr)-2 {
+		// Happy path: message fits in pool buffer — write length + payload in one call.
 		(*sBufPtr)[0] = byte(pn >> 8)
 		(*sBufPtr)[1] = byte(pn)
 		if _, err = stream.Write((*sBufPtr)[:2+pn]); err != nil {
 			return nil, err
 		}
 	} else {
+		// Oversized (> ~4094 B): fall back to two writes — length header first.
 		var hdr [2]byte
 		binary.BigEndian.PutUint16(hdr[:], uint16(pn))
 		if _, err = stream.Write(hdr[:]); err != nil {

@@ -1,13 +1,21 @@
 /*
 File: process.go
-Version: 1.45.0
-Last Updated: 2026-03-06 19:40 CET
+Version: 1.46.0
+Last Updated: 2026-03-08 14:00 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.46.0 - [FIX] ProcessDNS step 7 (upstream failure log): the error log is
+           always emitted regardless of logQueries — upstream failures should
+           never be silently dropped. However the log line formatted the client
+           identifier as clientIP+" ("+clientName+")" unconditionally. When
+           logQueries=false && !hasClientNameUpstream, clientName is never
+           populated (the identity block is gated behind needsClientName), so
+           the log produced ugly "192.168.1.5 ()" output. Now degrades
+           gracefully to just the IP when clientName is empty.
   1.45.0 - [LOG] Added responseContainsNullIP helper to detect and log sinkholed
            responses (0.0.0.0 or ::) from upstream resolvers, cache, and local
            overrides. Modified log lines to include a "(NULL-IP)" tag when an
@@ -59,7 +67,6 @@ Changes:
            [FIX]  transformResponse applied on cache-hit paths.
   1.37.0 - [FEAT] DDR spoofed records support multiple IPs + interface fallback.
   1.36.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
-  1.35.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
   1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags.
   1.33.0 - [FEAT] Upstream forwarding uses raceExchange.
   1.32.0 - [PERF] lowerTrimDot: zero-alloc single-pass lowercase + dot trim.
@@ -384,6 +391,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// Pre-format client identifier for log lines using a pooled strings.Builder.
+	// Only built when logQueries is true — skipping the pool op entirely on the
+	// silent path.
 	var clientID string
 	if logQueries {
 		sb := clientIDPool.Get().(*strings.Builder)
@@ -729,9 +738,21 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	finalResp, upstreamUsed, lastErr := raceExchange(upstreams, r, clientName)
 
 	// --- 7. Handle Error ---
+	// Always log upstream failures regardless of logQueries — these are operational
+	// errors that must never be silently dropped.
+	//
+	// BUG FIX (v1.46.0): when logQueries=false && !hasClientNameUpstream,
+	// clientName is never populated (the identity block is gated behind
+	// needsClientName). Formatting as clientIP+" ("+clientName+")" produced
+	// ugly "192.168.1.5 ()" output. Now degrades gracefully to just the IP.
 	if finalResp == nil {
+		failLabel := clientIP
+		if clientName != "" {
+			failLabel = clientIP + " (" + clientName + ")"
+		}
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | FAILED: %v",
-			protocol, clientIP+" ("+clientName+")", q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, lastErr)
+			protocol, failLabel, q.Name, dns.TypeToString[q.Qtype],
+			routeOriginType, routeName, lastErr)
 		dns.HandleFailed(w, r)
 		return
 	}
@@ -826,7 +847,7 @@ func flattenCNAMEChain(msg *dns.Msg, qtype uint16) *dns.Msg {
 	qname := msg.Question[0].Name
 	flat  := make([]dns.RR, 0, len(addrRRs))
 	for _, rr := range addrRRs {
-		c              := dns.Copy(rr)
+		c             := dns.Copy(rr)
 		c.Header().Name = qname
 		c.Header().Ttl  = minTTL
 		flat = append(flat, c)
