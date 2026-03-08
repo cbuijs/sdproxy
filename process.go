@@ -1,13 +1,17 @@
 /*
 File: process.go
-Version: 1.44.0
-Last Updated: 2026-03-05 19:00 CET
+Version: 1.45.0
+Last Updated: 2026-03-06 19:40 CET
 Description: Core logical router. Evaluates client IPs, performs MAC lookups,
              intercepts DDR discovery queries, resolves local hostnames and PTR
              records, executes zero-allocation domain route matching, resolves
              {client-name} dynamically, and forwards to upstream DNS.
 
 Changes:
+  1.45.0 - [LOG] Added responseContainsNullIP helper to detect and log sinkholed
+           responses (0.0.0.0 or ::) from upstream resolvers, cache, and local
+           overrides. Modified log lines to include a "(NULL-IP)" tag when an
+           A/AAAA response points to an unspecified address.
   1.44.0 - [FEAT] IncrQueryTotal() called after AcquireQuery to feed the
            miss-rate signal in throttle.go. IncrUpstreamCall() called at
            step 6 (just before raceExchange) to count cache misses. Together
@@ -606,7 +610,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		cachedResp = transformResponse(cachedResp, q.Qtype, true)
 		w.WriteMsg(cachedResp)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s %s | LOCAL CACHE HIT", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+			status := "LOCAL CACHE HIT"
+			if responseContainsNullIP(cachedResp) {
+				status = "LOCAL CACHE HIT (NULL-IP)"
+			}
+			log.Printf("[DNS] [%s] %s -> %s %s | %s", protocol, clientID, q.Name, dns.TypeToString[q.Qtype], status)
 		}
 		return
 	}
@@ -639,7 +647,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				CacheSet(localCacheKey, resp)
 				w.WriteMsg(resp)
 				if logQueries {
-					log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+					status := "LOCAL IDENTITY"
+					if responseContainsNullIP(resp) {
+						status = "LOCAL IDENTITY (NULL-IP)"
+					}
+					log.Printf("[DNS] [%s] %s -> %s %s | %s", protocol, clientID, q.Name, dns.TypeToString[q.Qtype], status)
 				}
 				return
 			}
@@ -692,8 +704,12 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		cachedResp = transformResponse(cachedResp, q.Qtype, true)
 		w.WriteMsg(cachedResp)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | CACHE HIT",
-				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName)
+			status := "CACHE HIT"
+			if responseContainsNullIP(cachedResp) {
+				status = "CACHE HIT (NULL-IP)"
+			}
+			log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | %s",
+				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, status)
 		}
 		return
 	}
@@ -731,8 +747,12 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	w.WriteMsg(finalResp)
 
 	if logQueries {
-		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | UPSTREAM: %s | OK",
-			protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, upstreamUsed)
+		status := "OK"
+		if responseContainsNullIP(finalResp) {
+			status = "OK (NULL-IP)"
+		}
+		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | UPSTREAM: %s | %s",
+			protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, upstreamUsed, status)
 	}
 }
 
@@ -894,5 +914,34 @@ func isValidIPv6PTR(addr string) bool {
 		addr = addr[dot+1:]
 	}
 	return nibbles == 32
+}
+
+// --- Sinkhole Detection Helpers ---
+
+// responseContainsNullIP checks if the DNS response contains an A or AAAA record
+// pointing to an unspecified (NULL) IP address (0.0.0.0 or ::). This is a common
+// indicator of an ad-blocked or sinkholed domain returned by upstream resolvers
+// (or local overrides/blocklists).
+//
+// Zero allocations: iterates over the Answer section and uses net.IP.IsUnspecified()
+// which checks the underlying byte slice directly. Loopback addresses (127.0.0.1, ::1)
+// are intentionally excluded as they are technically "specified".
+func responseContainsNullIP(msg *dns.Msg) bool {
+	if msg == nil {
+		return false
+	}
+	for _, rr := range msg.Answer {
+		switch r := rr.(type) {
+		case *dns.A:
+			if r.A.IsUnspecified() {
+				return true
+			}
+		case *dns.AAAA:
+			if r.AAAA.IsUnspecified() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
