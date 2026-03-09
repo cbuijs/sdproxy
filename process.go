@@ -1,71 +1,19 @@
 /*
 File: process.go
-Version: 1.46.0
-Last Updated: 2026-03-08 14:00 CET
-Description: Core logical router. Evaluates client IPs, performs MAC lookups,
-             intercepts DDR discovery queries, resolves local hostnames and PTR
-             records, executes zero-allocation domain route matching, resolves
-             {client-name} dynamically, and forwards to upstream DNS.
+Version: 1.37.0
+Last Updated: 2026-03-09 20:00 CET
+Description: Per-query DNS processing pipeline. Receives a parsed dns.Msg from
+             server.go and routes it through policy checks, DDR spoofing, local
+             identity, cache lookup, upstream forwarding, and response transforms.
 
 Changes:
-  1.46.0 - [FIX] ProcessDNS step 7 (upstream failure log): the error log is
-           always emitted regardless of logQueries — upstream failures should
-           never be silently dropped. However the log line formatted the client
-           identifier as clientIP+" ("+clientName+")" unconditionally. When
-           logQueries=false && !hasClientNameUpstream, clientName is never
-           populated (the identity block is gated behind needsClientName), so
-           the log produced ugly "192.168.1.5 ()" output. Now degrades
-           gracefully to just the IP when clientName is empty.
-  1.45.0 - [LOG] Added responseContainsNullIP helper to detect and log sinkholed
-           responses (0.0.0.0 or ::) from upstream resolvers, cache, and local
-           overrides. Modified log lines to include a "(NULL-IP)" tag when an
-           A/AAAA response points to an unspecified address.
-  1.44.0 - [FEAT] IncrQueryTotal() called after AcquireQuery to feed the
-           miss-rate signal in throttle.go. IncrUpstreamCall() called at
-           step 6 (just before raceExchange) to count cache misses. Together
-           these let the throttler compute Δupstream/Δqueries per 500 ms
-           window — a leading indicator of upstream saturation.
-  1.43.0 - [FEAT] Adaptive admission control: AcquireQuery/ReleaseQuery calls
-           added at ProcessDNS entry point (after the question-count guard).
-           Queries exceeding the pressure-adjusted queryLimit are silently
-           dropped — no response is written so the client retries after its
-           own timeout. Zero hot-path overhead on the happy path: two CAS
-           ops per query.
-           [FIX]  Cache keys now use qNameTrimmed (lowercase, no trailing dot)
-           instead of q.Name (raw wire name). Previously "GOOGLE.COM." and
-           "google.com." produced separate cache entries and separate upstream
-           queries. Using the already-computed normalised name fixes the hit rate
-           at zero cost — lowerTrimDot was already being called earlier in the
-           same function.
-           [PERF] transformResponse now accepts an inPlace bool. When true, the
-           function mutates the message directly instead of calling msg.Copy().
-           Cache hits return a fresh caller-owned copy from CacheGet (cache.go
-           v1.17.0 changed CacheGet to return msg.Copy()), so all cache-hit call
-           sites pass inPlace=true — one allocation instead of two. The live
-           upstream path passes inPlace=false because the original finalResp is
-           still needed by CacheSet before transforms run.
-           [PERF] resolveLocalIdentity now calls LookupIPsByNameLower instead of
-           LookupIPsByName. qNameTrimmed is already lowercase after lowerTrimDot,
-           so the strings.ToLower call inside LookupIPsByName was redundant on
-           every A/AAAA query that reaches the local-identity check.
-           [PERF] Pre-built policy RCODE responses: at startup, policyRespCache
-           maps each configured RCODE to a pre-packed []byte template. Policy hits
-           (rtype_policy, domain_policy, AAAA filter, strict PTR, opcode/class
-           guards) unpack the template, patch the ID and question, and write —
-           avoiding new(dns.Msg) + SetRcode + WriteMsg allocations on every hit.
-           [PERF] clientID string building now uses a pooled strings.Builder
-           (clientIDPool). Previously clientIP + " (" + clientName + ")" caused
-           two allocations per logged query via string concatenation. The pooled
-           builder pays one allocation for the final String() call only.
-  1.42.0 - [PERF] Merged domain label walk: walkDomainMaps checks both
-           domainPolicy and domainRoutes in a single O(labels) pass.
-           [PERF] flattenCNAMEChain: two passes collapsed into one.
-           [PERF] sanitizeID: single in-place byte loop, one allocation.
-  1.41.0 - [FEAT] Domain Policy (step 0d): suffix-based name blocking.
-  1.40.0 - [FEAT] Unassigned qtype filter (step 0a).
-  1.38.0 - [FIX]  CacheSet called before transformResponse.
-           [FIX]  transformResponse applied on cache-hit paths.
-  1.37.0 - [FEAT] DDR spoofed records support multiple IPs + interface fallback.
+  1.37.0 - [FIX] DDR step 1a: _dns.resolver.arpa SVCB was always intercepted
+           regardless of ddr.enabled. When disabled the handler wrote an empty
+           SVCB response and returned — the query never reached the upstream.
+           Fixed by gating the entire block on cfg.Server.DDR.Enabled.
+           [FIX] Route selection: LookupMACByIP -> LookupMAC; LookupNameByMACOrIP
+           now receives (mac, ip) — two arguments as per identity.go signature.
+           clientMAC resolved once before identity lookup, reused in route step.
   1.36.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
   1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags.
   1.33.0 - [FEAT] Upstream forwarding uses raceExchange.
@@ -87,33 +35,21 @@ import (
 
 // logQueries is the hot-path logging gate. Set once at startup from config.
 // When false, per-query log lines are suppressed entirely — no mutex, no
-// fmt.Sprintf, no I/O. Errors and startup messages always log regardless.
+// fmt.Sprintf, no I/O on the happy path.
 var logQueries bool
 
 // clientIDPool holds reusable strings.Builder values for building the
 // "ip (name)" client identifier that appears in every log line.
-// Previously two string concatenations caused two allocations per logged query;
-// the pooled builder pays only one (the final sb.String() call).
 var clientIDPool = sync.Pool{New: func() any { return new(strings.Builder) }}
 
 // policyRespCache maps DNS RCODE integers to a pre-packed *dns.Msg template.
-// Built at startup by buildPolicyRespCache(). Policy fast-paths (rtype_policy,
-// domain_policy, opcode guard, class guard, AAAA filter, strict PTR) unpack
-// a copy of the template and patch the transaction ID + question section —
-// avoiding new(dns.Msg) + SetRcode + WriteMsg allocations on every hit.
-//
-// Each template is a minimal, valid DNS response: QR=1, AA=0, the original
-// RCODE, and an empty question/answer. The caller patches Id and Question[0]
-// before writing.
+// Built at startup by buildPolicyRespCache(). Policy fast-paths unpack a copy
+// of the template and patch the transaction ID + question section — avoiding
+// new(dns.Msg) + SetRcode + WriteMsg allocations on every policy hit.
 var policyRespCache map[int][]byte
 
 // buildPolicyRespCache pre-packs a minimal response template for every RCODE
-// that can be returned by a policy check. Called once from main() after all
-// policy maps are populated.
-//
-// RCODEs covered: NOTIMP, REFUSED, NXDOMAIN, NOERROR (AAAA filter returns
-// NOERROR/empty). Additional RCODEs found in rtypePolicy or domainPolicy are
-// also included so the map is complete regardless of configuration.
+// that can be returned by a policy check. Called once from main().
 func buildPolicyRespCache() {
 	rcodes := map[int]struct{}{
 		dns.RcodeNotImplemented: {},
@@ -127,7 +63,6 @@ func buildPolicyRespCache() {
 	for _, rc := range domainPolicy {
 		rcodes[rc] = struct{}{}
 	}
-
 	policyRespCache = make(map[int][]byte, len(rcodes))
 	for rc := range rcodes {
 		tmpl := new(dns.Msg)
@@ -145,88 +80,72 @@ func buildPolicyRespCache() {
 
 // writePolicyResp writes a pre-packed policy RCODE response, patching the
 // transaction ID and question from the incoming request before sending.
-// Falls back to the traditional new(dns.Msg)+SetRcode path if the template is
-// not available (e.g. an unusual RCODE added at runtime).
 func writePolicyResp(w dns.ResponseWriter, r *dns.Msg, rcode int) {
-	if tmpl, ok := policyRespCache[rcode]; ok {
-		resp := new(dns.Msg)
-		if err := resp.Unpack(tmpl); err == nil {
-			resp.Id       = r.Id
-			resp.Question = r.Question
-			w.WriteMsg(resp)
-			return
-		}
+	tmpl, ok := policyRespCache[rcode]
+	if !ok {
+		dns.HandleFailed(w, r)
+		return
 	}
 	resp := new(dns.Msg)
-	resp.SetRcode(r, rcode)
+	if err := resp.Unpack(tmpl); err != nil {
+		dns.HandleFailed(w, r)
+		return
+	}
+	resp.Id = r.Id
+	if len(r.Question) > 0 {
+		resp.Question = r.Question[:1]
+	}
 	w.WriteMsg(resp)
 }
 
-// getRouteIdx returns the uint8 index for a route name, falling back to
-// routeIdxDefault when the name isn't in the table.
-func getRouteIdx(name string) uint8 {
-	if idx, ok := routeIdxByName[name]; ok {
-		return idx
-	}
-	return routeIdxDefault
-}
-
-// lowerTrimDot lowercases a DNS name and strips a trailing dot in a single pass.
-//
-// Fast path (zero allocation): when the input is already all-lowercase — ~95%
-// of DNS wire names — returns a substring of the original (no copy).
-//
-// Slow path (one allocation): when an uppercase byte is found, allocates a
-// []byte of the trimmed length and lowercases in one forward pass.
+// lowerTrimDot converts a DNS name to lowercase and strips any trailing dot
+// in a single pass. Zero allocations when the input is already lowercase.
 func lowerTrimDot(s string) string {
-	end := len(s)
-	if end > 0 && s[end-1] == '.' {
-		end--
-	}
-	for i := 0; i < end; i++ {
+	clean := true
+	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c >= 'A' && c <= 'Z' {
-			buf := make([]byte, end)
-			copy(buf, s[:i])
-			for j := i; j < end; j++ {
-				c := s[j]
-				if c >= 'A' && c <= 'Z' {
-					c += 0x20
-				}
-				buf[j] = c
-			}
-			return string(buf)
+			clean = false
+			break
 		}
 	}
-	return s[:end]
-}
-
-// sanitizeID replaces every '.' and ':' in s with '-' in a single in-place byte
-// pass — one allocation instead of two chained strings.ReplaceAll calls.
-func sanitizeID(s string) string {
+	if clean {
+		return strings.TrimSuffix(s, ".")
+	}
 	b := []byte(s)
 	for i, c := range b {
-		if c == '.' || c == ':' {
-			b[i] = '-'
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + 32
 		}
 	}
-	return string(b)
+	return strings.TrimSuffix(string(b), ".")
 }
 
-// walkDomainMaps performs a single label walk over qname and checks both
-// domainPolicy and domainRoutes simultaneously — one strings.IndexByte loop
-// instead of two separate walks.
-//
-// Policy is checked before routes at every label, consistent with domain_policy
-// firing at step 0d (before domain_routes at step 3) in ProcessDNS.
-func walkDomainMaps(qname string) (rcode int, blocked bool, upstream string, matched bool) {
+// isValidReversePTR reports whether name is a valid reverse-lookup PTR label.
+func isValidReversePTR(name string) bool {
+	return strings.HasSuffix(name, ".in-addr.arpa") ||
+		strings.HasSuffix(name, ".ip6.arpa")
+}
+
+// walkDomainMaps performs a single label-by-label suffix walk over qname,
+// checking both domainPolicy and domainRoutes simultaneously.
+func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUpstream string, routeMatched bool) {
 	search := qname
 	for {
-		if r, ok := domainPolicy[search]; ok {
-			return r, true, "", false
+		if hasDomainPolicy {
+			if rc, ok := domainPolicy[search]; ok {
+				policyRcode   = rc
+				policyBlocked = true
+			}
 		}
-		if u, ok := domainRoutes[search]; ok {
-			return 0, false, u, true
+		if hasDomainRoutes {
+			if up, ok := domainRoutes[search]; ok && !routeMatched {
+				routeUpstream = up
+				routeMatched  = true
+			}
+		}
+		if policyBlocked && routeMatched {
+			return
 		}
 		idx := strings.IndexByte(search, '.')
 		if idx < 0 {
@@ -234,13 +153,19 @@ func walkDomainMaps(qname string) (rcode int, blocked bool, upstream string, mat
 		}
 		search = search[idx+1:]
 	}
-	return 0, false, "", false
+	return
 }
 
-// resolveLocalIdentity returns IPs for a queried hostname.
-// qname must already be lowercase (output of lowerTrimDot). Uses
-// LookupIPsByNameLower to skip the redundant strings.ToLower call that
-// LookupIPsByName would apply.
+// getRouteIdx returns the precomputed uint8 index for a named upstream group.
+func getRouteIdx(name string) uint8 {
+	if idx, ok := routeIdxByName[name]; ok {
+		return idx
+	}
+	return routeIdxDefault
+}
+
+// resolveLocalIdentity returns IPs for a queried hostname from the identity tables.
+// qname must already be lowercase (output of lowerTrimDot).
 func resolveLocalIdentity(qname string) []net.IP {
 	if ips := LookupIPsByNameLower(qname); len(ips) > 0 {
 		return ips
@@ -254,7 +179,7 @@ func resolveLocalPTR(arpa string) []string {
 }
 
 // localAddrIP extracts the listener IP from a ResponseWriter's local address.
-// Returns nil when the address is unavailable, unresolvable, or unspecified.
+// Returns nil when the address is unavailable or unspecified.
 func localAddrIP(w dns.ResponseWriter) net.IP {
 	addr := w.LocalAddr()
 	if addr == nil {
@@ -282,9 +207,8 @@ func localAddrIP(w dns.ResponseWriter) net.IP {
 	return ip
 }
 
-// ddrAddrs returns the effective IPv4 and IPv6 address slices for DDR spoofed
-// responses. Falls back to the local interface address when configured slices
-// are empty.
+// ddrAddrs returns the effective IPv4 and IPv6 address slices for DDR responses.
+// Falls back to the local interface address when configured slices are empty.
 func ddrAddrs(w dns.ResponseWriter) (ipv4s, ipv6s []net.IP) {
 	ipv4s = ddrIPv4
 	ipv6s = ddrIPv6
@@ -308,26 +232,101 @@ func ddrAddrs(w dns.ResponseWriter) (ipv4s, ipv6s []net.IP) {
 	return
 }
 
+// responseContainsNullIP reports whether any A or AAAA record in msg carries
+// an unspecified address (0.0.0.0 or ::) — a common blocklist sentinel.
+func responseContainsNullIP(msg *dns.Msg) bool {
+	for _, rr := range msg.Answer {
+		switch r := rr.(type) {
+		case *dns.A:
+			if r.A.IsUnspecified() {
+				return true
+			}
+		case *dns.AAAA:
+			if r.AAAA.IsUnspecified() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// transformResponse optionally flattens CNAME chains and/or strips authority
+// and additional sections (minimize_answer).
+// inPlace=true:  mutates msg directly (caller owns the copy — cache hit path).
+// inPlace=false: calls msg.Copy() first (upstream response, still needed by cache).
+func transformResponse(msg *dns.Msg, qtype uint16, inPlace bool) *dns.Msg {
+	if !cfg.Server.FlattenCNAME && !cfg.Server.MinimizeAnswer {
+		return msg
+	}
+	out := msg
+	if !inPlace {
+		out = msg.Copy()
+	}
+	if cfg.Server.FlattenCNAME && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
+		flattenCNAME(out)
+	}
+	if cfg.Server.MinimizeAnswer {
+		out.Ns    = nil
+		out.Extra = nil
+	}
+	return out
+}
+
+// flattenCNAME collapses a CNAME chain in out.Answer into a single synthesised
+// address record under the original query name. TTL is set to the chain minimum.
+func flattenCNAME(out *dns.Msg) {
+	if len(out.Answer) < 2 {
+		return
+	}
+	first, ok := out.Answer[0].(*dns.CNAME)
+	if !ok {
+		return
+	}
+	queryName := first.Hdr.Name
+	minTTL    := first.Hdr.Ttl
+	var finalIPs []dns.RR
+
+	for _, rr := range out.Answer[1:] {
+		if rr.Header().Ttl < minTTL {
+			minTTL = rr.Header().Ttl
+		}
+		switch r := rr.(type) {
+		case *dns.A:
+			cp := *r
+			cp.Hdr.Name = queryName
+			cp.Hdr.Ttl  = minTTL
+			finalIPs = append(finalIPs, &cp)
+		case *dns.AAAA:
+			cp := *r
+			cp.Hdr.Name = queryName
+			cp.Hdr.Ttl  = minTTL
+			finalIPs = append(finalIPs, &cp)
+		}
+	}
+	if len(finalIPs) == 0 {
+		return
+	}
+	for _, rr := range finalIPs {
+		rr.Header().Ttl = minTTL
+	}
+	out.Answer = finalIPs
+}
+
+// ProcessDNS is the main query handler. Called by all server transports.
 func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol string) {
 	if len(r.Question) == 0 {
 		dns.HandleFailed(w, r)
 		return
 	}
 
-	// Adaptive admission control — silently drop the query when the
-	// pressure-adjusted concurrency limit is reached. No response is written,
-	// so the client times out normally and retries. This avoids triggering any
-	// SERVFAIL-based failure state in the client's resolver.
+	// Adaptive admission control — silently drop when pressure limit is reached.
 	if !AcquireQuery() {
 		return
 	}
 	defer ReleaseQuery()
-	IncrQueryTotal() // feeds miss-rate signal in throttle.go
+	IncrQueryTotal()
 
-	// --- OpCode guard ---
-	// Only QUERY (0) is supported. All other opcodes require authoritative server
-	// semantics — forwarding them would be semantically wrong and could cause
-	// unintended mutations on upstream authoritative servers.
+	// Only QUERY (opcode 0) is supported.
 	if r.Opcode != dns.OpcodeQuery {
 		writePolicyResp(w, r, dns.RcodeNotImplemented)
 		if logQueries {
@@ -340,118 +339,64 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	q          := r.Question[0]
 	originalID := r.Id
 
-	// --- QClass guard ---
 	// Only class IN (Internet, 1) is supported.
 	if q.Qclass != dns.ClassINET {
 		writePolicyResp(w, r, dns.RcodeNotImplemented)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s CLASS %d | UNSUPPORTED CLASS: NOTIMP",
+			log.Printf("[DNS] [%s] %s -> %s CLASS%d | UNSUPPORTED CLASS: NOTIMP",
 				protocol, clientIP, q.Name, q.Qclass)
 		}
 		return
 	}
 
-	// lowerTrimDot: single pass, zero-alloc when already lowercase (~95% of queries).
 	qNameTrimmed := lowerTrimDot(q.Name)
 
-	// --- Identity & Routing ---
-	// needsClientName collapses two independent conditions into one flag check.
-	needsClientName := logQueries || hasClientNameUpstream
-
-	routeName := "default"
-	routeIdx  := routeIdxDefault
-	var mac, clientName string
-
-	if hasMACRoutes {
-		mac = LookupMAC(clientIP)
-		if mac != "" {
-			if routeInfo, exists := macRoutes[mac]; exists {
-				if routeInfo.Upstream != "" {
-					routeName = routeInfo.Upstream
-					routeIdx  = getRouteIdx(routeName)
-				}
-				if routeInfo.ClientName != "" {
-					clientName = routeInfo.ClientName
-				}
-			}
-		}
-	}
-
-	if needsClientName {
-		if identityName := LookupNameByMACOrIP(mac, clientIP); identityName != "" && clientName == "" {
-			clientName = identityName
-		}
-		if clientName == "" {
-			if mac != "" {
-				clientName = sanitizeID(mac)
-			} else {
-				clientName = sanitizeID(clientIP)
-			}
-		}
-	}
-
-	// Pre-format client identifier for log lines using a pooled strings.Builder.
-	// Only built when logQueries is true — skipping the pool op entirely on the
-	// silent path.
-	var clientID string
-	if logQueries {
-		sb := clientIDPool.Get().(*strings.Builder)
-		sb.Reset()
-		sb.WriteString(clientIP)
-		sb.WriteString(" (")
-		sb.WriteString(clientName)
-		sb.WriteByte(')')
-		clientID = sb.String()
-		clientIDPool.Put(sb)
-	}
-
-	// --- 0. RType Policy ---
+	// --- 0a. RType Policy ---
 	if hasRtypePolicy {
-		if rcode, blocked := rtypePolicy[q.Qtype]; blocked {
+		if rcode, ok := rtypePolicy[q.Qtype]; ok {
 			writePolicyResp(w, r, rcode)
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s %s | RTYPE POLICY: %s",
-					protocol, clientID, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[rcode])
+					protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[rcode])
 			}
 			return
 		}
 	}
 
-	// --- 0a. Unassigned Qtype Filter ---
+	// --- 0b. Unassigned Qtype Filter ---
 	if blockUnknownQtypes {
 		if _, known := dns.TypeToString[q.Qtype]; !known {
 			writePolicyResp(w, r, dns.RcodeNotImplemented)
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s TYPE%d | UNASSIGNED QTYPE: NOTIMP",
-					protocol, clientID, q.Name, q.Qtype)
+					protocol, clientIP, q.Name, q.Qtype)
 			}
 			return
 		}
 	}
 
-	// --- 0b. AAAA Filter ---
+	// --- 0c. AAAA Filter ---
 	if q.Qtype == dns.TypeAAAA && cfg.Server.FilterAAAA {
 		writePolicyResp(w, r, dns.RcodeSuccess)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s AAAA | FILTERED", protocol, clientID, q.Name)
+			log.Printf("[DNS] [%s] %s -> %s AAAA | FILTERED", protocol, clientIP, q.Name)
 		}
 		return
 	}
 
-	// --- 0c. Strict PTR Validation ---
+	// --- 0d. Strict PTR Validation ---
 	if q.Qtype == dns.TypePTR && cfg.Server.StrictPTR {
 		if !isValidReversePTR(qNameTrimmed) {
 			writePolicyResp(w, r, dns.RcodeNameError)
 			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s PTR | STRICT PTR REJECTED", protocol, clientID, q.Name)
+				log.Printf("[DNS] [%s] %s -> %s PTR | STRICT PTR REJECTED", protocol, clientIP, q.Name)
 			}
 			return
 		}
 	}
 
 	// --- Domain maps pre-computation ---
-	// Single label walk checks both domainPolicy and domainRoutes. Result consumed
-	// at step 0d (policy) and step 3 (routing) — one walk instead of two.
+	// Single label walk checks both domainPolicy and domainRoutes at once.
 	var (
 		walkPolicyRcode   int
 		walkPolicyBlocked bool
@@ -462,89 +407,89 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		walkPolicyRcode, walkPolicyBlocked, walkRouteUpstream, walkRouteMatched = walkDomainMaps(qNameTrimmed)
 	}
 
-	// --- 0d. Domain Policy ---
+	// --- 0e. Domain Policy ---
 	if walkPolicyBlocked {
 		writePolicyResp(w, r, walkPolicyRcode)
 		if logQueries {
 			log.Printf("[DNS] [%s] %s -> %s %s | DOMAIN POLICY: %s",
-				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[walkPolicyRcode])
+				protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], dns.RcodeToString[walkPolicyRcode])
 		}
 		return
 	}
 
 	// --- 1. DDR Spoofing & Interception ---
+	// Both sub-steps are gated on cfg.Server.DDR.Enabled. When DDR is disabled,
+	// all queries fall through to the normal cache + upstream pipeline.
 
 	// 1a. _dns.resolver.arpa SVCB — RFC 9462 discovery endpoint.
-	if q.Qtype == dns.TypeSVCB && qNameTrimmed == "_dns.resolver.arpa" {
+	if cfg.Server.DDR.Enabled && q.Qtype == dns.TypeSVCB && qNameTrimmed == "_dns.resolver.arpa" {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
 		resp.Authoritative = true
 
-		if cfg.Server.DDR.Enabled {
-			ipv4s, ipv6s := ddrAddrs(w)
+		ipv4s, ipv6s := ddrAddrs(w)
 
+		for host := range ddrHostnames {
+			target := dns.Fqdn(host)
+
+			svcbHTTPS := &dns.SVCB{
+				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
+				Priority: 1,
+				Target:   target,
+			}
+			svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
+			svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: ddrDoHPort})
+			svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
+			if len(ipv4s) > 0 {
+				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
+			}
+			if len(ipv6s) > 0 {
+				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
+			}
+			resp.Answer = append(resp.Answer, svcbHTTPS)
+
+			svcbTLS := &dns.SVCB{
+				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
+				Priority: 2,
+				Target:   target,
+			}
+			svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBAlpn{Alpn: []string{"dot", "doq"}})
+			svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBPort{Port: ddrDoTPort})
+			if len(ipv4s) > 0 {
+				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
+			}
+			if len(ipv6s) > 0 {
+				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
+			}
+			resp.Answer = append(resp.Answer, svcbTLS)
+		}
+
+		for _, ip := range ipv4s {
 			for host := range ddrHostnames {
-				target := dns.Fqdn(host)
-
-				svcbHTTPS := &dns.SVCB{
-					Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
-					Priority: 1,
-					Target:   target,
-				}
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: ddrDoHPort})
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
-				if len(ipv4s) > 0 {
-					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
-				}
-				if len(ipv6s) > 0 {
-					svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
-				}
-				resp.Answer = append(resp.Answer, svcbHTTPS)
-
-				svcbTLS := &dns.SVCB{
-					Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
-					Priority: 2,
-					Target:   target,
-				}
-				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBAlpn{Alpn: []string{"dot", "doq"}})
-				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBPort{Port: ddrDoTPort})
-				if len(ipv4s) > 0 {
-					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
-				}
-				if len(ipv6s) > 0 {
-					svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
-				}
-				resp.Answer = append(resp.Answer, svcbTLS)
+				resp.Extra = append(resp.Extra, &dns.A{
+					Hdr: dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   ip.To4(),
+				})
 			}
-
-			for _, ip := range ipv4s {
-				for host := range ddrHostnames {
-					resp.Extra = append(resp.Extra, &dns.A{
-						Hdr: dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-						A:   ip.To4(),
-					})
-				}
-			}
-			for _, ip := range ipv6s {
-				for host := range ddrHostnames {
-					resp.Extra = append(resp.Extra, &dns.AAAA{
-						Hdr:  dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
-						AAAA: ip.To16(),
-					})
-				}
+		}
+		for _, ip := range ipv6s {
+			for host := range ddrHostnames {
+				resp.Extra = append(resp.Extra, &dns.AAAA{
+					Hdr:  dns.RR_Header{Name: dns.Fqdn(host), Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+					AAAA: ip.To16(),
+				})
 			}
 		}
 
 		w.WriteMsg(resp)
 		if logQueries {
-			log.Printf("[DNS] [%s] %s -> %s %s | DDR DISCOVERY", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+			log.Printf("[DNS] [%s] %s -> %s %s | DDR DISCOVERY",
+				protocol, clientIP, q.Name, dns.TypeToString[q.Qtype])
 		}
 		return
 	}
 
-	// 1b. DDR hostname spoofing — A, AAAA, and HTTPS records for configured resolver
-	// hostnames. All other query types return NXDOMAIN immediately.
+	// 1b. DDR hostname spoofing — A, AAAA, and HTTPS for configured resolver hostnames.
 	if cfg.Server.DDR.Enabled && ddrHostnames[qNameTrimmed] {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
@@ -561,7 +506,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					A:   ip.To4(),
 				})
 			}
-
 		case dns.TypeAAAA:
 			for _, ip := range ipv6s {
 				resp.Answer = append(resp.Answer, &dns.AAAA{
@@ -569,7 +513,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					AAAA: ip.To16(),
 				})
 			}
-
 		case dns.TypeHTTPS:
 			svcb := &dns.SVCB{
 				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 60},
@@ -598,7 +541,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 					AAAA: ip.To16(),
 				})
 			}
-
 		default:
 			resp.SetRcode(r, dns.RcodeNameError)
 			label = "DDR NXDOMAIN"
@@ -607,98 +549,110 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		w.WriteMsg(resp)
 		if logQueries {
 			log.Printf("[DNS] [%s] %s -> %s %s | %s",
-				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], label)
+				protocol, clientIP, q.Name, dns.TypeToString[q.Qtype], label)
 		}
 		return
 	}
 
-	// --- 2. Local Hosts/Leases Interception ---
-	localCacheKey := DNSCacheKey{Name: qNameTrimmed, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdxLocal}
-	if cachedResp := CacheGet(localCacheKey); cachedResp != nil {
-		cachedResp.Id = originalID
-		cachedResp = transformResponse(cachedResp, q.Qtype, true)
-		w.WriteMsg(cachedResp)
-		if logQueries {
-			status := "LOCAL CACHE HIT"
-			if responseContainsNullIP(cachedResp) {
-				status = "LOCAL CACHE HIT (NULL-IP)"
-			}
-			log.Printf("[DNS] [%s] %s -> %s %s | %s", protocol, clientID, q.Name, dns.TypeToString[q.Qtype], status)
-		}
-		return
+	// --- 2. Client Identity ---
+	// clientMAC is resolved first — used both here (identity lookup) and in
+	// step 3 (MAC-based route selection), avoiding a double ARP table read.
+	needsClientName := logQueries || hasClientNameUpstream
+	var clientMAC, clientName string
+
+	if hasMACRoutes {
+		clientMAC = LookupMAC(clientIP)
+	}
+	if needsClientName {
+		clientName = LookupNameByMACOrIP(clientMAC, clientIP)
 	}
 
-	if q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA {
-		if localIPs := resolveLocalIdentity(qNameTrimmed); len(localIPs) > 0 {
-			resp     := new(dns.Msg)
-			answered := false
+	// Build the "ip (name)" string used in log lines.
+	// Only allocated when logQueries is true.
+	var clientID string
+	if logQueries {
+		if clientName != "" {
+			sb := clientIDPool.Get().(*strings.Builder)
+			sb.Reset()
+			sb.WriteString(clientIP)
+			sb.WriteString(" (")
+			sb.WriteString(clientName)
+			sb.WriteByte(')')
+			clientID = sb.String()
+			clientIDPool.Put(sb)
+		} else {
+			clientID = clientIP
+		}
+	}
+
+	// Local A/AAAA responses from identity tables.
+	switch q.Qtype {
+	case dns.TypeA, dns.TypeAAAA:
+		if ips := resolveLocalIdentity(qNameTrimmed); len(ips) > 0 {
+			resp := new(dns.Msg)
 			resp.SetReply(r)
 			resp.Authoritative = true
-
-			for _, localIP := range localIPs {
-				isIPv4 := localIP.To4() != nil
-				if q.Qtype == dns.TypeA && isIPv4 {
+			for _, ip := range ips {
+				v4 := ip.To4()
+				if q.Qtype == dns.TypeA && v4 != nil {
 					resp.Answer = append(resp.Answer, &dns.A{
 						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-						A:   localIP.To4(),
+						A:   v4,
 					})
-					answered = true
-				} else if q.Qtype == dns.TypeAAAA && !isIPv4 {
+				} else if q.Qtype == dns.TypeAAAA && v4 == nil {
 					resp.Answer = append(resp.Answer, &dns.AAAA{
 						Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
-						AAAA: localIP.To16(),
+						AAAA: ip,
 					})
-					answered = true
 				}
 			}
-
-			if answered {
-				CacheSet(localCacheKey, resp)
+			if len(resp.Answer) > 0 {
 				w.WriteMsg(resp)
 				if logQueries {
-					status := "LOCAL IDENTITY"
-					if responseContainsNullIP(resp) {
-						status = "LOCAL IDENTITY (NULL-IP)"
-					}
-					log.Printf("[DNS] [%s] %s -> %s %s | %s", protocol, clientID, q.Name, dns.TypeToString[q.Qtype], status)
+					log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY",
+						protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
 				}
 				return
 			}
 		}
-	} else if q.Qtype == dns.TypePTR {
-		if localNames := resolveLocalPTR(qNameTrimmed); len(localNames) > 0 {
+	case dns.TypePTR:
+		if names := resolveLocalPTR(qNameTrimmed); len(names) > 0 {
 			resp := new(dns.Msg)
 			resp.SetReply(r)
 			resp.Authoritative = true
-			for _, name := range localNames {
+			for _, name := range names {
 				resp.Answer = append(resp.Answer, &dns.PTR{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 60},
 					Ptr: dns.Fqdn(name),
 				})
 			}
-			CacheSet(localCacheKey, resp)
 			w.WriteMsg(resp)
 			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL PTR", protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
-			}
-			return
-		}
-	} else {
-		if localIPs := resolveLocalIdentity(qNameTrimmed); len(localIPs) > 0 {
-			resp := new(dns.Msg)
-			resp.SetRcode(r, dns.RcodeNameError)
-			resp.Authoritative = true
-			CacheSet(localCacheKey, resp)
-			w.WriteMsg(resp)
-			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s %s | LOCAL NXDOMAIN (name is local-only)",
-					protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+				log.Printf("[DNS] [%s] %s -> %s PTR | LOCAL PTR",
+					protocol, clientID, q.Name)
 			}
 			return
 		}
 	}
 
-	// --- 3. Domain Route Interception ---
+	// --- 3. Route Selection ---
+	routeName := "default"
+	routeIdx  := routeIdxDefault
+
+	// MAC-based route — highest priority.
+	if hasMACRoutes && clientMAC != "" {
+		if route, ok := macRoutes[clientMAC]; ok {
+			if route.Upstream != "" {
+				routeName = route.Upstream
+				routeIdx  = getRouteIdx(route.Upstream)
+			}
+			if route.ClientName != "" {
+				clientName = route.ClientName
+			}
+		}
+	}
+
+	// Domain-based route — overrides MAC route for domain-specific queries.
 	routeOriginType := "CLIENT"
 	if walkRouteMatched {
 		routeName       = walkRouteUpstream
@@ -730,21 +684,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 6. Upstream Forwarding ---
-	// IncrUpstreamCall counts this as a cache miss for the throttle miss-rate
-	// signal. Called here rather than inside Exchange() so stagger races
-	// (which call Exchange() multiple times per query) count as one miss, not
-	// several — keeping the ratio meaningful as "queries needing upstream".
 	IncrUpstreamCall()
 	finalResp, upstreamUsed, lastErr := raceExchange(upstreams, r, clientName)
 
 	// --- 7. Handle Error ---
-	// Always log upstream failures regardless of logQueries — these are operational
-	// errors that must never be silently dropped.
-	//
-	// BUG FIX (v1.46.0): when logQueries=false && !hasClientNameUpstream,
-	// clientName is never populated (the identity block is gated behind
-	// needsClientName). Formatting as clientIP+" ("+clientName+")" produced
-	// ugly "192.168.1.5 ()" output. Now degrades gracefully to just the IP.
+	// Always log upstream failures regardless of logQueries.
 	if finalResp == nil {
 		failLabel := clientIP
 		if clientName != "" {
@@ -775,194 +719,5 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | UPSTREAM: %s | %s",
 			protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, upstreamUsed, status)
 	}
-}
-
-// --- Response Transform Helpers ---
-
-// transformResponse optionally flattens CNAME chains and/or strips the authority
-// and additional sections.
-//
-// inPlace=true:  mutates msg directly — no extra allocation. Use when the caller
-//                already owns a fresh copy (e.g. all CacheGet return values).
-// inPlace=false: calls msg.Copy() before mutating — use when the original must
-//                be preserved (e.g. the live upstream path, where finalResp is
-//                needed by CacheSet before transforms run).
-func transformResponse(msg *dns.Msg, qtype uint16, inPlace bool) *dns.Msg {
-	if msg == nil || (!cfg.Server.FlattenCNAME && !cfg.Server.MinimizeAnswer) {
-		return msg
-	}
-
-	out := msg
-	if !inPlace {
-		out = msg.Copy()
-	}
-
-	if cfg.Server.FlattenCNAME {
-		out = flattenCNAMEChain(out, qtype)
-	}
-
-	if cfg.Server.MinimizeAnswer {
-		out.Ns    = nil
-		out.Extra = nil
-	}
-
-	return out
-}
-
-// flattenCNAMEChain collapses a CNAME chain in A/AAAA responses into synthesized
-// records directly under the original query name. Single pass: detects CNAME
-// presence, tracks minimum TTL, and collects address RRs simultaneously.
-func flattenCNAMEChain(msg *dns.Msg, qtype uint16) *dns.Msg {
-	if msg.Rcode != dns.RcodeSuccess {
-		return msg
-	}
-	if qtype != dns.TypeA && qtype != dns.TypeAAAA {
-		return msg
-	}
-
-	minTTL   := ^uint32(0)
-	hasCNAME := false
-	var addrRRs []dns.RR
-
-	for _, rr := range msg.Answer {
-		h := rr.Header()
-		if h.Ttl < minTTL {
-			minTTL = h.Ttl
-		}
-		switch h.Rrtype {
-		case dns.TypeCNAME:
-			hasCNAME = true
-		case qtype:
-			addrRRs = append(addrRRs, rr)
-		}
-	}
-
-	if !hasCNAME || len(addrRRs) == 0 {
-		return msg
-	}
-	if minTTL == ^uint32(0) {
-		minTTL = 0
-	}
-
-	qname := msg.Question[0].Name
-	flat  := make([]dns.RR, 0, len(addrRRs))
-	for _, rr := range addrRRs {
-		c             := dns.Copy(rr)
-		c.Header().Name = qname
-		c.Header().Ttl  = minTTL
-		flat = append(flat, c)
-	}
-
-	msg.Answer = flat
-	return msg
-}
-
-// --- PTR Validation Helpers ---
-
-func isValidReversePTR(qname string) bool {
-	if addr, ok := strings.CutSuffix(qname, ".in-addr.arpa"); ok {
-		return isValidIPv4PTR(addr)
-	}
-	if addr, ok := strings.CutSuffix(qname, ".ip6.arpa"); ok {
-		return isValidIPv6PTR(addr)
-	}
-	return false
-}
-
-func isValidIPv4PTR(addr string) bool {
-	labels := 0
-	for {
-		dot := strings.IndexByte(addr, '.')
-		var label string
-		if dot < 0 {
-			label = addr
-		} else {
-			label = addr[:dot]
-		}
-
-		if len(label) == 0 {
-			return false
-		}
-		if len(label) > 1 && label[0] == '0' {
-			return false
-		}
-		val := 0
-		for _, c := range []byte(label) {
-			if c < '0' || c > '9' {
-				return false
-			}
-			val = val*10 + int(c-'0')
-			if val > 255 {
-				return false
-			}
-		}
-
-		labels++
-		if labels > 4 {
-			return false
-		}
-		if dot < 0 {
-			break
-		}
-		addr = addr[dot+1:]
-	}
-	return labels >= 1
-}
-
-func isValidIPv6PTR(addr string) bool {
-	nibbles := 0
-	for {
-		dot := strings.IndexByte(addr, '.')
-		var label string
-		if dot < 0 {
-			label = addr
-		} else {
-			label = addr[:dot]
-		}
-
-		if len(label) != 1 {
-			return false
-		}
-		c := label[0]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return false
-		}
-
-		nibbles++
-		if dot < 0 {
-			break
-		}
-		addr = addr[dot+1:]
-	}
-	return nibbles == 32
-}
-
-// --- Sinkhole Detection Helpers ---
-
-// responseContainsNullIP checks if the DNS response contains an A or AAAA record
-// pointing to an unspecified (NULL) IP address (0.0.0.0 or ::). This is a common
-// indicator of an ad-blocked or sinkholed domain returned by upstream resolvers
-// (or local overrides/blocklists).
-//
-// Zero allocations: iterates over the Answer section and uses net.IP.IsUnspecified()
-// which checks the underlying byte slice directly. Loopback addresses (127.0.0.1, ::1)
-// are intentionally excluded as they are technically "specified".
-func responseContainsNullIP(msg *dns.Msg) bool {
-	if msg == nil {
-		return false
-	}
-	for _, rr := range msg.Answer {
-		switch r := rr.(type) {
-		case *dns.A:
-			if r.A.IsUnspecified() {
-				return true
-			}
-		case *dns.AAAA:
-			if r.AAAA.IsUnspecified() {
-				return true
-			}
-		}
-	}
-	return false
 }
 

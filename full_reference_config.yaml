@@ -1,10 +1,11 @@
 # File: full_reference_config.yaml
-# Version: 1.23.0
-# Last Updated: 2026-03-03 23:30 CET
+# Version: 1.24.0
+# Last Updated: 2026-03-09 16:00 CET
 # Description: sdproxy full reference configuration — Simple DNS Proxy.
 #              Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.24.0 - Added bootstrap_servers global option.
 #   1.23.0 - Added domain_policy section with IETF-reserved TLD examples.
 #   1.22.0 - Added cache.max_ttl option.
 #   1.21.0 - Added logging.log_queries option.
@@ -26,260 +27,144 @@ server:
   listen_doq: ["0.0.0.0:853"]   # DNS over QUIC — RFC 9250
 
   # Number of goroutines in the UDP worker pool.
-  # On constrained routers, match this to your expected peak concurrent queries.
-  # Excess queries are dropped (load shedding) when the pool is saturated.
   udp_workers: 10
 
   # TLS certificate and key for DoT, DoH, and DoQ listeners.
   # Leave both empty to auto-generate an ephemeral self-signed certificate.
-  # For production use, point these at a valid certificate (e.g. from Let's Encrypt).
   tls_cert: ""
   tls_key: ""
 
   # Hard memory ceiling for the Go runtime via debug.SetMemoryLimit.
-  # Without this, Go's GC has no knowledge of total device RAM and may allocate
-  # too aggressively on constrained hardware.
-  # Recommended: (total_device_ram_mb - 10). Examples:
-  #   22  — 32 MB router
-  #   54  — 64 MB router
-  #   118 — 128 MB router
-  # 0 = disabled (default — fine for full-size machines).
+  # 0 = disabled (default).
   memory_limit_mb: 0
 
   # Filter all AAAA (IPv6) queries by returning an empty NOERROR response.
-  # Useful on IPv4-only networks — prevents clients from stalling on AAAA
-  # timeouts before falling back to A records.
-  # false = disabled (default). true = all AAAA queries silently suppressed.
+  # false = disabled (default).
   filter_aaaa: false
 
   # Strict PTR validation — reject PTR queries that are not valid reverse-lookup
   # addresses. Valid forms: *.in-addr.arpa (IPv4) and *.ip6.arpa (IPv6).
-  # false = disabled (default). true = invalid PTR queries rejected with NXDOMAIN.
+  # false = disabled (default).
   strict_ptr: false
 
-  # CNAME flattening — collapse CNAME chains in A/AAAA responses into a single
-  # synthesized record directly under the original query name. Intermediate CNAME
-  # records are removed. TTL is set to the minimum across the entire chain.
-  # Applies to both live upstream responses and cache hits for consistent behaviour.
-  # No effect on non-A/AAAA queries, NXDOMAIN, or responses with no CNAMEs.
+  # CNAME flattening — collapse CNAME chains in A/AAAA responses.
   # false = disabled (default).
   flatten_cname: false
 
-  # Answer minimization — strip authority (NS) and additional sections from
-  # responses before sending to clients. Reduces response size and avoids leaking
-  # internal zone structure. Applies on top of the cached raw response, so the
-  # full Ns/Extra sections remain available in the cache for correct TTL calculation
-  # (e.g. SOA-based negative TTL). Transforms are applied on the way out to the
-  # client, not on the stored cache entry.
+  # Answer minimization — strip authority (NS) and additional sections.
   # false = disabled (default).
   minimize_answer: false
 
   # Discovery of Designated Resolvers (DDR) — RFC 9462.
   # When enabled, sdproxy intercepts _dns.resolver.arpa SVCB queries and
   # responds with SVCB records advertising its own encrypted DNS endpoints.
-  # Also spoofs A/AAAA lookups for the configured hostnames so clients can
-  # resolve them without hitting an upstream.
-  # Ports are derived automatically from the first configured listener address
-  # for each protocol (listen_doh -> DoH port, listen_dot -> DoT/DoQ port).
+  # Also spoofs A/AAAA/HTTPS lookups for the configured hostnames.
+  # When DISABLED, _dns.resolver.arpa queries and DDR hostname queries are
+  # forwarded to the upstream like any other query — no interception at all.
   ddr:
     enabled: true
     hostnames: ["dns.local.net", "doh.local.net"]
-    ipv4: ""
-    ipv6: ""
+    ipv4: ["192.168.1.1"]   # Leave empty to use the incoming interface address
+    ipv6: []
 
   # Staggered parallel upstream queries — eliminates "context deadline exceeded".
-  # When > 0 and an upstream group has multiple targets, queries are launched in
-  # parallel with this delay (ms) between them. First response wins; losers are
-  # canceled. A healthy upstream responds in 10-50ms, so the stagger almost never
-  # fires — but when the primary is down, the fallback starts after just this delay
-  # instead of waiting for the full 3-5s transport timeout.
-  #
-  # Health tracking (automatic): after 3 consecutive failures an upstream is marked
-  # unhealthy and the stagger delay is skipped entirely — the next upstream fires
-  # at t=0 alongside the sick one. One success resets the counter.
-  #
-  # 0 = sequential (default — one upstream at a time, fail-then-next).
-  # Recommended: 150 for groups with 2-3 upstreams on a home network.
-  # On very slow links (satellite, rural DSL), 300-500 avoids false positives.
+  # 0 = sequential (default). Recommended: 150 for 2-3 upstreams on a home network.
   upstream_stagger_ms: 150
+
+  # Global bootstrap DNS servers — plain UDP/TCP resolvers used to resolve
+  # upstream hostnames that have no per-URL bootstrap IPs (the #ip1,ip2 syntax).
+  #
+  # Format: bare IP address or IP:port. Only IP addresses are accepted here —
+  # no hostnames (chicken-and-egg). Port defaults to 53 when omitted.
+  #
+  # Resolution order:
+  #   1. Per-URL bootstrap IPs in the upstream URL  (e.g. "doh://host/path#1.1.1.1")
+  #      — always take precedence over global servers.
+  #   2. Global bootstrap_servers (this list) — used when no per-URL IPs are set
+  #      and the hostname is not already a bare IP.
+  #   3. OS resolver (fallback) — used when both of the above are absent.
+  #
+  # When bootstrap_servers is empty (default), upstreams without per-URL IPs
+  # must use bare IP addresses in their URLs, or rely on the OS resolver
+  # being functional at startup (which is not guaranteed on many routers).
+  #
+  # Typical home-router setup — point at your ISP or a well-known resolver:
+  #   bootstrap_servers: ["1.1.1.1", "9.9.9.9"]
+  #
+  # {client-name} is a LOCAL substitution — replaced at query time using ARP,
+  # DHCP leases, and hosts files. It is never resolved via DNS. What bootstrap
+  # servers resolve is the upstream SERVER hostname itself (e.g. *.controld.com),
+  # which maps to the same IPs regardless of the per-device prefix in front of it.
+  #
+  # For DoT/DoQ with {client-name} IN THE HOSTNAME: the hostname cannot be
+  # resolved at startup (it's still a template). Resolution happens lazily on
+  # the first query for each unique expanded hostname, using bootstrap_servers
+  # if configured, or the OS resolver as fallback. Results are cached for the
+  # process lifetime. Per-URL bootstrap IPs still take precedence and skip
+  # the lazy resolution entirely if you prefer explicit control.
+  bootstrap_servers: []
 
 logging:
   # Per-query logging — logs every DNS query with client IP, route, upstream, etc.
-  # log.Printf acquires a global mutex and runs fmt.Sprintf with reflection on
-  # every query across all UDP workers. At 500+ qps on a constrained router this
-  # becomes the dominant serialisation bottleneck.
-  # true  = log every query (default — good for debugging and small networks).
-  # false = suppress per-query lines; errors and startup messages still log.
-  # Omitting this key defaults to true.
+  # true  = log every query (default). false = suppress per-query lines.
   log_queries: true
 
-  # strip_time: true removes the date/time prefix from log lines.
-  # Useful when running under a supervisor (systemd, procd) that adds its own
-  # timestamps, avoiding duplicate timestamp output in logs.
+  # strip_time removes the date/time prefix from log lines. Useful under
+  # supervisors (systemd, procd) that add their own timestamps.
   strip_time: false
 
 # QUERY-TYPE POLICY
-# Maps specific DNS RR query types to an immediate RCODE — no cache lookup,
-# no identity check, no upstream forwarding. Fired at step 0 in ProcessDNS,
-# before AAAA filter, strict PTR, domain policy, DDR spoofing, local identity,
-# and routing.
-# Cost on the hot path: one map lookup on a uint16 key.
-#
-# Keys:   RR type names, case-insensitive.
-# Values: RCODE names, case-insensitive. NOERROR, FORMERR, SERVFAIL, NXDOMAIN,
-#         NOTIMP, REFUSED, …
-# Unknown type or RCODE names are logged as [WARN] and skipped at startup.
-#
-# Recommended hardening set for a home/office stub resolver:
+# Maps specific DNS RR query types to an immediate RCODE.
+# Fired at step 0 in ProcessDNS — before cache, identity, DDR, and upstream.
 rtype_policy:
-  ANY:   "REFUSED"   # RFC 8482 — amplification vector, no legitimate stub use
-  AXFR:  "REFUSED"   # Zone transfers make no sense on a forwarding resolver
+  ANY:   "REFUSED"   # RFC 8482 — amplification vector
+  AXFR:  "REFUSED"   # Zone transfers not valid on a forwarding resolver
   IXFR:  "REFUSED"   # Same rationale as AXFR
   HINFO: "NOTIMP"    # Historical record, no modern use case
 
 # DOMAIN POLICY
-# Maps domain suffixes to an immediate RCODE — no cache lookup, no upstream
-# forwarding. A single entry covers the apex AND all sub-domains:
-#   "example.com" blocks "example.com" and "anything.below.example.com"
-#   "onion"       blocks "onion"       and "anything.onion"
-#
-# Fired at step 0d in ProcessDNS — after qtype checks (rtype_policy, AAAA filter,
-# strict PTR) but before DDR spoofing, local identity, domain_routes, and the
-# upstream cache. Blocked names never touch the network or cache regardless of
-# any other configuration.
-#
-# Keys:   Domain suffixes, case-insensitive, trailing dot optional.
-# Values: RCODE names, case-insensitive. NXDOMAIN, REFUSED, NOTIMP, etc.
-# Unknown RCODE names are logged as [WARN] and skipped at startup.
-#
-# IMPORTANT: domain_policy fires BEFORE domain_routes and local identity. If you
-# route a zone internally (e.g. "lan" or "home.arpa" in domain_routes) do NOT
-# also add it here — it would be blocked before routing ever applies.
-#
-# The entries below cover IETF-reserved names that must never leak to a public
-# upstream. Adjust to taste — add ad-network roots, tracker domains, or any
-# other names you want to sink locally.
+# Maps domain suffixes to an immediate RCODE — no upstream forwarding.
+# A single entry covers the apex AND all sub-domains.
+# Fired at step 0d — after qtype checks but before DDR, identity, and routing.
+# IMPORTANT: domain_policy fires BEFORE domain_routes. Don't add zones here
+# that are also in domain_routes — the block wins and routing never fires.
 domain_policy:
-  # RFC 6761 §6.4 — "invalid." is guaranteed never to be delegated.
-  # Any query for *.invalid is definitionally a misconfiguration or a bug.
-  "invalid":      "NXDOMAIN"
-
-  # RFC 6761 §6.2 — "test." is reserved for local testing and must not be
-  # forwarded to the global DNS. Remove this entry if you use .test internally
-  # and resolve it via domain_routes or local identity instead.
-  "test":         "NXDOMAIN"
-
-  # RFC 2606 / RFC 6761 §6.5 — "example.", "example.com", "example.net", and
-  # "example.org" are IANA-reserved for documentation and examples. They have
-  # real delegations (IANA serves them) but forwarding queries for them wastes
-  # upstream capacity and leaks your users' browsing behaviour.
-  "example":      "NXDOMAIN"
-  "example.com":  "NXDOMAIN"
-  "example.net":  "NXDOMAIN"
-  "example.org":  "NXDOMAIN"
-
-  # RFC 7686 — ".onion" is reserved for Tor hidden services. Tor clients resolve
-  # .onion internally via the Tor daemon — queries must never reach a public
-  # resolver (it's a privacy leak and always returns NXDOMAIN upstream anyway).
-  "onion":        "NXDOMAIN"
-
-  # RFC 8375 — "home.arpa" is the designated zone for home-network use.
-  # Uncomment and change to REFUSED if you want to actively reject rather than
-  # silently drop, or remove entirely if you route home.arpa via domain_routes.
-  # "home.arpa":  "NXDOMAIN"
-
-  # Examples of custom blocks — uncomment or add your own:
-  # "doubleclick.net":   "NXDOMAIN"   # Google ad network
-  # "googlesyndication.com": "NXDOMAIN"
-  # "adnxs.com":         "NXDOMAIN"   # AppNexus / Xandr
-
-cache:
-  enabled: true
-
-  # Total number of DNS response entries to hold across all cache shards.
-  # Memory cost is approximately (size * avg_response_bytes) / shardCount.
-  # 1024 is suitable for a typical home network with ~50 active devices.
-  size: 1024
-
-  # min_ttl: floor applied to all cached response TTLs (seconds).
-  # Prevents thrashing for records with very short TTLs (< 60s).
-  # Also used as the fallback negative cache TTL when a response has no SOA
-  # (e.g. when the upstream strips the authority section itself).
-  min_ttl: 60
-
-  # max_ttl: ceiling applied to all cached response TTLs (seconds).
-  # Prevents stale data sitting in cache when upstreams advertise excessively
-  # long TTLs (some CDN records use 86400s or more). Applies uniformly to:
-  #   - Positive responses  (NOERROR with answer records)
-  #   - Negative responses  (NXDOMAIN — TTL derived from SOA or min_ttl fallback)
-  #   - Empty responses     (NOERROR/NODATA — no matching records for the type)
-  # The TTL ceiling is applied before any response transforms (flatten_cname,
-  # minimize_answer) run, so it is always calculated from the full upstream
-  # response including any SOA in the authority section.
-  # 0 = disabled (no ceiling — default). Must be >= min_ttl when non-zero.
-  # Recommended: 3600 (1 hour) for home networks; 300-900 for frequently
-  # changing environments or when you want tighter cache coherence.
-  max_ttl: 0
-
-# IDENTITY RESOLUTION
-# Extracts short hostnames from hosts files and dnsmasq lease files for two
-# purposes:
-#   1. {client-name} substitution in upstream URLs (e.g. ControlD per-device routing)
-#   2. Local A/AAAA/PTR resolution without forwarding to upstream
-#
-# Files are polled every poll_interval seconds. Each file is stat()'d first —
-# re-parsing only occurs when the modification time has changed.
-identity:
-  hosts_files: ["/etc/hosts"]
-  # Point at your dnsmasq lease file — location varies by platform:
-  #   OpenWrt:       /tmp/dhcp.leases
-  #   Pi-hole:       /etc/pihole/dhcp.leases
-  #   Generic Linux: /var/lib/misc/dnsmasq.leases
-  dnsmasq_leases: ["/tmp/dhcp.leases", "/var/lib/misc/dnsmasq.leases"]
-
-  # How often to check hosts and lease files for changes, in seconds.
-  # Each file is only stat()'d — actual I/O and map rebuilds only happen when
-  # the mtime changed, so short intervals are cheap on a quiet network.
-  # Default (0 or omitted): 30 seconds. Floor: 5 seconds.
-  poll_interval: 30
+  "onion":         "NXDOMAIN"   # RFC 7686 — Tor hidden services
+  "local":         "NXDOMAIN"   # RFC 6762 — mDNS (use domain_routes for LAN zones)
+  "localhost":     "NXDOMAIN"   # RFC 6761
+  "invalid":       "NXDOMAIN"   # RFC 6761
+  "example":       "NXDOMAIN"   # RFC 2606
+  "example.com":   "NXDOMAIN"   # RFC 2606
+  "example.net":   "NXDOMAIN"   # RFC 2606
+  "example.org":   "NXDOMAIN"   # RFC 2606
+  "test":          "NXDOMAIN"   # RFC 6761
 
 # UPSTREAM GROUPS
-# Each group is a named list of upstream resolvers tried in order until one
-# succeeds. The "default" group is required — all other groups are optional and
-# referenced by name from routes and domain_routes.
-#
-# TCP, DoT, and DoQ connections are reused across queries — one idle connection
-# is cached per upstream dial address. DoH/DoH3 reuse is handled by Go's
-# http.Transport (HTTP/2 multiplexing) and http3.Transport (QUIC).
+# The "default" group is required — all other groups are optional.
 #
 # PROTOCOL SCHEMES
-# ─────────────────────────────────────────────────────────────────────────────
-#
 #   udp://host:port   Plain DNS over UDP (RFC 1035). Default port: 53.
 #   tcp://host:port   Plain DNS over TCP (RFC 1035). Default port: 53.
 #   dot://host:port   DNS over TLS — RFC 7858. Default port: 853.
 #   doh://host/path   DNS over HTTPS/2 with HTTP/1.1 fallback — RFC 8484.
-#   doh3://host/path  DNS over HTTP/3 / QUIC. Same semantics as doh://.
+#   doh3://host/path  DNS over HTTP/3 / QUIC.
 #   doq://host:port   DNS over QUIC — RFC 9250. Default port: 853.
 #
-# BOOTSTRAP IPs  (appended after #, comma-separated)
-#   Bypasses DNS for the upstream hostname itself. Required for any upstream
-#   whose hostname is not a bare IP address.
+# PER-URL BOOTSTRAP IPs  (appended after #, comma-separated)
+#   Bypasses DNS for the upstream hostname itself. Always takes precedence
+#   over bootstrap_servers above. Required for {client-name} in hostnames.
 #   Syntax:  "scheme://host/path#ip1,ip2"
-#
-# {client-name} SUBSTITUTION
-#   Replaced at query time with the resolved short hostname of the requesting
-#   device. Resolution order: explicit route override -> MAC lookup -> IP lookup
-#   -> hyphenated MAC -> hyphenated IP.
-#   Syntax:  "doh://provider.com/{client-name}#bootstrap_ip"
 #
 # PRIVACY NOTE
 #   All outgoing queries have EDNS0 options stripped (removes ECS, cookies, etc.).
 #   Encrypted upstreams additionally get RFC 7830/8467 padding applied.
+#   UDP payload size is always normalised to 4096 bytes before forwarding.
 #
 upstreams:
   default:
     - "udp://1.1.1.1:53"
+    # Cloudflare DoH — hostname resolved via bootstrap_servers if configured,
+    # or via per-URL IPs if you prefer explicit control:
     - "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
   kids:
     - "tcp://1.1.1.3:53"
@@ -291,23 +176,34 @@ upstreams:
     - "udp://192.168.1.1:53"
 
 # MAC-BASED ROUTES
-# Maps a client MAC address to a specific upstream group and/or a fixed
-# {client-name} override. Takes priority over dynamic identity resolution.
 routes:
   "00:11:22:33:44:55":
     upstream: "kids"
     client_name: "kids-ipad-override"
 
 # DOMAIN-BASED ROUTES
-# Suffix matching — checked before the cache and upstream selection. If the
-# queried domain ends in any configured suffix it is routed to that upstream
-# group regardless of which client sent the query.
-#
-# NOTE: domain_policy is checked BEFORE domain_routes. Do not add zones here
-# that are also blocked in domain_policy — the block wins and routing never fires.
+# Suffix matching checked before cache and upstream selection.
+# NOTE: domain_policy is checked BEFORE domain_routes.
 domain_routes:
   "lan":           "local_network"
-  "local":         "local_network"
   "home.arpa":     "local_network"
   "corp.internal": "local_network"
+
+cache:
+  enabled:  true
+  size:     4096   # Maximum number of cached responses (LRU eviction)
+  min_ttl:  60     # Floor TTL in seconds — prevents hammering for short-lived records
+  max_ttl:  3600   # Ceiling TTL in seconds — 0 = unlimited
+
+identity:
+  # Hosts files to load for local A/AAAA/PTR resolution.
+  hosts_files:
+    - "/etc/hosts"
+
+  # dnsmasq lease files for DHCP client name resolution.
+  dnsmasq_leases:
+    - "/var/lib/misc/dnsmasq.leases"
+
+  # How often (seconds) to re-read identity files. 0 = once at startup only.
+  poll_interval: 60
 

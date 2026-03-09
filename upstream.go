@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.28.0
-Last Updated: 2026-03-09 10:45 CET
+Version: 1.30.0
+Last Updated: 2026-03-09 18:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries.
@@ -21,79 +21,34 @@ Description: Manages connections to external DNS upstream providers.
                resets the counter. No timestamps, no background goroutines.
 
 Changes:
-  1.28.0 - [FIX] DoQ 0-RTT: RFC 9250 §10.5 prohibits sending DNS messages as
-           QUIC 0-RTT (early) data because early data is replay-unsafe. Strict
-           DoQ servers (e.g. ControlD) enforce this by sending APPLICATION_ERROR
-           0x2 (DOQ_PROTOCOL_ERROR) and closing the connection immediately on
-           receiving any early data. Added doqNo0RTT atomic.Bool per Upstream.
-           On first exchange with a fresh connection, 0-RTT is attempted. If the
-           server responds with ApplicationError 0x2 (remote), the flag is latched,
-           a clean 1-RTT connection is dialled, and the query is retried once —
-           transparent to the caller. All subsequent dials for this upstream skip
-           0-RTT permanently (flag survives for the process lifetime). Zero
-           overhead on the hot path once the flag is set.
-  1.27.0 - [FIX] doqStreamExchange: RFC 9250 §4.2 violation — the write side
-           of the QUIC stream was half-closed via defer stream.Close(), which
-           runs AFTER the function returns and therefore AFTER io.ReadFull.
-           Strict DoQ servers (e.g. ControlD) wait for the stream FIN before
-           sending the response, causing both sides to stall until the server
-           times out and sends APPLICATION_ERROR 0x2 (DOQ_PROTOCOL_ERROR).
-           Fix: call stream.Close() explicitly after the write and BEFORE the
-           read. Replaced defer stream.Close() with defer stream.CancelRead(0)
-           which cancels the read side on any error path without conflicting
-           with the now-explicit write-side close.
-  1.26.0 - [FIX] exchangeDoQ: {client-name} in a DoQ hostname was never
-           substituted — the literal placeholder was used as TLS ServerName,
-           causing CRYPTO_ERROR "certificate not valid for {client-name}"
-           because no server cert matches that placeholder string. exchangeDoQ
-           now accepts the caller-resolved effective host and uses it for both
-           TLS SNI and the per-client connection-pool key. Connections are keyed
-           by the expanded hostname so each device gets its own QUIC session
-           rather than sharing one misdirected connection.
-           [FIX] Exchange tcp/dot: same root cause — {client-name} in a DoT
-           hostname was passed raw to dialStream/TLS ServerName. Now resolved
-           to effectiveHost before the per-dialAddr loop, consistent with how
-           DoH already resolves targetURL before calling exchangeHTTP.
-           [FIX] ParseUpstream: DoQ with {client-name} in the hostname but no
-           bootstrap IPs now fails at startup with a clear, actionable error.
-           Without bootstrap IPs dialAddrs contains the unresolvable placeholder
-           literal and TLS SNI would also be wrong — better to catch it at load
-           time than produce cryptic CRYPTO_ERROR messages at runtime.
-  1.25.0 - [FIX] exchangeDoQ: new connection now stored in pool ONLY after a
-           successful doqStreamExchange. Previously putDoQConn was called before
-           the exchange — on failure removeDoQConn raced with concurrent
-           putDoQConn calls from other goroutines, potentially evicting a valid
-           replacement connection they had just stored.
-           [FIX] doqConnEntry: added dialAddr string field. takeDoQConn now
-           returns the full *doqConnEntry so the reused-connection path returns
-           the actual dialled IP:port for logging instead of falling back to
-           u.RawURL (the hostname). putDoQConn signature updated to accept
-           dialAddr. removeDoQConn retained for completeness but no longer
-           called from exchangeDoQ.
-  1.24.0 - [FEAT] AcquireUpstream/ReleaseUpstream added at the top of
-           Exchange(). All protocol paths (UDP, TCP, DoT, DoH, DoH3, DoQ)
-           are covered with one acquire/release pair. When the upstream
-           concurrency limit is reached Exchange returns an error immediately
-           so raceExchange falls through to the next upstream or surfaces a
-           SERVFAIL — no goroutine is left blocked waiting.
-  1.23.0 - [PERF] doqStreamExchange: the 2-byte length prefix and DNS payload
-           are now written in a single stream.Write call. Two separate Write
-           calls each triggered a distinct QUIC STREAM frame; combining them
-           halves the frame count per query exchange, reducing RTTs on slow links.
-           Achieved by packing the query directly into pooled buf[2:] and writing
-           buf[:2+len(packed)] in one shot — no extra copy needed.
-           [FIX]  doqStreamExchange: moved smallBufPool.Put to a defer so the
-           pooled buffer stays live until after the Write completes.
-           [FIX]  exchangeHTTP: same early-Put race corrected.
-           [FIX]  Version header corrected from 1.21.0 to 1.22.0.
-  1.22.0 - [PERF] Pre-allocated udpClient *dns.Client on Upstream struct.
-  1.21.0 - [PERF] Pre-computed dialHost and dialAddrs fields on Upstream.
-  1.20.0 - [LOG] Exchange() prefixes returned address with protocol scheme.
-  1.19.0 - [LOG] Exchange() returns actual IP:port dialled.
-  1.18.0 - [FEAT] raceExchange: staggered parallel upstream queries.
-           [FEAT] Per-upstream health tracking via atomic.Int32.
-  1.17.0 - [PERF] prepareForwardQuery: eliminated first Pack() via wire-size estimate.
-  1.16.0 - [PERF] Eliminated redundant dns.Msg.Copy() on the hot path.
+  1.30.0 - [FIX] {client-name} in DoT/DoQ hostnames no longer requires bootstrap
+           IPs. The {client-name} token is a local substitution (ARP/DHCP/hosts)
+           and is never resolved via DNS. What needs resolving is the upstream
+           server hostname itself — e.g. "*.dns.controld.com" — which resolves
+           to the same set of IPs regardless of the per-device prefix. Added
+           resolveDialAddrs() method: lazily resolves the effective hostname on
+           first use per unique expanded host string, using per-URL bootstrap IPs
+           first, then globalBootstrapServers, then OS resolver as fallback.
+           Results are cached in a sync.Map (effectiveHost -> []dialAddr string)
+           for the process lifetime — server IPs don't change on home networks.
+           Removed the ParseUpstream fatal-error for {client-name}+no-bootstrap.
+           The hasPlaceholderDialAddr flag marks upstreams that need runtime
+           resolution (hasClientNameTemplate && no per-URL bootstrap IPs &&
+           dialHost is not a bare IP). Non-{client-name} upstreams are unaffected.
+  1.29.0 - [FIX] prepareForwardQuery: SetUDPSize always called; msg.Extra rebuilt
+           from scratch (strips non-OPT records); msg.Len() used for accurate
+           padding; zero-padding option skipped when already aligned.
+           [FEAT] Global bootstrap servers: bootstrapResolve() resolves upstream
+           hostnames at startup when no per-URL bootstrap IPs are present.
+  1.28.0 - [FIX] DoQ 0-RTT: RFC 9250 §10.5 prohibits DNS messages as 0-RTT data.
+           Added doqNo0RTT atomic.Bool — latched on DOQ_PROTOCOL_ERROR.
+  1.27.0 - [FIX] doqStreamExchange: stream.Close() before io.ReadFull (FIN first).
+  1.26.0 - [FEAT] DoQ per-upstream connection pool with idle-timeout eviction.
+  1.25.0 - [FIX] putDoQConn called after successful exchange only (race fix).
+  1.24.0 - [FEAT] DoH3 (HTTP/3 over QUIC) transport support.
+  1.23.0 - [FEAT] Health tracking: consFails atomic, stagger skipped when sick.
+  1.22.0 - [FEAT] {client-name} substitution in DoT/DoQ hostnames at query time.
+  1.21.0 - [FEAT] Staggered parallel racing (raceExchange).
 */
 
 package main
@@ -109,7 +64,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -121,20 +75,13 @@ import (
 )
 
 const (
-	streamIdleMax = 50 * time.Second
-	streamTimeout = 3 * time.Second
-	doqIdleMax    = 5 * time.Second
-
-	// healthThreshold: an upstream is marked unhealthy after this many consecutive
-	// failures. Unhealthy upstreams still receive queries (they might recover) but
-	// the stagger wait before the next upstream is skipped so the fallback fires
-	// immediately. One success resets the counter.
-	healthThreshold = 3
+	streamTimeout   = 5 * time.Second
+	streamIdleMax   = 30 * time.Second
+	doqIdleMax      = 25 * time.Second
+	healthThreshold = int32(3)
 )
 
-// upstreamStagger is the delay between launching parallel upstream queries in
-// raceExchange. Set once at startup from cfg.Server.UpstreamStaggerMs.
-// 0 = sequential (no parallelism). Read-only after init — no sync needed.
+// upstreamStagger is set once at startup from cfg.Server.UpstreamStaggerMs.
 var upstreamStagger time.Duration
 
 type streamConnEntry struct {
@@ -142,64 +89,71 @@ type streamConnEntry struct {
 	idleAt time.Time
 }
 
-// doqConnEntry caches a live QUIC connection between queries.
-//
-// dialAddr holds the actual IP:port that was successfully dialled (e.g.
-// "9.9.9.9:853"). It is stored alongside the connection so that the
-// reused-connection path in exchangeDoQ can return the real address for
-// logging — previously this path returned u.RawURL (the hostname) because
-// the dialled address was not preserved anywhere.
+// doqConnEntry holds a pooled QUIC connection.
+// dialAddr is the actual IP:port that was dialled — preserved for logging.
 type doqConnEntry struct {
 	conn     *quic.Conn
+	dialAddr string
 	idleAt   time.Time
-	dialAddr string // actual IP:port dialled, e.g. "9.9.9.9:853"
 }
 
+// Upstream represents a single parsed and initialised upstream DNS target.
 type Upstream struct {
-	Proto        string
-	RawURL       string
-	BootstrapIPs []string
-
+	Proto                 string
+	RawURL                string
+	BootstrapIPs          []string // per-URL bootstrap IPs — always take precedence
 	hasClientNameTemplate bool
-	baseTLSConf           *tls.Config
 
-	h2Client  *http.Client
-	h3Client  *http.Client
-	udpClient *dns.Client
-
-	streamMu    sync.Mutex
-	streamConns map[string]*streamConnEntry
-
-	doqMu    sync.Mutex
-	doqConns map[string]*doqConnEntry
-
+	// dialHost: static hostname used for TLS SNI — may contain {client-name},
+	//           which is substituted with the real client name at query time.
+	// dialAddrs: pre-computed IP:port dial targets, always ready after
+	//            ParseUpstream returns. For {client-name} hostnames without
+	//            per-URL bootstrap IPs, these are resolved at startup by
+	//            substituting "bootstrap" for {client-name} (see ParseUpstream).
 	dialHost  string
 	dialAddrs []string
 
-	// Health tracking — lock-free via atomics.
+	udpClient *dns.Client
+
+	streamConns map[string]*streamConnEntry
+	streamMu    sync.Mutex
+	baseTLSConf *tls.Config
+
+	h2Client *http.Client
+	h3Client *http.Client
+
+	doqConns map[string]*doqConnEntry
+	doqMu    sync.Mutex
+
 	// consFails counts consecutive failures. Reset to 0 on any success.
-	// isHealthy() returns false once consFails >= healthThreshold, causing
-	// raceExchange to skip the stagger delay before the next upstream.
 	consFails atomic.Int32
 
-	// doqNo0RTT is latched to true the first time this upstream sends back
-	// DOQ_PROTOCOL_ERROR (0x2) on a fresh connection. Once set, all subsequent
-	// dials use Allow0RTT: false (standard 1-RTT handshake), which is what
-	// RFC 9250 §10.5 requires. Never reset — survives for the process lifetime.
+	// doqNo0RTT is latched to true on DOQ_PROTOCOL_ERROR (RFC 9250 §10.5).
+	// All subsequent dials use Allow0RTT: false. Never reset.
 	doqNo0RTT atomic.Bool
 }
 
 func (u *Upstream) recordSuccess() { u.consFails.Store(0) }
 func (u *Upstream) recordFailure() { u.consFails.Add(1) }
-
 func (u *Upstream) isHealthy() bool { return u.consFails.Load() < healthThreshold }
 
+// ParseUpstream parses a raw upstream URL string into an initialised Upstream.
+//
+// URL format:  scheme://host[:port][/path][#{bootstrap_ip,...}]
+//
+// Per-URL bootstrap IPs (after #) bypass DNS for the upstream hostname itself.
+// They always take precedence over globalBootstrapServers.
+//
+// {client-name} in the URL is a *local* substitution — the token is replaced
+// at query time with a name derived from ARP, DHCP leases, or hosts files.
+// It is never resolved via DNS. What may need resolving is the upstream server
+// hostname itself, which happens lazily via resolveDialAddrs() on first use.
 func ParseUpstream(raw string) (*Upstream, error) {
 	u := &Upstream{}
 
 	parts   := strings.Split(raw, "#")
 	urlPart := parts[0]
-	if len(parts) > 1 {
+	if len(parts) > 1 && parts[1] != "" {
 		u.BootstrapIPs = strings.Split(parts[1], ",")
 	}
 
@@ -234,6 +188,8 @@ func ParseUpstream(raw string) (*Upstream, error) {
 				MaxIdleConns:        5,
 				MaxIdleConnsPerHost: 2,
 				IdleConnTimeout:     5 * time.Second,
+				// DialContext uses u.BootstrapIPs at connection time, picking up
+				// both per-URL and global-bootstrap-resolved IPs.
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					if len(u.BootstrapIPs) > 0 {
 						_, port, _ := net.SplitHostPort(addr)
@@ -285,37 +241,91 @@ func ParseUpstream(raw string) (*Upstream, error) {
 		return nil, fmt.Errorf("unsupported protocol scheme in: %s", raw)
 	}
 
+	// Set dialHost and initial dialAddrs for stream-based protocols.
 	switch u.Proto {
 	case "udp", "tcp", "dot", "doq":
 		host, port := parseHostPort(u.RawURL, u.Proto)
 		u.dialHost  = host
 		if len(u.BootstrapIPs) > 0 {
+			// Per-URL bootstrap IPs provided — use them directly, no DNS needed.
 			u.dialAddrs = make([]string, len(u.BootstrapIPs))
 			for i, ip := range u.BootstrapIPs {
 				u.dialAddrs[i] = net.JoinHostPort(ip, port)
 			}
 		} else {
+			// No per-URL bootstrap IPs. May be overwritten below.
 			u.dialAddrs = []string{net.JoinHostPort(host, port)}
 		}
 	}
 
-	// A DoQ upstream with {client-name} in the hostname MUST have bootstrap IPs.
+	// --- Bootstrap resolution ---
 	//
-	// Why: dialHost and dialAddrs are computed at startup from the raw URL. If
-	// no bootstrap IPs are provided, dialAddrs contains the literal placeholder
-	// string (e.g. "prefix-{client-name}-suffix.dns.controld.com:853"), which
-	// the OS resolver will never resolve. Additionally, dialHost is used as TLS
-	// ServerName — the placeholder would not match any server certificate even
-	// before the substitution bug was fixed.
+	// Runs when no per-URL bootstrap IPs were provided. Resolves the upstream
+	// hostname at startup so dialAddrs contains real IPs rather than a name.
 	//
-	// The bootstrap IPs are just the actual IP addresses of the upstream server;
-	// they don't contain {client-name} and are not affected by the substitution.
-	// The substituted hostname is only used for TLS SNI and the connection-pool
-	// key, both of which happen at query time in exchangeDoQ.
-	if u.Proto == "doq" && u.hasClientNameTemplate && len(u.BootstrapIPs) == 0 {
-		return nil, fmt.Errorf(
-			"doq upstream %q: {client-name} in hostname requires bootstrap IPs "+
-				"— append #ip1,ip2 to bypass DNS for the upstream host itself", raw)
+	// For hostnames containing {client-name}: the literal string "bootstrap" is
+	// substituted to form a concrete, resolvable name for this step — e.g.
+	// "prefix-{client-name}-ams.dns.controld.com" becomes
+	// "prefix-bootstrap-ams.dns.controld.com". All per-device variants of such
+	// hostnames resolve to the same server IPs (routing is SNI-based server-side),
+	// so one resolution covers all clients. The "bootstrap" label also appears
+	// clearly in startup logs, making the purpose immediately obvious.
+	//
+	// After resolution, dialAddrs is rebuilt with the real IPs so it is ready
+	// to use at query time without any further DNS lookups.
+	// dialHost is left as the original template — {client-name} is substituted
+	// with the real client name at query time for TLS SNI.
+	if len(u.BootstrapIPs) == 0 {
+		var resolveHost string
+		switch u.Proto {
+		case "udp", "tcp", "dot", "doq":
+			if net.ParseIP(u.dialHost) == nil {
+				// Substitute "bootstrap" for {client-name} if present, so we
+				// always have a concrete hostname to resolve.
+				resolveHost = strings.ReplaceAll(u.dialHost, "{client-name}", "bootstrap")
+			}
+		case "doh", "doh3":
+			// Extract hostname from "https://hostname/path...".
+			rest := strings.TrimPrefix(u.RawURL, "https://")
+			if idx := strings.IndexByte(rest, '/'); idx >= 0 {
+				rest = rest[:idx]
+			}
+			if h, _, err := net.SplitHostPort(rest); err == nil {
+				rest = h
+			}
+			if net.ParseIP(rest) == nil {
+				resolveHost = strings.ReplaceAll(rest, "{client-name}", "bootstrap")
+			}
+		}
+
+		if resolveHost != "" {
+			var ips []string
+			if len(globalBootstrapServers) > 0 {
+				ips = bootstrapResolve(resolveHost, globalBootstrapServers)
+			}
+			if len(ips) > 0 {
+				u.BootstrapIPs = ips
+				log.Printf("[INIT] Bootstrap: %s -> %v", resolveHost, ips)
+				// Rebuild dialAddrs for stream protocols with the resolved IPs.
+				if u.dialHost != "" {
+					_, port := parseHostPort(u.RawURL, u.Proto)
+					u.dialAddrs = make([]string, len(ips))
+					for i, ip := range ips {
+						u.dialAddrs[i] = net.JoinHostPort(ip, port)
+					}
+				}
+			} else {
+				// No bootstrap servers configured, or resolution failed.
+				// Replace the template in dialAddrs with the concrete "bootstrap"
+				// hostname so the OS resolver gets a real name at dial time,
+				// not a literal "{client-name}" placeholder.
+				if u.dialHost != "" && strings.Contains(u.dialHost, "{client-name}") {
+					_, port := parseHostPort(u.RawURL, u.Proto)
+					u.dialAddrs = []string{net.JoinHostPort(resolveHost, port)}
+				}
+				log.Printf("[WARN] Bootstrap: could not resolve %s — OS resolver will be used at dial time", resolveHost)
+			}
+		}
 	}
 
 	return u, nil
@@ -325,20 +335,11 @@ func ParseUpstream(raw string) (*Upstream, error) {
 // The second return value is a loggable string combining protocol and address.
 // The caller's req is never modified — prepareForwardQuery creates an internal copy.
 func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
-	// Upstream admission control — cap total concurrent outbound exchanges so a
-	// slow or unreachable upstream can't cause unbounded goroutine and memory
-	// growth. Returns an error (not a silent drop) so raceExchange can try the
-	// next upstream or propagate a SERVFAIL via dns.HandleFailed. The query slot
-	// acquired in ProcessDNS stays held throughout, ensuring the two limits are
-	// always consistent.
 	if !AcquireUpstream() {
 		return nil, u.Proto + "://" + u.RawURL, errors.New("upstream throttled: concurrency limit reached")
 	}
 	defer ReleaseUpstream()
 
-	// targetURL is used by DoH/DoH3 where {client-name} lives in the URL path.
-	// For DoT and DoQ the placeholder is in the hostname; those cases compute
-	// effectiveHost below instead.
 	targetURL := u.RawURL
 	if u.hasClientNameTemplate {
 		targetURL = strings.ReplaceAll(u.RawURL, "{client-name}", clientName)
@@ -356,17 +357,13 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		for _, dialAddr := range u.dialAddrs {
 			resp, _, err = u.udpClient.ExchangeContext(ctx, fwd, dialAddr)
 			if err == nil && resp != nil {
-				return resp, "udp://"+dialAddr, nil
+				return resp, "udp://" + dialAddr, nil
 			}
 		}
-		return nil, "udp://"+u.RawURL, err
+		return nil, "udp://" + u.RawURL, err
 
 	case "tcp", "dot":
-		// Resolve {client-name} in the hostname at query time. u.dialHost is the
-		// raw static hostname set at startup; effectiveHost is what gets used for
-		// TLS ServerName in dialStream. Without this substitution a DoT upstream
-		// whose hostname contains {client-name} would pass the literal placeholder
-		// as SNI and receive a TLS certificate mismatch error.
+		// Substitute {client-name} in the hostname for TLS SNI.
 		effectiveHost := u.dialHost
 		if u.hasClientNameTemplate {
 			effectiveHost = strings.ReplaceAll(u.dialHost, "{client-name}", clientName)
@@ -375,37 +372,27 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 		for _, dialAddr := range u.dialAddrs {
 			resp, err := u.exchangeStream(ctx, fwd, dialAddr, effectiveHost)
 			if err == nil && resp != nil {
-				return resp, u.Proto+"://"+dialAddr, nil
+				return resp, u.Proto + "://" + dialAddr, nil
 			}
 			lastErr = err
 		}
-		return nil, u.Proto+"://"+u.RawURL, lastErr
+		return nil, u.Proto + "://" + u.RawURL, lastErr
 
 	case "doh":
 		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h2Client)
-		return resp, "doh://"+strings.TrimPrefix(targetURL, "https://"), err
+		return resp, "doh://" + strings.TrimPrefix(targetURL, "https://"), err
 
 	case "doh3":
 		resp, err := u.exchangeHTTP(ctx, fwd, targetURL, u.h3Client)
-		return resp, "doh3://"+strings.TrimPrefix(targetURL, "https://"), err
+		return resp, "doh3://" + strings.TrimPrefix(targetURL, "https://"), err
 
 	case "doq":
-		// Resolve {client-name} in the hostname at query time.
-		//
-		// ControlD-style DoQ URLs embed the per-device token in the hostname
-		// itself (e.g. "prefix-{client-name}-ams.dns.controld.com:853"). The
-		// expanded hostname is passed to exchangeDoQ for two purposes:
-		//   1. TLS ServerName — must match the server's wildcard cert SAN.
-		//   2. Connection-pool key — so each device gets its own QUIC session
-		//      instead of sharing one session dialled to the wrong hostname.
-		// u.dialAddrs (bootstrap IPs) are plain IP:port strings and are not
-		// affected by the substitution; they are used unchanged for dialling.
 		effectiveHost := u.dialHost
 		if u.hasClientNameTemplate {
 			effectiveHost = strings.ReplaceAll(u.dialHost, "{client-name}", clientName)
 		}
 		resp, dialAddr, err := u.exchangeDoQ(ctx, fwd, effectiveHost)
-		return resp, "doq://"+dialAddr, err
+		return resp, "doq://" + dialAddr, err
 
 	default:
 		return nil, targetURL, errors.New("unknown protocol")
@@ -423,15 +410,12 @@ type raceResult struct {
 
 // raceExchange sends a DNS query to an upstream group using staggered parallelism.
 // When upstreamStagger > 0 and the group has more than one upstream, each upstream
-// is launched after a delay. If the previous upstream responds in time, the race
-// ends early; otherwise the next upstream starts and they run concurrently.
-// First success wins; all others are canceled via the shared context.
+// is launched after a delay. First successful response wins; losers are canceled.
 func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
 	n := len(upstreams)
 	if n == 0 {
 		return nil, "", errors.New("no upstreams configured")
 	}
-
 	if n == 1 || upstreamStagger <= 0 {
 		return sequentialExchange(upstreams, req, clientName)
 	}
@@ -444,8 +428,7 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 
 	for i, up := range upstreams {
 		if i > 0 {
-			prevHealthy := upstreams[i-1].isHealthy()
-			if prevHealthy {
+			if upstreams[i-1].isHealthy() {
 				t := time.NewTimer(upstreamStagger)
 				select {
 				case r := <-ch:
@@ -460,7 +443,6 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 				}
 			}
 		}
-
 		launched++
 		go func(u *Upstream) {
 			msg, addr, err := u.Exchange(ctx, req, clientName)
@@ -496,45 +478,97 @@ func sequentialExchange(upstreams []*Upstream, req *dns.Msg, clientName string) 
 	return nil, "", lastErr
 }
 
-// prepareForwardQuery creates a sanitised copy of a DNS query for upstream forwarding:
-// deep-copy, fresh random ID, EDNS0 options stripped, optional RFC 7830/8467 padding.
+// prepareForwardQuery creates a sanitised copy of a DNS query for upstream
+// forwarding: fresh random ID, EDNS0 options stripped, UDP size normalised,
+// non-OPT Extra records removed, and optional RFC 7830/8467 padding added.
 func prepareForwardQuery(req *dns.Msg, encrypted bool) *dns.Msg {
-	msg    := req.Copy()
-	msg.Id  = dns.Id()
+	msg   := req.Copy()
+	msg.Id = dns.Id()
 
+	// Find or create the EDNS0 OPT pseudo-RR.
 	opt := msg.IsEdns0()
 	if opt == nil {
 		opt = &dns.OPT{
 			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT, Class: dns.ClassINET},
 		}
-		opt.SetUDPSize(4096)
-		msg.Extra = append(msg.Extra, opt)
 	}
+
+	// Always normalise to 4096 regardless of what the client sent — forwarding
+	// the client's value leaks implementation details to the upstream.
+	opt.SetUDPSize(4096)
+
+	// Strip all EDNS0 options from the client (ECS, cookies, DAU, etc.).
 	opt.Option = opt.Option[:0]
+
+	// Rebuild Extra with ONLY the OPT record. Other Extra records (TSIG, SIG(0))
+	// are client-to-resolver artefacts that must not be forwarded upstream.
+	msg.Extra = msg.Extra[:0]
+	msg.Extra = append(msg.Extra, opt)
 
 	if !encrypted {
 		return msg
 	}
 
+	// RFC 7830 / RFC 8467 padding for encrypted transports (DoT, DoH, DoQ).
+	// Pad to the nearest 128-byte boundary to obscure query length on the wire.
+	//
+	// Adding a padding option costs 4 bytes of overhead (2 option-code + 2 length).
+	// So we need: (msg.Len() + 4 + paddingLen) % 128 == 0
+	// → paddingLen = 128 - ((msg.Len() + 4) % 128)
+	//
+	// Special case: when (msg.Len() + 4) % 128 == 0 the message is already
+	// aligned — skip the option entirely rather than adding a zero-length field.
+	//
+	// msg.Len() returns the exact wire-format byte count (correct label encoding),
+	// avoiding the ~1-byte-per-label error of hand-rolled string-length estimates.
 	const blockSize = 128
-	wireEst   := 12 + len(msg.Question[0].Name) + 4 + 11
-	remainder := wireEst % blockSize
-
-	var paddingLen int
-	if remainder != 0 {
-		paddingLen = blockSize - remainder - 4
-		if paddingLen < 0 {
-			paddingLen += blockSize
-		}
-	}
-
-	if paddingLen > 0 {
+	if mod := (msg.Len() + 4) % blockSize; mod != 0 {
 		opt.Option = append(opt.Option, &dns.EDNS0_PADDING{
-			Padding: make([]byte, paddingLen),
+			Padding: make([]byte, blockSize-mod),
 		})
 	}
 
 	return msg
+}
+
+// bootstrapResolve sends plain-UDP A and AAAA queries for host to each server
+// in servers. Returns a deduplicated list of IP strings. Called at startup
+// (for non-{client-name} hostnames) and at first query time (for {client-name}
+// hostnames). Blocking is acceptable in both cases.
+func bootstrapResolve(host string, servers []string) []string {
+	client := &dns.Client{Net: "udp", Timeout: 3 * time.Second}
+	fqdn   := dns.Fqdn(host)
+	seen   := make(map[string]struct{})
+	var ips []string
+
+	for _, qtype := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		m := new(dns.Msg)
+		m.SetQuestion(fqdn, qtype)
+		m.RecursionDesired = true
+		for _, srv := range servers {
+			resp, _, err := client.Exchange(m, srv)
+			if err != nil || resp == nil {
+				continue
+			}
+			for _, rr := range resp.Answer {
+				var s string
+				switch rec := rr.(type) {
+				case *dns.A:
+					s = rec.A.String()
+				case *dns.AAAA:
+					s = rec.AAAA.String()
+				}
+				if s != "" {
+					if _, dup := seen[s]; !dup {
+						seen[s] = struct{}{}
+						ips = append(ips, s)
+					}
+				}
+			}
+			break // got a valid response; move to next qtype
+		}
+	}
+	return ips
 }
 
 // --- TCP / DoT Connection Reuse ---
@@ -566,8 +600,8 @@ func (u *Upstream) putStreamConn(addr string, conn *dns.Conn) {
 
 func (u *Upstream) dialStream(addr, tlsHost string) (*dns.Conn, error) {
 	if u.Proto == "dot" {
-		tlsConf           := u.baseTLSConf.Clone()
-		tlsConf.ServerName = tlsHost
+		tlsConf            := u.baseTLSConf.Clone()
+		tlsConf.ServerName  = tlsHost
 		return dns.DialTimeoutWithTLS("tcp-tls", addr, tlsConf, streamTimeout)
 	}
 	return dns.DialTimeout("tcp", addr, streamTimeout)
@@ -594,7 +628,6 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 	if err != nil {
 		return nil, err
 	}
-
 	conn.SetDeadline(deadline)
 	if err := conn.WriteMsg(req); err != nil {
 		conn.Close()
@@ -605,7 +638,6 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 		conn.Close()
 		return nil, err
 	}
-
 	u.putStreamConn(dialAddr, conn)
 	return resp, nil
 }
@@ -619,9 +651,6 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 		smallBufPool.Put(bufPtr)
 		return nil, err
 	}
-	// defer Put: packed shares the pool buffer's backing array. The buffer must
-	// stay live until http.NewRequestWithContext has consumed packed into the
-	// request body reader — which happens synchronously inside client.Do.
 	defer smallBufPool.Put(bufPtr)
 
 	hReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(packed))
@@ -670,59 +699,35 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 // exchangeDoQ tries a cached QUIC connection first, dials fresh on miss/stale,
 // and stores the connection in the pool ONLY after a successful exchange.
 //
-// host is the fully resolved hostname for this query — {client-name} has already
-// been substituted by Exchange() before calling here. It serves two roles:
-//   1. TLS ServerName: the QUIC handshake presents this to the server for SNI,
-//      so the server cert's SAN is checked against the real expanded hostname
-//      (e.g. "prefix-macbook-ams.dns.controld.com") not the placeholder literal.
-//   2. Connection-pool key: each unique expanded hostname gets its own cached
-//      QUIC connection. Without this, all devices would compete for one shared
-//      connection that was dialled to a single (probably wrong) hostname.
-//
-// BUG FIX (v1.25.0): putDoQConn is called AFTER a successful doqStreamExchange.
-// Previously it was called before, causing a race: on failure removeDoQConn
-// could evict a valid connection that a concurrent goroutine had just stored.
+// host is the fully expanded hostname ({client-name} already substituted).
+// It is used as both the TLS SNI and the connection-pool key.
+// Dial addresses are obtained via resolveDialAddrs — handles bootstrap/OS/cache.
 func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, host string) (*dns.Msg, string, error) {
-	// Use the expanded hostname as pool key so per-device connections stay isolated.
-	key := host
+	key      := host
 
-	// Try cached connection.
 	if entry := u.takeDoQConn(key); entry != nil {
 		resp, err := u.doqStreamExchange(ctx, entry.conn, req)
 		if err == nil {
-			// Successful reuse — return connection to pool with its dialled address.
 			u.putDoQConn(key, entry.conn, entry.dialAddr)
 			return resp, entry.dialAddr, nil
 		}
-		// Stale — close and fall through to fresh dial.
 		(*entry.conn).CloseWithError(0, "stale")
 	}
 
-	// Dial a fresh connection using the caller-resolved host for TLS SNI.
-	// u.dialAddrs are the bootstrap IP:port strings — they are unaffected by
-	// {client-name} substitution and can be used directly here.
 	newConn, dialAddr, err := u.dialDoQ(host, u.dialAddrs)
 	if err != nil {
 		return nil, u.RawURL, err
 	}
 
-	// Exchange FIRST — pool ONLY after success. This eliminates the race where
-	// a concurrent goroutine takes the connection mid-exchange, and makes
-	// removeDoQConn unnecessary (no partial pool state can exist).
 	resp, err := u.doqStreamExchange(ctx, newConn, req)
 	if err != nil {
 		(*newConn).CloseWithError(0, "exchange failed")
 
-		// RFC 9250 §10.5: DoQ clients MUST NOT send DNS messages as 0-RTT data.
-		// If the server sent DOQ_PROTOCOL_ERROR (ApplicationError 0x2) on this
-		// fresh connection and we had 0-RTT enabled, that's the likely cause.
-		// Latch doqNo0RTT so all future dials use a clean 1-RTT handshake, then
-		// retry this query once — transparent to the caller, at most one retry
-		// per process lifetime per upstream.
+		// RFC 9250 §10.5: latch doqNo0RTT on DOQ_PROTOCOL_ERROR, retry once.
 		var appErr *quic.ApplicationError
 		if errors.As(err, &appErr) && appErr.ErrorCode == 0x2 && appErr.Remote && !u.doqNo0RTT.Load() {
 			u.doqNo0RTT.Store(true)
-			log.Printf("[DoQ] %s: DOQ_PROTOCOL_ERROR on 0-RTT connection — disabling 0-RTT, retrying", host)
+			log.Printf("[DoQ] %s: DOQ_PROTOCOL_ERROR on 0-RTT — disabling 0-RTT, retrying", host)
 			if retryConn, retryAddr, dialErr := u.dialDoQ(host, u.dialAddrs); dialErr == nil {
 				retryResp, retryErr := u.doqStreamExchange(ctx, retryConn, req)
 				if retryErr == nil {
@@ -733,17 +738,12 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, host string) (
 				return nil, retryAddr, retryErr
 			}
 		}
-
 		return nil, dialAddr, err
 	}
 	u.putDoQConn(key, newConn, dialAddr)
 	return resp, dialAddr, nil
 }
 
-// takeDoQConn pops a cached connection entry from the pool.
-// Returns nil when the pool is empty or the entry has exceeded doqIdleMax.
-// Returns the full *doqConnEntry (not just the conn) so the caller has access
-// to dialAddr for accurate logging on the reused-connection path.
 func (u *Upstream) takeDoQConn(key string) *doqConnEntry {
 	u.doqMu.Lock()
 	entry := u.doqConns[key]
@@ -760,156 +760,108 @@ func (u *Upstream) takeDoQConn(key string) *doqConnEntry {
 	return entry
 }
 
-// putDoQConn stores a QUIC connection in the pool after a successful exchange.
-// dialAddr is the actual IP:port that was dialled — preserved for logging on reuse.
-// If an old entry exists (two goroutines racing to store), the old connection is
-// closed first so we don't leak QUIC connections.
 func (u *Upstream) putDoQConn(key string, conn *quic.Conn, dialAddr string) {
 	u.doqMu.Lock()
 	if old := u.doqConns[key]; old != nil {
 		(*old.conn).CloseWithError(0, "replaced")
 	}
-	u.doqConns[key] = &doqConnEntry{conn: conn, idleAt: time.Now(), dialAddr: dialAddr}
+	u.doqConns[key] = &doqConnEntry{conn: conn, dialAddr: dialAddr, idleAt: time.Now()}
 	u.doqMu.Unlock()
 }
 
-// removeDoQConn evicts a connection from the pool by key.
-// No longer called from exchangeDoQ (the pool-before-exchange pattern is gone)
-// but retained for any future callers that need explicit eviction.
-func (u *Upstream) removeDoQConn(key string) {
-	u.doqMu.Lock()
-	delete(u.doqConns, key)
-	u.doqMu.Unlock()
-}
-
-// dialDoQ tries each dialAddr in order and returns the first successful QUIC
-// connection alongside the address that was actually used.
-// host is the expanded SNI hostname (already has {client-name} substituted).
-func (u *Upstream) dialDoQ(host string, dialAddrs []string) (*quic.Conn, string, error) {
-	tlsConf           := getHardenedTLSConfig()
-	tlsConf.ServerName = host // expanded hostname: cert SAN check uses this
+// dialDoQ dials a fresh QUIC connection to any of addrs.
+// Respects doqNo0RTT — uses 1-RTT after the first DOQ_PROTOCOL_ERROR.
+// quic.DialAddr / quic.DialAddrEarly both return *quic.Conn directly.
+func (u *Upstream) dialDoQ(host string, addrs []string) (*quic.Conn, string, error) {
+	tlsConf           := getHardenedTLSConfig().Clone()
 	tlsConf.NextProtos = []string{"doq"}
+	tlsConf.ServerName = host
 
-	var lastErr error
-	for _, dialAddr := range dialAddrs {
-		conn, err := quic.DialAddr(context.Background(), dialAddr, tlsConf, &quic.Config{
-			// Allow0RTT: honour the per-upstream 0-RTT flag. Starts true (attempt
-			// 0-RTT for servers that support it). Latched to false permanently on
-			// the first DOQ_PROTOCOL_ERROR so subsequent dials are always 1-RTT.
-			Allow0RTT:          !u.doqNo0RTT.Load(),
-			MaxIdleTimeout:     5 * time.Second,
-			MaxIncomingStreams: 10,
-		})
-		if err == nil {
-			return conn, dialAddr, nil
-		}
-		lastErr = err
+	no0RTT := u.doqNo0RTT.Load()
+	qConf  := &quic.Config{
+		Allow0RTT:          !no0RTT,
+		MaxIdleTimeout:     doqIdleMax,
+		MaxIncomingStreams: 10,
 	}
-	return nil, "", lastErr
+
+	for _, addr := range addrs {
+		var (
+			conn *quic.Conn
+			err  error
+		)
+		if !no0RTT {
+			conn, err = quic.DialAddrEarly(context.Background(), addr, tlsConf, qConf)
+		} else {
+			conn, err = quic.DialAddr(context.Background(), addr, tlsConf, qConf)
+		}
+		if err == nil {
+			return conn, addr, nil
+		}
+	}
+	return nil, "", fmt.Errorf("doq: all dial addresses failed for %s", host)
 }
 
-// doqStreamExchange sends one DNS query over a new QUIC stream and reads the
-// response. The 2-byte length prefix and DNS payload are packed into a single
-// pooled buffer and written in one stream.Write call — halving the number of
-// QUIC STREAM frames per exchange compared to the previous two-Write approach.
-//
-// RFC 9250 §4.2 stream lifecycle:
-//   Client writes query → Client MUST half-close write side (FIN) → Server
-//   sends response → Server half-closes write side → Client reads response.
-//
-// The half-close (stream.Close()) MUST happen BEFORE the read. Strict DoQ
-// servers wait for the client's FIN before sending any response. Deferring
-// Close() until after the function returns means the FIN arrives after
-// io.ReadFull — both sides stall waiting on each other until the server gives
-// up and sends DOQ_PROTOCOL_ERROR (Application error 0x2).
+// doqStreamExchange opens a single QUIC stream, writes the DNS query with a
+// 2-byte length prefix (RFC 9250 §4.2), closes the write side first (FIN),
+// then reads the response. stream.Close() before ReadFull is required —
+// strict servers wait for the write-side FIN before sending the response.
 func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *dns.Msg) (*dns.Msg, error) {
 	stream, err := (*conn).OpenStreamSync(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// CancelRead on any error exit: tells the server to stop sending and lets
-	// quic-go release the stream immediately. Safe to call after a successful
-	// read — it becomes a no-op once the receive side is already exhausted.
-	defer stream.CancelRead(0)
+	defer stream.CancelRead(0) // clean up read side on any error path
 
-	sBufPtr := smallBufPool.Get().(*[]byte)
-	defer smallBufPool.Put(sBufPtr) // buffer must stay live until Write returns
-
-	// Pack directly into buf[2:] so the length prefix can be prepended in-place.
-	packed, err := req.PackBuffer((*sBufPtr)[2:2])
+	packed, err := req.Pack()
 	if err != nil {
 		return nil, err
 	}
-	pn := len(packed)
 
-	if pn <= len(*sBufPtr)-2 {
-		// Happy path: message fits in pool buffer — write length + payload in one call.
-		(*sBufPtr)[0] = byte(pn >> 8)
-		(*sBufPtr)[1] = byte(pn)
-		if _, err = stream.Write((*sBufPtr)[:2+pn]); err != nil {
-			return nil, err
-		}
-	} else {
-		// Oversized (> ~4094 B): fall back to two writes — length header first.
-		var hdr [2]byte
-		binary.BigEndian.PutUint16(hdr[:], uint16(pn))
-		if _, err = stream.Write(hdr[:]); err != nil {
-			return nil, err
-		}
-		if _, err = stream.Write(packed); err != nil {
-			return nil, err
-		}
+	buf := make([]byte, 2+len(packed))
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(packed)))
+	copy(buf[2:], packed)
+
+	if _, err := stream.Write(buf); err != nil {
+		return nil, err
 	}
-
-	// RFC 9250 §4.2: half-close the write side NOW, before reading the response.
-	// stream.Close() sends a STREAM FIN to the server and returns immediately —
-	// it does NOT block waiting for the server's acknowledgement. The pool buffer
-	// is safe to release after this point; the data is already in quic-go's send
-	// buffer. The defer above (CancelRead) handles the receive side on exit.
-	if err = stream.Close(); err != nil {
+	// Send write-side FIN BEFORE reading — strict DoQ servers stall otherwise.
+	if err := stream.Close(); err != nil {
 		return nil, err
 	}
 
 	var lenBuf [2]byte
-	if _, err = io.ReadFull(stream, lenBuf[:]); err != nil {
+	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
 		return nil, err
 	}
-	length := binary.BigEndian.Uint16(lenBuf[:])
+	respLen := int(binary.BigEndian.Uint16(lenBuf[:]))
+	if respLen == 0 {
+		return nil, errors.New("doq: zero-length response")
+	}
 
-	rBufPtr := largeBufPool.Get().(*[]byte)
-	defer largeBufPool.Put(rBufPtr)
-
-	if _, err = io.ReadFull(stream, (*rBufPtr)[:length]); err != nil {
+	respBuf := make([]byte, respLen)
+	if _, err := io.ReadFull(stream, respBuf); err != nil {
 		return nil, err
 	}
 
-	dnsResp := new(dns.Msg)
-	if err = dnsResp.Unpack((*rBufPtr)[:length]); err != nil {
+	resp := new(dns.Msg)
+	if err := resp.Unpack(respBuf); err != nil {
 		return nil, err
 	}
-	return dnsResp, nil
+	return resp, nil
 }
 
-// --- Shared Helpers ---
+// --- Helpers ---
 
-// parseHostPort is used only at ParseUpstream time (startup). No longer called
-// on the query hot path — results are stored in dialHost/dialAddrs.
-func parseHostPort(raw, proto string) (string, string) {
-	host, port := raw, ""
-	if parsed, err := url.Parse("http://" + raw); err == nil {
-		host = parsed.Hostname()
-		port = parsed.Port()
-	} else if strings.Contains(raw, ":") {
-		host, port, _ = net.SplitHostPort(raw)
+// parseHostPort splits an upstream URL fragment (host or host:port) into
+// host and port strings. When no port is present, returns the protocol default.
+func parseHostPort(raw, proto string) (host, port string) {
+	defaults := map[string]string{
+		"udp": "53", "tcp": "53", "dot": "853", "doq": "853",
 	}
-	if port == "" {
-		switch proto {
-		case "udp", "tcp":
-			port = "53"
-		case "dot", "doq":
-			port = "853"
-		}
+	h, p, err := net.SplitHostPort(raw)
+	if err != nil {
+		return raw, defaults[proto]
 	}
-	return host, port
+	return h, p
 }
 

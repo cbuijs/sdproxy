@@ -1,33 +1,31 @@
 /*
 File: main.go
-Version: 1.27.0
-Last Updated: 2026-03-05 19:00 CET
+Version: 1.28.0
+Last Updated: 2026-03-09 16:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.28.0 - [FEAT] Global bootstrap servers: added BootstrapServers []string to
+           the Server config struct (yaml: "bootstrap_servers"). Parsed at startup
+           into globalBootstrapServers []string, normalising bare IPs to "ip:53".
+           Used by ParseUpstream in upstream.go when no per-URL bootstrap IPs are
+           present. When empty, bootstrapping is disabled for upstreams without
+           per-URL IPs (those must use bare IPs in the URL, existing behaviour).
   1.27.0 - [FEAT] InitThrottle() called after InitIdentity(). Derives initial
            query and upstream concurrency limits from udp_workers and starts
            the 500 ms AIMD pressure monitor. No new config keys needed.
   1.26.1 - [FEAT] Pre-pack policy RCODE response templates for zero-alloc
            policy fast-paths.
-  1.25.0 - [FEAT] domain_policy config section: maps domain suffixes (and all
-           their sub-domains) to an immediate RCODE. Parsed into domainPolicy
-           map[string]int at startup. Hot-path gated via hasDomainPolicy bool.
-           Processed in ProcessDNS at new step 0d — before DDR, local identity,
-           domain_routes, and the cache.
+  1.25.0 - [FEAT] domain_policy config section: maps domain suffixes to RCODE.
   1.24.0 - [FEAT] block_obsolete_qtypes config flag.
-  1.23.0 - [FEAT] Cache.MaxTTL config field — caps cached response TTLs.
+  1.23.0 - [FEAT] Cache.MaxTTL config field.
   1.22.0 - [FEAT] DDR.IPv4/IPv6 changed to []string for multiple addresses.
   1.21.0 - [PERF] Four feature-presence flags set at startup for hot-path gating.
   1.20.0 - [PERF] Route index table: upstream group names mapped to uint8 indices.
   1.19.0 - [FEAT] RType Policy config section.
   1.18.0 - [PERF] logging.log_queries config option.
-  1.17.0 - [FEAT] identity.poll_interval config field.
-  1.16.0 - [FIX]  DDR SVCB port numbers derived from first configured listener.
-  1.15.0 - [PERF] Tiered buffer pools (smallBufPool 4KB, largeBufPool 64KB).
-  1.14.0 - Added DomainRoutes initialisation, DDR spoofing, TLS auto-generation.
 */
 
 package main
@@ -64,6 +62,7 @@ type RouteConfig struct {
 }
 
 // Config is the structured representation of config.yaml.
+// All fields have yaml tags matching the config file keys.
 type Config struct {
 	Server struct {
 		ListenUDP  []string `yaml:"listen_udp"`
@@ -84,8 +83,7 @@ type Config struct {
 
 		// BlockObsoleteQtypes injects all obsolete/unassigned/reserved RR types
 		// into rtypePolicy with NOTIMP at startup, and enables a runtime check
-		// for completely unrecognised type numbers (IANA unassigned gaps). See
-		// the obsoleteQtypes map for the full list with RFC citations.
+		// for completely unrecognised type numbers (IANA unassigned gaps).
 		BlockObsoleteQtypes bool `yaml:"block_obsolete_qtypes"`
 
 		DDR struct {
@@ -96,6 +94,14 @@ type Config struct {
 		} `yaml:"ddr"`
 
 		UpstreamStaggerMs int `yaml:"upstream_stagger_ms"`
+
+		// BootstrapServers is an optional list of plain-DNS servers (IP or IP:port,
+		// UDP only) used to resolve upstream hostnames that have no per-URL
+		// bootstrap IPs. Entries without a port default to :53.
+		// Per-URL bootstrap IPs always take precedence over these global servers.
+		// When empty, upstreams with hostnames (not bare IPs) and no per-URL
+		// bootstrap IPs fall back to the OS resolver at connection time.
+		BootstrapServers []string `yaml:"bootstrap_servers"`
 	} `yaml:"server"`
 
 	Logging struct {
@@ -131,39 +137,14 @@ type ParsedRoute struct {
 }
 
 // obsoleteQtypes maps IANA RR type numbers to a short label for every type that
-// is obsolete, withdrawn, experimental-and-never-standardised, or IANA-reserved
-// with no published specification.
+// is obsolete, withdrawn, experimental-and-never-standardised, or reserved.
 var obsoleteQtypes = map[uint16]string{
-	3:   "MD",
-	4:   "MF",
-	7:   "MB",
-	8:   "MG",
-	9:   "MR",
-	10:  "NULL",
-	11:  "WKS",
-	14:  "MINFO",
-	19:  "X25",
-	20:  "ISDN",
-	21:  "RT",
-	22:  "NSAP",
-	23:  "NSAP-PTR",
-	24:  "SIG",
-	25:  "KEY",
-	26:  "PX",
-	27:  "GPOS",
-	30:  "NXT",
-	31:  "EID",
-	32:  "NIMLOC",
-	34:  "ATMA",
-	38:  "A6",
-	40:  "SINK",
-	99:  "SPF",
-	100: "UINFO",
-	101: "UID",
-	102: "GID",
-	103: "UNSPEC",
-	253: "MAILB",
-	254: "MAILA",
+	3: "MD", 4: "MF", 7: "MB", 8: "MG", 9: "MR", 10: "NULL",
+	11: "WKS", 14: "MINFO", 19: "X25", 20: "ISDN", 21: "RT",
+	22: "NSAP", 23: "NSAP-PTR", 24: "SIG", 25: "KEY", 26: "PX",
+	27: "GPOS", 30: "NXT", 31: "EID", 32: "NIMLOC", 34: "ATMA",
+	38: "A6", 40: "SINK", 99: "SPF", 100: "UINFO", 101: "UID",
+	102: "GID", 103: "UNSPEC", 253: "MAILB", 254: "MAILA",
 }
 
 var (
@@ -191,6 +172,11 @@ var (
 	hasDomainPolicy       bool
 	hasClientNameUpstream bool
 	blockUnknownQtypes    bool
+
+	// globalBootstrapServers is populated from cfg.Server.BootstrapServers at
+	// startup. Entries are normalised to "ip:port" form (default port 53).
+	// Declared here (main.go) and read by upstream.go (same package).
+	globalBootstrapServers []string
 )
 
 // Tiered buffer pools — shared by server.go and upstream.go.
@@ -205,7 +191,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.27.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.28.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -247,6 +233,42 @@ func main() {
 		log.Printf("[BOOT] Upstream stagger: %s (parallel racing enabled)", upstreamStagger)
 	} else {
 		log.Println("[BOOT] Upstream stagger: 0 (sequential mode)")
+	}
+
+	// --- Global bootstrap servers ---
+	// Normalise each entry to "ip:port" (default port 53 for plain DNS).
+	// These are used by ParseUpstream when an upstream hostname has no per-URL
+	// bootstrap IPs — resolved once at startup, not at query time.
+	for _, s := range cfg.Server.BootstrapServers {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		// Validate: must be a bare IP or IP:port — no hostnames allowed here.
+		host, port, splitErr := net.SplitHostPort(s)
+		if splitErr != nil {
+			// No port present — treat the whole string as a bare IP.
+			if net.ParseIP(s) == nil {
+				log.Printf("[WARN] bootstrap_servers: %q is not a valid IP address — skipped", s)
+				continue
+			}
+			globalBootstrapServers = append(globalBootstrapServers, net.JoinHostPort(s, "53"))
+		} else {
+			if net.ParseIP(host) == nil {
+				log.Printf("[WARN] bootstrap_servers: %q — host part is not a valid IP address — skipped", s)
+				continue
+			}
+			if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+				log.Printf("[WARN] bootstrap_servers: %q — invalid port — skipped", s)
+				continue
+			}
+			globalBootstrapServers = append(globalBootstrapServers, s)
+		}
+	}
+	if len(globalBootstrapServers) > 0 {
+		log.Printf("[INIT] Global bootstrap servers: %v", globalBootstrapServers)
+	} else {
+		log.Println("[INIT] Global bootstrap servers: none — upstreams with hostname URLs require per-URL bootstrap IPs (#ip)")
 	}
 
 	// 1. MAC-based routes
@@ -318,7 +340,6 @@ func main() {
 
 		log.Printf("[INIT] DDR enabled for %d hostname(s), DoH port: %d, DoT/DoQ port: %d",
 			len(ddrHostnames), ddrDoHPort, ddrDoTPort)
-
 		if len(ddrIPv4) == 0 {
 			log.Println("[INIT] DDR IPv4: none configured — will use incoming query interface address")
 		} else {
@@ -329,9 +350,12 @@ func main() {
 		} else {
 			log.Printf("[INIT] DDR IPv6: %v", ddrIPv6)
 		}
+	} else {
+		log.Println("[INIT] DDR disabled — _dns.resolver.arpa queries forwarded to upstream")
 	}
 
-	// 4. Upstream connections
+	// 4. Upstream connections — ParseUpstream now uses globalBootstrapServers
+	//    for hostnames that have no per-URL bootstrap IPs.
 	routeUpstreams = make(map[string][]*Upstream)
 	for groupName, urls := range cfg.Upstreams {
 		var group []*Upstream
@@ -400,11 +424,10 @@ outer:
 	// 6. Obsolete qtype blocking
 	if cfg.Server.BlockObsoleteQtypes {
 		added := 0
-		for qtype, label := range obsoleteQtypes {
+		for qtype := range obsoleteQtypes {
 			if _, userSet := rtypePolicy[qtype]; !userSet {
 				rtypePolicy[qtype] = dns.RcodeNotImplemented
 				added++
-				_ = label
 			}
 		}
 		blockUnknownQtypes = true
@@ -450,7 +473,6 @@ outer:
 		}
 	}
 
-	// ARP polling is Linux-only and only useful when MAC-based routes are configured.
 	if hasMACRoutes {
 		InitARP()
 	} else {
@@ -458,10 +480,6 @@ outer:
 	}
 
 	InitIdentity()
-
-	// Adaptive admission control — self-calibrating AIMD throttle.
-	// Derives initial concurrency limits from udp_workers and monitors goroutine
-	// count + heap pressure every 500 ms. No configuration needed.
 	InitThrottle()
 
 	// 9. TLS
@@ -527,41 +545,46 @@ func setupTLS() *tls.Config {
 		}
 		log.Println("[TLS] Loaded provided certificates.")
 	} else {
-		log.Println("[TLS] No certificates provided — generating ephemeral self-signed cert...")
+		// Auto-generate an ephemeral self-signed certificate. Useful for local
+		// testing; for production use a real cert (e.g. from Let's Encrypt).
+		log.Println("[TLS] No cert/key configured — generating ephemeral self-signed certificate.")
 		cert, err = generateSelfSignedCert()
 		if err != nil {
 			log.Fatalf("[FATAL] Failed to generate self-signed cert: %v", err)
 		}
 	}
-	conf             := getHardenedTLSConfig()
-	conf.Certificates = []tls.Certificate{cert}
-	conf.NextProtos   = []string{"h3", "h2", "doq", "dot", "http/1.1"}
-	return conf
+
+	base := getHardenedTLSConfig()
+	base.Certificates = []tls.Certificate{cert}
+	// Advertise all supported ALPN tokens — the DoH listener clones this and
+	// restricts to HTTP-only tokens before binding.
+	base.NextProtos = []string{"h2", "http/1.1", "dot", "doq"}
+	return base
 }
 
 func generateSelfSignedCert() (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	tmpl := x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{Organization: []string{"sdproxy"}},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "sdproxy"},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
-	certPEM   := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	privBytes, _ := x509.MarshalECPrivateKey(priv)
-	keyPEM    := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM  := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	return tls.X509KeyPair(certPEM, keyPEM)
 }
 
