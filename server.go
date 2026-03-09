@@ -1,12 +1,21 @@
 /*
 File: server.go
-Version: 1.19.0
-Last Updated: 2026-03-08 14:00 CET
+Version: 1.20.0
+Last Updated: 2026-03-09 22:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
              targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.20.0 - [FIX] Bug 1: handleDoQConnection now takes quic.Connection (the interface
+           itself) instead of *quic.Connection (pointer-to-interface). In quic-go,
+           quic.Conn is a type alias for quic.Connection which is an interface —
+           storing/passing it as a pointer prevents method calls from compiling.
+           listener.Accept() already returned quic.Connection; the pointer was wrong.
+           [FIX] Bug 1: inner per-stream goroutine now takes quic.Stream (interface)
+           instead of *quic.Stream — same root cause, same fix.
+           [FIX] Bug 1: doqResponseWriter.stream is now quic.Stream (not *quic.Stream)
+           so Write/Close method calls on it compile and dispatch correctly.
   1.19.0 - [FIX] dohResponseWriter.WriteMsg: moved smallBufPool.Put to AFTER
            w.Write(packed). Previously the buffer was returned to the pool before
            the HTTP layer had finished reading the packed slice — which shares the
@@ -186,6 +195,8 @@ func StartServers(tlsConf *tls.Config) {
 			}
 			log.Printf("[LISTEN] DoQ on %s", addr)
 			for {
+				// listener.Accept returns quic.Connection (the interface) —
+				// pass it directly to handleDoQConnection, no pointer indirection.
 				conn, err := listener.Accept(context.Background())
 				if err != nil {
 					continue
@@ -288,7 +299,14 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host, localIP: localIP}, msg, host, proto)
 }
 
-func handleDoQConnection(conn *quic.Conn) {
+// handleDoQConnection handles all DNS streams on a single DoQ QUIC connection.
+//
+// BUG FIX (v1.20.0): parameter type changed from *quic.Conn to quic.Connection.
+// quic.Conn is a type alias for quic.Connection, which is an interface in quic-go.
+// Storing or passing an interface as a pointer (*interface) means no methods are
+// callable on the pointer receiver — this was a compile error. quic.Listener.Accept
+// already returns quic.Connection directly; the pointer was always wrong.
+func handleDoQConnection(conn quic.Connection) {
 	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
 	// Parse the local listener IP once per connection, stored as net.IP in
@@ -301,11 +319,15 @@ func handleDoQConnection(conn *quic.Conn) {
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
+			// Connection closed or reset — stop accepting streams.
 			return
 		}
-		go func(s *quic.Stream) {
+		// BUG FIX (v1.20.0): goroutine takes quic.Stream (interface), not *quic.Stream.
+		// quic.Stream is also an interface; pointer-to-interface has no methods.
+		go func(s quic.Stream) {
 			defer s.Close()
 
+			// RFC 9250 §4.2: each DoQ message is preceded by a 2-byte length.
 			var lenBuf [2]byte
 			if _, err := io.ReadFull(s, lenBuf[:]); err != nil {
 				return
@@ -376,8 +398,12 @@ func (dw *dohResponseWriter) Hijack()                     {}
 // localIP holds the listener interface address parsed once per QUIC connection in
 // handleDoQConnection and shared across all streams on that connection. Exposed via
 // LocalAddr() for the same DDR fallback purpose as dohResponseWriter.
+//
+// BUG FIX (v1.20.0): stream field changed from *quic.Stream to quic.Stream.
+// quic.Stream is an interface — pointer-to-interface has no methods, making
+// the Write/Close calls on it compile-fail. The interface value is correct.
 type doqResponseWriter struct {
-	stream   *quic.Stream
+	stream   quic.Stream // interface — NOT a pointer to it
 	remoteIP string
 	localIP  net.IP
 }

@@ -1,10 +1,16 @@
 # File: full_reference_config.yaml
-# Version: 1.24.0
-# Last Updated: 2026-03-09 16:00 CET
+# Version: 1.25.0
+# Last Updated: 2026-03-09 22:00 CET
 # Description: sdproxy full reference configuration — Simple DNS Proxy.
 #              Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.25.0 - [FIX] Bug 5: cache.size comment corrected from "LRU eviction" to
+#            "pseudo-random eviction". The actual eviction strategy in cache.go
+#            is a zero-allocation pseudo-random map-iteration delete (Go map
+#            iteration order is randomised). True LRU would require per-entry
+#            access-time tracking which was deliberately avoided to keep the
+#            cache allocation-free on the hot path.
 #   1.24.0 - Added bootstrap_servers global option.
 #   1.23.0 - Added domain_policy section with IETF-reserved TLD examples.
 #   1.22.0 - Added cache.max_ttl option.
@@ -15,7 +21,6 @@
 #   1.17.0 - Added filter_aaaa option.
 #   1.16.0 - Added memory_limit_mb option. DDR ports derived from listeners.
 #   1.15.0 - Added domain_routes section.
-#   1.14.0 - Added identity section.
 
 server:
   # Listener addresses. Multiple addresses supported per protocol.
@@ -54,6 +59,13 @@ server:
   # Answer minimization — strip authority (NS) and additional sections.
   # false = disabled (default).
   minimize_answer: false
+
+  # Block obsolete / unassigned / reserved DNS RR query types.
+  # When true: all IANA-obsolete types are injected into rtype_policy with
+  # NOTIMP at startup, and any completely unrecognised type number (IANA
+  # unassigned gaps) is also rejected with NOTIMP at query time.
+  # false = disabled (default).
+  block_obsolete_qtypes: false
 
   # Discovery of Designated Resolvers (DDR) — RFC 9462.
   # When enabled, sdproxy intercepts _dns.resolver.arpa SVCB queries and
@@ -126,8 +138,13 @@ rtype_policy:
 # Maps domain suffixes to an immediate RCODE — no upstream forwarding.
 # A single entry covers the apex AND all sub-domains.
 # Fired at step 0d — after qtype checks but before DDR, identity, and routing.
+#
 # IMPORTANT: domain_policy fires BEFORE domain_routes. Don't add zones here
 # that are also in domain_routes — the block wins and routing never fires.
+#
+# IMPORTANT: most-specific-wins semantics apply. If both "sub.example.com" and
+# "example.com" are configured, a query for sub.example.com will match the
+# sub.example.com entry and stop — the example.com entry is NOT applied.
 domain_policy:
   "onion":         "NXDOMAIN"   # RFC 7686 — Tor hidden services
   "local":         "NXDOMAIN"   # RFC 6762 — mDNS (use domain_routes for LAN zones)
@@ -191,7 +208,7 @@ domain_routes:
 
 cache:
   enabled:  true
-  size:     4096   # Maximum number of cached responses (LRU eviction)
+  size:     4096   # Maximum number of cached responses (pseudo-random eviction)
   min_ttl:  60     # Floor TTL in seconds — prevents hammering for short-lived records
   max_ttl:  3600   # Ceiling TTL in seconds — 0 = unlimited
 

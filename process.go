@@ -1,12 +1,22 @@
 /*
 File: process.go
-Version: 1.37.0
-Last Updated: 2026-03-09 20:00 CET
+Version: 1.38.0
+Last Updated: 2026-03-09 22:00 CET
 Description: Per-query DNS processing pipeline. Receives a parsed dns.Msg from
              server.go and routes it through policy checks, DDR spoofing, local
              identity, cache lookup, upstream forwarding, and response transforms.
 
 Changes:
+  1.38.0 - [FIX] Bug 2: walkDomainMaps now correctly applies most-specific-wins
+           semantics for domain_policy. Previously the policy block lacked the
+           && !policyBlocked guard that domainRoutes already had, so a parent-
+           domain entry would always silently overwrite a more specific child-
+           domain entry during the suffix walk. Example: if both "sub.blocked.com"
+           (NOERROR) and "blocked.com" (NXDOMAIN) were configured, a query for
+           sub.blocked.com would first match NOERROR but then continue walking
+           and overwrite with NXDOMAIN — the exact opposite of expected behaviour.
+           Fix: added && !policyBlocked guard to the inner policy check block,
+           matching the existing && !routeMatched guard on the routes check.
   1.37.0 - [FIX] DDR step 1a: _dns.resolver.arpa SVCB was always intercepted
            regardless of ddr.enabled. When disabled the handler wrote an empty
            SVCB response and returned — the query never reached the upstream.
@@ -129,21 +139,34 @@ func isValidReversePTR(name string) bool {
 
 // walkDomainMaps performs a single label-by-label suffix walk over qname,
 // checking both domainPolicy and domainRoutes simultaneously.
+//
+// Most-specific-wins semantics: once a match is found in either map, further
+// suffix iterations cannot overwrite it. This ensures "sub.example.com" config
+// takes precedence over a "example.com" config when both are present.
+//
+// BUG FIX (v1.38.0): added && !policyBlocked guard to the policy lookup block.
+// Previously the guard was missing — each suffix iteration unconditionally
+// overwrote policyRcode/policyBlocked, so the least-specific (widest) matching
+// entry always won, which is the exact opposite of expected behaviour.
+// The domainRoutes block already had && !routeMatched; policyBlocked now matches.
 func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUpstream string, routeMatched bool) {
 	search := qname
 	for {
-		if hasDomainPolicy {
+		// Only record the first (most specific) matching policy entry.
+		if hasDomainPolicy && !policyBlocked {
 			if rc, ok := domainPolicy[search]; ok {
 				policyRcode   = rc
 				policyBlocked = true
 			}
 		}
+		// Only record the first (most specific) matching route entry.
 		if hasDomainRoutes {
 			if up, ok := domainRoutes[search]; ok && !routeMatched {
 				routeUpstream = up
 				routeMatched  = true
 			}
 		}
+		// Early exit: both maps have been matched — no need to keep walking.
 		if policyBlocked && routeMatched {
 			return
 		}
