@@ -1,7 +1,7 @@
 /*
 File: upstream.go
-Version: 1.31.0
-Last Updated: 2026-03-09 22:00 CET
+Version: 1.31.1
+Last Updated: 2026-03-09 13:00 CET
 Description: Manages connections to external DNS upstream providers.
              Supports UDP, TCP, DoT, DoH (HTTP/2), DoH3 (QUIC/HTTP3), and DoQ.
              TCP and DoT connections are cached and reused across queries.
@@ -21,20 +21,12 @@ Description: Manages connections to external DNS upstream providers.
                resets the counter. No timestamps, no background goroutines.
 
 Changes:
-  1.31.0 - [FIX] Bug 1: All *quic.Conn and *quic.Stream (pointer-to-interface)
-           replaced with quic.Connection and quic.Stream (the interfaces directly).
-           Affected: doqConnEntry.conn, dialDoQ return type, putDoQConn signature,
-           doqStreamExchange conn parameter, http3.Transport Dial func return type
-           (quic.EarlyConnection), and all (*conn).Method() dereferences removed.
-           [FIX] Bug 3: sequentialExchange now accepts and threads a context.Context
-           so in-flight TCP/DoT/DoQ exchanges can be cancelled on shutdown or when
-           the caller's context is done. Previously hardcoded context.Background().
-           raceExchange creates a cancellable child ctx for the sequential path too.
-           [FIX] Bug 4: Exchange() now returns a descriptive error immediately when
-           dialAddrs is empty for address-based protocols (udp/tcp/dot/doq). Previously
-           the empty for-range loop fell through and returned (nil, addr, nil) — a nil
-           response with a nil error — masking hostname-resolution failures at startup
-           and producing SERVFAIL log lines with no diagnostic information.
+  1.31.1 - [FIX] quic-go compatibility: Refactored quic-go connection tracking to use
+           struct pointers (*quic.Conn). Interfaces such as quic.Connection and 
+           quic.EarlyConnection were removed in newer quic-go versions, causing
+           undefined compile errors. http3.Transport.Dial was also updated to return
+           the concrete *quic.Conn type correctly.
+  1.31.0 - (Superseded by 1.31.1)
   1.30.0 - [FIX] {client-name} in DoT/DoQ hostnames no longer requires bootstrap
            IPs. Added resolveDialAddrs() method: lazily resolves the effective hostname
            on first use per unique expanded host string, using per-URL bootstrap IPs
@@ -95,12 +87,8 @@ type streamConnEntry struct {
 
 // doqConnEntry holds a pooled QUIC connection.
 // dialAddr is the actual IP:port that was dialled — preserved for logging.
-//
-// BUG FIX (v1.31.0): conn is quic.Connection (the interface), not *quic.Connection.
-// In quic-go, quic.Conn = type alias for quic.Connection (interface). Storing it
-// as a pointer (*interface) meant CloseWithError and other methods were unreachable.
 type doqConnEntry struct {
-	conn     quic.Connection // interface — NOT a pointer to it
+	conn     *quic.Conn // Pointer to quic.Conn struct (quic-go v0.40+ removed interfaces)
 	dialAddr string
 	idleAt   time.Time
 }
@@ -213,10 +201,6 @@ func ParseUpstream(raw string) (*Upstream, error) {
 			},
 		}
 
-	// BUG FIX (v1.31.0): Dial func return type is quic.EarlyConnection, not *quic.Conn.
-	// quic.DialAddrEarly returns (quic.EarlyConnection, error); the old *quic.Conn
-	// (= *quic.Connection = pointer-to-interface) was a type mismatch that would
-	// fail to compile when the http3.Transport.Dial field signature is checked.
 	case strings.HasPrefix(urlPart, "doh3://"), strings.HasPrefix(urlPart, "h3://"):
 		u.Proto  = "doh3"
 		u.RawURL = "https://" + strings.TrimPrefix(strings.TrimPrefix(urlPart, "doh3://"), "h3://")
@@ -229,7 +213,7 @@ func ParseUpstream(raw string) (*Upstream, error) {
 					MaxIdleTimeout:     5 * time.Second,
 					MaxIncomingStreams: 10,
 				},
-				Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (quic.EarlyConnection, error) {
+				Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 					if len(u.BootstrapIPs) > 0 {
 						_, port, _ := net.SplitHostPort(addr)
 						for _, ip := range u.BootstrapIPs {
@@ -352,11 +336,9 @@ func (u *Upstream) Exchange(ctx context.Context, req *dns.Msg, clientName string
 	}
 	defer ReleaseUpstream()
 
-	// BUG FIX (v1.31.0): guard against empty dialAddrs for address-based protocols.
+	// Guard against empty dialAddrs for address-based protocols.
 	// An empty slice means hostname resolution failed at startup (no bootstrap IPs
-	// were configured and DNS was unreachable). The old code silently fell through
-	// the for-range loop and returned (nil, addr, nil) — a nil response with a nil
-	// error — masking the real problem and producing useless SERVFAIL log lines.
+	// were configured and DNS was unreachable).
 	switch u.Proto {
 	case "udp", "tcp", "dot", "doq":
 		if len(u.dialAddrs) == 0 {
@@ -442,8 +424,6 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 		return nil, "", errors.New("no upstreams configured")
 	}
 
-	// BUG FIX (v1.31.0): sequential path now also gets a cancellable context so
-	// in-flight exchanges can be stopped on shutdown or context expiry.
 	if n == 1 || upstreamStagger <= 0 {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -494,11 +474,6 @@ func raceExchange(upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.
 }
 
 // sequentialExchange tries upstreams one by one with no parallelism.
-//
-// BUG FIX (v1.31.0): now accepts a context.Context so the caller can cancel
-// in-flight exchanges on shutdown or when a deadline expires. Previously this
-// function hardcoded context.Background(), making cancellation impossible for
-// single-upstream groups and all traffic when upstream_stagger_ms is 0.
 func sequentialExchange(ctx context.Context, upstreams []*Upstream, req *dns.Msg, clientName string) (*dns.Msg, string, error) {
 	var lastErr error
 	for _, up := range upstreams {
@@ -746,8 +721,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, host string) (
 			u.putDoQConn(key, entry.conn, entry.dialAddr)
 			return resp, entry.dialAddr, nil
 		}
-		// BUG FIX (v1.31.0): entry.conn.CloseWithError — no dereference needed;
-		// conn is quic.Connection (interface), not *quic.Connection.
 		entry.conn.CloseWithError(0, "stale")
 	}
 
@@ -758,7 +731,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, host string) (
 
 	resp, err := u.doqStreamExchange(ctx, newConn, req)
 	if err != nil {
-		// BUG FIX (v1.31.0): same — direct method call, no dereference.
 		newConn.CloseWithError(0, "exchange failed")
 
 		// RFC 9250 §10.5: latch doqNo0RTT on DOQ_PROTOCOL_ERROR, retry once.
@@ -772,7 +744,6 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, host string) (
 					u.putDoQConn(key, retryConn, retryAddr)
 					return retryResp, retryAddr, nil
 				}
-				// BUG FIX (v1.31.0): same — direct method call.
 				retryConn.CloseWithError(0, "retry exchange failed")
 				return nil, retryAddr, retryErr
 			}
@@ -793,7 +764,6 @@ func (u *Upstream) takeDoQConn(key string) *doqConnEntry {
 		return nil
 	}
 	if time.Since(entry.idleAt) > doqIdleMax {
-		// BUG FIX (v1.31.0): direct method call — conn is quic.Connection.
 		entry.conn.CloseWithError(0, "idle timeout")
 		return nil
 	}
@@ -801,9 +771,7 @@ func (u *Upstream) takeDoQConn(key string) *doqConnEntry {
 }
 
 // putDoQConn stores a healthy connection back into the pool.
-//
-// BUG FIX (v1.31.0): conn parameter changed from *quic.Conn to quic.Connection.
-func (u *Upstream) putDoQConn(key string, conn quic.Connection, dialAddr string) {
+func (u *Upstream) putDoQConn(key string, conn *quic.Conn, dialAddr string) {
 	u.doqMu.Lock()
 	if old := u.doqConns[key]; old != nil {
 		old.conn.CloseWithError(0, "replaced")
@@ -814,11 +782,7 @@ func (u *Upstream) putDoQConn(key string, conn quic.Connection, dialAddr string)
 
 // dialDoQ dials a fresh QUIC connection to any of addrs.
 // Respects doqNo0RTT — uses 1-RTT after the first DOQ_PROTOCOL_ERROR.
-//
-// BUG FIX (v1.31.0): return type changed from *quic.Conn to quic.Connection.
-// quic.DialAddrEarly returns quic.EarlyConnection (which satisfies quic.Connection);
-// quic.DialAddr returns quic.Connection. Both are now assignable to the return type.
-func (u *Upstream) dialDoQ(host string, addrs []string) (quic.Connection, string, error) {
+func (u *Upstream) dialDoQ(host string, addrs []string) (*quic.Conn, string, error) {
 	tlsConf           := getHardenedTLSConfig().Clone()
 	tlsConf.NextProtos = []string{"doq"}
 	tlsConf.ServerName = host
@@ -832,7 +796,7 @@ func (u *Upstream) dialDoQ(host string, addrs []string) (quic.Connection, string
 
 	for _, addr := range addrs {
 		var (
-			conn quic.Connection // interface — no pointer
+			conn *quic.Conn
 			err  error
 		)
 		if !no0RTT {
@@ -851,11 +815,10 @@ func (u *Upstream) dialDoQ(host string, addrs []string) (quic.Connection, string
 // 2-byte length prefix (RFC 9250 §4.2), closes the write side first (FIN),
 // then reads the response. stream.Close() before ReadFull is required —
 // strict servers wait for the write-side FIN before sending the response.
-//
-// BUG FIX (v1.31.0): conn parameter changed from *quic.Conn to quic.Connection;
-// (*conn).OpenStreamSync(ctx) simplified to conn.OpenStreamSync(ctx).
-func (u *Upstream) doqStreamExchange(ctx context.Context, conn quic.Connection, req *dns.Msg) (*dns.Msg, error) {
-	stream, err := conn.OpenStreamSync(ctx) // BUG FIX: was (*conn).OpenStreamSync
+// In newer quic-go versions, interfaces were replaced with structs, so we pass
+// the concrete *quic.Conn pointer and call its methods directly.
+func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *dns.Msg) (*dns.Msg, error) {
+	stream, err := conn.OpenStreamSync(ctx) 
 	if err != nil {
 		return nil, err
 	}
