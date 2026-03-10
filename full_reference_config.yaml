@@ -1,16 +1,14 @@
 # File: full_reference_config.yaml
-# Version: 1.25.0
-# Last Updated: 2026-03-09 22:00 CET
+# Version: 1.26.0
+# Last Updated: 2026-03-10 12:00 CET
 # Description: sdproxy full reference configuration — Simple DNS Proxy.
 #              Every option is documented inline. No separate manual needed.
 #
 # Changes:
-#   1.25.0 - [FIX] Bug 5: cache.size comment corrected from "LRU eviction" to
-#            "pseudo-random eviction". The actual eviction strategy in cache.go
-#            is a zero-allocation pseudo-random map-iteration delete (Go map
-#            iteration order is randomised). True LRU would require per-entry
-#            access-time tracking which was deliberately avoided to keep the
-#            cache allocation-free on the hot path.
+#   1.26.0 - [FEAT] cache.negative_ttl: dedicated TTL floor for NXDOMAIN/NODATA.
+#            [FEAT] cache.stale_ttl: serve-stale window in seconds (RFC 8767).
+#   1.25.0 - [FIX] cache.size comment corrected from "LRU eviction" to
+#            "pseudo-random eviction".
 #   1.24.0 - Added bootstrap_servers global option.
 #   1.23.0 - Added domain_policy section with IETF-reserved TLD examples.
 #   1.22.0 - Added cache.max_ttl option.
@@ -20,7 +18,6 @@
 #   1.18.0 - Added strict_ptr option.
 #   1.17.0 - Added filter_aaaa option.
 #   1.16.0 - Added memory_limit_mb option. DDR ports derived from listeners.
-#   1.15.0 - Added domain_routes section.
 
 server:
   # Listener addresses. Multiple addresses supported per protocol.
@@ -99,9 +96,6 @@ server:
   # When bootstrap_servers is empty (default), upstreams without per-URL IPs
   # must use bare IP addresses in their URLs, or rely on the OS resolver
   # being functional at startup (which is not guaranteed on many routers).
-  #
-  # Typical home-router setup — point at your ISP or a well-known resolver:
-  #   bootstrap_servers: ["1.1.1.1", "9.9.9.9"]
   #
   # {client-name} is a LOCAL substitution — replaced at query time using ARP,
   # DHCP leases, and hosts files. It is never resolved via DNS. What bootstrap
@@ -207,10 +201,59 @@ domain_routes:
   "corp.internal": "local_network"
 
 cache:
-  enabled:  true
-  size:     4096   # Maximum number of cached responses (pseudo-random eviction)
-  min_ttl:  60     # Floor TTL in seconds — prevents hammering for short-lived records
-  max_ttl:  3600   # Ceiling TTL in seconds — 0 = unlimited
+  enabled: true
+
+  # Maximum number of cached responses across all shards.
+  # Pseudo-random eviction fires per-shard when the per-shard limit is reached.
+  # Reduce on routers with very little RAM; raise on routers with ≥64 MB.
+  size: 4096
+
+  # min_ttl — floor for POSITIVE responses (NOERROR with answer records).
+  # Prevents hammering the upstream for records with very short TTLs.
+  # Also used as the negative floor when negative_ttl is not set (see below).
+  min_ttl: 60
+
+  # max_ttl — ceiling for ALL responses. 0 = unlimited.
+  # Prevents stale data from sitting in cache forever for long-TTL records.
+  max_ttl: 3600
+
+  # negative_ttl — independent floor for NEGATIVE responses:
+  #   NXDOMAIN (name does not exist)
+  #   NOERROR/NODATA (name exists but no records of the queried type)
+  #
+  # When negative_ttl=0 (default), min_ttl is used for all response types —
+  # exactly the behaviour before v1.18.0. No config change needed to keep it.
+  #
+  # Setting negative_ttl lower than min_ttl lets you cache ad-blocker NXDOMAINs
+  # and mistyped names for a shorter time without reducing the floor for positive
+  # records. Example: min_ttl=60, negative_ttl=15 means:
+  #   • A google.com           cached ≥60 s
+  #   • NXDOMAIN gogle.com     cached ≥15 s (typo expires quickly)
+  #
+  # Note: max_ttl still applies as the ceiling for negative responses too.
+  negative_ttl: 0   # 0 = use min_ttl for negatives (backwards-compatible default)
+
+  # stale_ttl — serve-stale window in seconds past a record's TTL expiry (RFC 8767).
+  #
+  # When stale_ttl=0 (default), expired entries are treated as misses and the
+  # client waits for a fresh upstream response — unchanged behaviour from v1.17.0.
+  #
+  # When stale_ttl>0, an expired-but-still-within-window entry is served
+  # IMMEDIATELY with TTL=0 (the RFC 8767 stale signal) while a background goroutine
+  # silently refreshes the cache. For the client this means zero wait time on
+  # common repeated queries. The next query after revalidation completes gets
+  # a fresh TTL.
+  #
+  # Concurrent stale hits on the same entry are automatically coalesced via
+  # singleflight — only ONE background upstream call fires regardless of how many
+  # clients trigger the revalidation simultaneously.
+  #
+  # Recommended starting value for a home router: 300 (5 minutes). This keeps
+  # a smooth browsing experience when records expire mid-session.
+  #
+  # Note: stale_ttl extends the in-memory lifetime of entries. Budget roughly
+  # the same RAM as the main cache when setting this (it's bounded by cache.size).
+  stale_ttl: 0   # 0 = disabled (backwards-compatible default)
 
 identity:
   # Hosts files to load for local A/AAAA/PTR resolution.

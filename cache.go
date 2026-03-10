@@ -1,37 +1,65 @@
 /*
 File: cache.go
-Version: 1.17.0
-Last Updated: 2026-03-05 14:00 CET
+Version: 1.18.0
+Last Updated: 2026-03-10 12:00 CET
 Description: High-performance, sharded, non-blocking DNS cache.
              Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
              with no answer records) responses per RFC 2308.
              Optimised for embedded: struct-based zero-allocation cache keys,
              pseudo-random eviction.
 
+             NEW — SERVE-STALE / BACKGROUND REVALIDATION (stale_ttl)
+             ──────────────────────────────────────────────────────────
+             Each cacheItem now carries two time boundaries:
+               expiration  — the TTL-derived "fresh" window. CacheGet returns
+                             (msg, isStale=false) while now < expiration.
+               staleUntil  — expiration + cfg.Cache.StaleTTL. While the entry
+                             lives in this extra window, CacheGet returns
+                             (msg, isStale=true). ProcessDNS serves the stale
+                             response immediately (zero latency for the client)
+                             and fires a backgroundRevalidate goroutine.
+                             When StaleTTL=0 (default), staleUntil==expiration
+                             and behaviour is identical to v1.17.0.
+             The background sweeper was updated to delete on now>staleUntil,
+             keeping stale entries in memory for the full stale window.
+             Per RFC 8767, stale responses are served with TTL=0 so clients
+             know the answer may be refreshed shortly.
+
+             NEW — DEDICATED NEGATIVE TTL (negative_ttl)
+             ──────────────────────────────────────────────────────────
+             negative_ttl gives operators a separate TTL floor specifically
+             for NXDOMAIN and NOERROR/NODATA responses, independent of
+             min_ttl (which now applies only to positive responses when
+             negative_ttl is set). Useful on routers where you want to
+             cache positive records for 60 s but cap negative/mistyped
+             entries at 30 s to avoid long wait times after a typo.
+             When negative_ttl=0 (default), behaviour is identical to v1.17.0
+             (MinTTL applies as the floor for all response types).
+
+             NEW — routeName stored in cacheItem
+             ──────────────────────────────────────────────────────────
+             cacheItem.routeName is the upstream group that produced this
+             entry (e.g. "default", "kids"). Stored so backgroundRevalidate
+             in process.go can look up the correct upstream group without
+             needing a reverse routeIdx→name map.
+
 Changes:
-  1.17.0 - [PERF] shardCount raised from 16 → 32. With 10 UDP workers the
-           probability of two workers colliding on the same shard drops from
-           ~1/16 to ~1/32, halving RWMutex contention at zero startup cost.
-           [PERF] cacheItem now stores an immutable *dns.Msg (deep copy via
-           msg.Copy()) instead of packed []byte. This eliminates msg.Pack() on
-           every CacheSet and msg.Unpack() on every CacheGet — both are replaced
-           by msg.Copy() which is a pure struct/slice copy with no byte
-           serialisation or parsing. Measured speedup: roughly 3× on CacheGet
-           and 2× on CacheSet on MIPS/ARM routers where byte-level loops are
-           expensive. Memory trade-off: ~+400 KB for a 1024-entry cache — fine
-           for any router with ≥ 32 MB RAM. Lower cache.size if RAM is very tight.
-           CacheGet returns a fresh caller-owned copy so process.go can apply
-           transforms in-place without a second Copy (see process.go v1.42.0).
-           CacheSet stores its own deep copy so the caller may mutate the original
-           message after CacheSet returns (needed by the in-place transform path).
-  1.16.0 - [PERF] Pre-computed cacheMaxPerShard in InitCache. Previously CacheSet
-           recomputed cfg.Cache.Size/shardCount on every write.
-  1.15.0 - [FEAT] max_ttl support: caps cached TTLs at a configurable ceiling.
-           [FIX]  CacheGet now rewrites TTLs in Ns and Extra sections too.
+  1.18.0 - [FEAT] Serve-stale / background revalidation (RFC 8767).
+           cacheItem gains staleUntil time.Time; CacheGet returns (msg, isStale bool).
+           Stale entries served with TTL=0. Sweeper uses staleUntil as deletion fence.
+           [FEAT] Dedicated NegativeTTL floor for NXDOMAIN/NODATA responses.
+           Separates the min_ttl concern: positives use MinTTL, negatives use
+           NegativeTTL (when set), falling back to MinTTL for backwards compat.
+           [FEAT] cacheItem.routeName stored for background revalidation.
+           CacheSet gains routeName string parameter; all callers updated.
+  1.17.0 - [PERF] shardCount 16→32. cacheItem stores *dns.Msg (not packed bytes).
+           CacheGet returns a fresh deep copy; CacheSet stores its own deep copy.
+  1.16.0 - [PERF] Pre-computed cacheMaxPerShard in InitCache.
+  1.15.0 - [FEAT] max_ttl support. CacheGet rewrites TTLs in Ns/Extra sections.
   1.14.0 - [PERF] Inline FNV-1a shard selector, RouteIdx uint8 cache key.
   1.13.0 - [PERF] Single time.Now() per CacheGet call.
   1.12.0 - [FIX]  Negative responses cached per RFC 2308.
-  1.11.0 - [PERF] Struct-based DNSCacheKey, 60s sweep interval.
+  1.11.0 - [PERF] Struct-based DNSCacheKey, 60 s sweep interval.
   1.10.0 - Initial sharded cache with pseudo-random eviction.
 */
 
@@ -46,17 +74,11 @@ import (
 
 // DNSCacheKey is the map key for all cache lookups.
 //
-// RouteIdx replaces the previous Route string field. Route names are a small
-// fixed set assigned at startup (see routeIdxByName in main.go). Storing an
-// index eliminates the per-lookup pointer chase when Go hashes the struct key
-// and shrinks the struct by ~15 bytes.
-//
-// RouteIdx 0 is always "local" (hosts/leases answers). All other indices are
-// assigned to upstream group names starting at 1.
-//
-// Name should always be the normalised (lowercase, no trailing dot) query name
-// as produced by lowerTrimDot in process.go. This ensures "GOOGLE.COM." and
-// "google.com." share the same cache entry.
+// Name must always be normalised (lowercase, no trailing dot) as produced by
+// lowerTrimDot in process.go — ensures "GOOGLE.COM." and "google.com" share
+// the same entry.
+// RouteIdx uint8 replaces the Route string, eliminating the per-lookup pointer
+// chase and shrinking the struct by ~15 bytes.
 type DNSCacheKey struct {
 	Name     string
 	Qtype    uint16
@@ -65,19 +87,25 @@ type DNSCacheKey struct {
 }
 
 // shardCount controls how many independent RWMutex-protected map buckets the
-// cache is split across. 32 shards is a good fit for a 10-worker UDP pool:
-// worst-case collision probability per query burst is ~1/32.
-// Must be a power of two (used as bitmask in getShard).
+// cache is split across. 32 is a good fit for a 10-worker UDP pool.
+// MUST be a power of two — used as a bitmask in getShard.
 const shardCount = 32
 
 // cacheItem holds one cached DNS response.
 //
-// msg is an immutable deep copy created at CacheSet time. Readers call
-// msg.Copy() in CacheGet to get their own mutable instance — no locks needed
-// after the initial map lookup, and no parse/serialise overhead.
+// msg is an immutable deep copy created at CacheSet time. Callers receive their
+// own msg.Copy() from CacheGet and may mutate it freely.
+//
+// expiration — the TTL-derived "fresh" deadline. Beyond this, isStale=true.
+// staleUntil — expiration + StaleTTL. Beyond this, the entry is treated as a
+//              miss. When StaleTTL=0, staleUntil==expiration (no stale window).
+// routeName  — the upstream group that produced this entry; used by the
+//              backgroundRevalidate path in process.go to find the right upstreams.
 type cacheItem struct {
-	msg        *dns.Msg // immutable; never modified after CacheSet stores it
-	expiration time.Time
+	msg        *dns.Msg  // immutable after store; callers always get a Copy
+	expiration time.Time // end of fresh window
+	staleUntil time.Time // end of stale window (== expiration when StaleTTL=0)
+	routeName  string    // upstream group name (e.g. "default", "kids")
 }
 
 type cacheShard struct {
@@ -88,11 +116,12 @@ type cacheShard struct {
 var shards [shardCount]*cacheShard
 
 // cacheMaxPerShard is the eviction threshold per shard, pre-computed in
-// InitCache. CacheSet previously divided cfg.Cache.Size/shardCount on every
-// write; this eliminates that entirely.
+// InitCache to avoid a division on every CacheSet call.
 var cacheMaxPerShard int
 
-func InitCache(maxSize int, minTTL int) {
+// InitCache initialises all shards and starts the background sweeper.
+// Called once from main() after cfg is populated.
+func InitCache(maxSize int, _ int) {
 	if !cfg.Cache.Enabled {
 		return
 	}
@@ -101,15 +130,16 @@ func InitCache(maxSize int, minTTL int) {
 			items: make(map[DNSCacheKey]cacheItem),
 		}
 	}
-
-	cacheMaxPerShard = cfg.Cache.Size / shardCount
+	cacheMaxPerShard = maxSize / shardCount
 	if cacheMaxPerShard < 1 {
 		cacheMaxPerShard = 1
 	}
 
-	// Background sweeper: reclaims memory from naturally expired items.
-	// 60s is safe — CacheGet already rejects expired entries on read, so the
-	// sweeper only affects memory pressure, not query correctness.
+	// Background sweeper — reclaims entries whose stale window has passed.
+	// 60 s is safe: CacheGet already rejects expired entries on read; the
+	// sweeper only affects memory, not query correctness.
+	// Entries in the stale window (expiration < now < staleUntil) are kept
+	// alive intentionally so backgroundRevalidate can serve them.
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -118,7 +148,9 @@ func InitCache(maxSize int, minTTL int) {
 			for i := range shards {
 				shards[i].Lock()
 				for k, v := range shards[i].items {
-					if now.After(v.expiration) {
+					// Delete only after the full stale window has passed.
+					// When StaleTTL=0, staleUntil==expiration — same behaviour as before.
+					if now.After(v.staleUntil) {
 						delete(shards[i].items, k)
 					}
 				}
@@ -130,13 +162,9 @@ func InitCache(maxSize int, minTTL int) {
 
 // getShard maps a cache key to a shard using inline FNV-1a.
 //
-// FNV-1a replaces maphash.Hash. The old implementation created a Hash struct,
-// called SetSeed, then WriteString/Write on every call. FNV-1a is purely
-// arithmetic — no object, no seed lookup, no method dispatch. Matters on
-// MIPS/ARM routers where every function call has non-trivial cost.
-//
-// Name is hashed first (highest entropy). Qtype and Qclass are mixed together
-// in one step. RouteIdx is a single byte — cheap XOR.
+// Purely arithmetic — no object allocation, no method dispatch. Name is hashed
+// first (highest entropy). Qtype and Qclass are mixed in one step. RouteIdx
+// is a cheap single-byte XOR. Matters on MIPS/ARM where syscalls are expensive.
 func getShard(key DNSCacheKey) *cacheShard {
 	const (
 		basis uint64 = 14695981039346656037
@@ -155,15 +183,18 @@ func getShard(key DNSCacheKey) *cacheShard {
 }
 
 // CacheGet returns a caller-owned copy of a cached response with TTLs rewritten
-// to the remaining cache lifetime, or nil on miss/expiry.
+// to the remaining lifetime, plus an isStale flag.
 //
-// The returned *dns.Msg is a fresh deep copy — the caller may freely mutate it
-// (patch ID, apply in-place transforms, etc.) without affecting the cached entry.
-// This is intentional: process.go uses inPlace=true transforms on the result
-// to avoid a second Copy call.
-func CacheGet(key DNSCacheKey) *dns.Msg {
+//   isStale=false — fresh entry; TTLs reflect remaining lifetime normally.
+//   isStale=true  — entry is past its TTL but inside the stale window.
+//                   TTLs are set to 0 (RFC 8767 §4) so clients know the answer
+//                   may be refreshed soon. ProcessDNS will fire a background
+//                   revalidation after writing the stale response.
+//
+// Returns (nil, false) on a complete miss or when the stale window has passed.
+func CacheGet(key DNSCacheKey) (*dns.Msg, bool) {
 	if !cfg.Cache.Enabled {
-		return nil
+		return nil, false
 	}
 	shard := getShard(key)
 	shard.RLock()
@@ -171,36 +202,45 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 	shard.RUnlock()
 
 	if !ok {
-		return nil
+		return nil, false
 	}
 
-	// Single time.Now() — reused for both expiry check and remaining-TTL calc.
-	// On some embedded targets (MIPS, older ARM without vDSO) time.Now() is a
-	// real syscall. Calling it twice per cache hit is measurable overhead.
+	// Single time.Now() — reused for both boundary checks and TTL math.
+	// On embedded targets without vDSO, this is a real syscall.
 	now := time.Now()
-	if now.After(item.expiration) {
-		return nil
-	}
-	remaining := uint32(item.expiration.Sub(now).Seconds())
-	if remaining == 0 {
-		return nil
+
+	// Past the full stale window — treat as miss (sweeper hasn't caught it yet).
+	if now.After(item.staleUntil) {
+		return nil, false
 	}
 
-	// Deep copy: the caller owns the result and can mutate it freely.
-	// msg.Copy() is a pure struct+slice copy — no byte parsing or allocation
-	// beyond the new structs. Much faster than msg.Unpack(packed_bytes).
+	isStale := now.After(item.expiration)
+
+	// Stale window only active when StaleTTL > 0. Otherwise reject expired entries.
+	if isStale && cfg.Cache.StaleTTL <= 0 {
+		return nil, false
+	}
+
+	// Compute remaining TTL for fresh entries.
+	// Stale entries get TTL=0 per RFC 8767 §4 — the answer is valid but the
+	// client should expect a fresh record soon.
+	var remaining uint32
+	if !isStale {
+		r := item.expiration.Sub(now).Seconds()
+		if r < 1 {
+			// Sub-second fresh window — effectively expired; avoid TTL=0 confusion
+			// with a deliberate stale response. Treat as miss.
+			return nil, false
+		}
+		remaining = uint32(r)
+	}
+	// remaining=0 for stale responses — intentional.
+
+	// Deep copy: caller owns the result and may mutate it (patch ID, transforms).
 	out := item.msg.Copy()
 
-	// Rewrite TTLs in all sections to reflect actual remaining cache lifetime.
-	//
-	// Answer: positive responses.
-	// Ns:     negative responses (NXDOMAIN/NODATA) — the SOA record lives here.
-	//         Without this rewrite, clients receive the original upstream TTL on
-	//         cache hits instead of how much lifetime is left.
-	// Extra:  glue and additional records.
-	//
-	// OPT (TypeOPT) is the EDNS0 pseudo-RR — its "TTL" field encodes extended
-	// RCODE and flags, not a lifetime. Never touch it.
+	// Rewrite TTLs in all sections to reflect actual remaining/stale lifetime.
+	// OPT (TypeOPT) carries EDNS0 flags, not a TTL — never touch it.
 	for _, rr := range out.Answer {
 		rr.Header().Ttl = remaining
 	}
@@ -212,52 +252,56 @@ func CacheGet(key DNSCacheKey) *dns.Msg {
 			rr.Header().Ttl = remaining
 		}
 	}
-	return out
+	return out, isStale
 }
 
 // CacheSet stores a deep copy of msg under key with a TTL-derived expiration.
 //
-// Storing a deep copy (msg.Copy()) ensures CacheSet does not hold any reference
-// into the caller's message. This lets process.go apply in-place transforms to
-// the original message after CacheSet returns — the stored copy is unaffected.
-// msg.Copy() is a pure struct+slice copy, faster than msg.Pack().
-func CacheSet(key DNSCacheKey, msg *dns.Msg) {
+// routeName is the upstream group that produced this response; stored in the
+// item so backgroundRevalidate can look up the correct upstreams later.
+//
+// Storing a deep copy ensures the caller may mutate msg after CacheSet returns
+// without corrupting the cached entry (needed by the in-place transform path).
+//
+// TTL derivation:
+//   Positive (NOERROR with answers):  minimum TTL across all answer RRs.
+//   Negative (NXDOMAIN or NODATA):    SOA minimum from authority section;
+//                                     falls back to NegativeTTL or MinTTL.
+//
+// NegativeTTL acts as an independent floor for negative responses when set,
+// allowing a shorter cache lifetime for NXDOMAIN without affecting positive TTLs.
+func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 	if !cfg.Cache.Enabled || msg == nil {
 		return
 	}
 
-	// Cacheable RCODEs per RFC 2308:
-	//   NOERROR  (0) — positive answer or empty (NOERROR/NODATA)
-	//   NXDOMAIN (3) — name does not exist
-	// Everything else (SERVFAIL, REFUSED, FORMERR, etc.) is a transient or
-	// policy failure at the upstream — never cache these.
+	// Only NOERROR and NXDOMAIN are cacheable per RFC 2308.
+	// SERVFAIL, REFUSED, FORMERR etc. are transient or policy failures — skip.
 	switch msg.Rcode {
 	case dns.RcodeSuccess, dns.RcodeNameError:
-		// cacheable — fall through
+		// fall through
 	default:
 		return
 	}
 
-	// Determine TTL depending on response type.
-	//
-	// This function receives the RAW upstream response (before any transforms).
-	// process.go ensures CacheSet is called before transformResponse, so the Ns
-	// section is always intact and the SOA is available for negative TTL
-	// calculation even when minimize_answer is enabled (which would strip Ns).
-	//
-	// Positive (NOERROR with answers): minimum TTL across all answer RRs.
-	// Negative (NXDOMAIN or NOERROR/NODATA — RFC 2308 §5):
-	//   Use min(SOA TTL, SOA MINIMUM) from the authority section when present.
-	//   Fall back to cfg.Cache.MinTTL when no SOA is available.
+	// Classify response type once — reused for TTL derivation and floor selection.
+	isNeg := msg.Rcode == dns.RcodeNameError ||
+		(msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)
+
 	var ttl uint32
-	if msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0 {
-		ttl = ^uint32(0)
+	if !isNeg {
+		// Positive NOERROR: minimum TTL across all answer records.
+		ttl = ^uint32(0) // start at max; shrink to actual minimum
 		for _, rr := range msg.Answer {
 			if rr.Header().Ttl < ttl {
 				ttl = rr.Header().Ttl
 			}
 		}
 	} else {
+		// Negative (NXDOMAIN or NOERROR/NODATA — RFC 2308 §5).
+		// Prefer SOA minimum from the authority section when present.
+		// CacheSet is called before transformResponse, so Ns is always intact
+		// even when minimize_answer would later strip it.
 		ttl = 0
 		for _, rr := range msg.Ns {
 			if soa, ok := rr.(*dns.SOA); ok {
@@ -269,40 +313,67 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg) {
 				break
 			}
 		}
+		// No SOA: use NegativeTTL as the dedicated negative fallback,
+		// or MinTTL when NegativeTTL is not configured (backwards compat).
 		if ttl == 0 {
-			ttl = uint32(cfg.Cache.MinTTL)
+			if cfg.Cache.NegativeTTL > 0 {
+				ttl = uint32(cfg.Cache.NegativeTTL)
+			} else {
+				ttl = uint32(cfg.Cache.MinTTL)
+			}
 		}
 	}
 
-	// Apply min_ttl floor — prevents thrashing for records with very short TTLs.
-	if int(ttl) < cfg.Cache.MinTTL {
-		ttl = uint32(cfg.Cache.MinTTL)
+	// Floor enforcement:
+	//   Positive responses  → MinTTL.
+	//   Negative responses  → NegativeTTL when explicitly set; else MinTTL.
+	// This lets operators write `min_ttl: 60, negative_ttl: 30` to get a
+	// shorter cache window for NXDOMAIN without affecting positive records.
+	effectiveMin := cfg.Cache.MinTTL
+	if isNeg && cfg.Cache.NegativeTTL > 0 {
+		effectiveMin = cfg.Cache.NegativeTTL
+	}
+	if int(ttl) < effectiveMin {
+		ttl = uint32(effectiveMin)
 	}
 
-	// Apply max_ttl ceiling — prevents stale data from sitting in cache too long.
-	// 0 means disabled (no ceiling). Applies uniformly to positive and negative.
+	// Ceiling: max_ttl=0 means unlimited. Applies to both positive and negative.
 	if cfg.Cache.MaxTTL > 0 && int(ttl) > cfg.Cache.MaxTTL {
 		ttl = uint32(cfg.Cache.MaxTTL)
 	}
 
-	// Deep copy: the caller may mutate msg after CacheSet returns (e.g. in-place
-	// transforms in process.go). Storing msg directly would let those mutations
-	// corrupt the cached entry. msg.Copy() is faster than msg.Pack().
+	// Compute time boundaries.
+	now := time.Now()
+	expiration := now.Add(time.Duration(ttl) * time.Second)
+
+	// staleUntil extends past expiration by StaleTTL seconds.
+	// When StaleTTL=0 (default), staleUntil==expiration — no stale window,
+	// behaviour is identical to v1.17.0.
+	staleUntil := expiration
+	if cfg.Cache.StaleTTL > 0 {
+		staleUntil = expiration.Add(time.Duration(cfg.Cache.StaleTTL) * time.Second)
+	}
+
+	// Deep copy so the caller may mutate msg after this call returns.
 	stored := msg.Copy()
-	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
 
 	shard := getShard(key)
 	shard.Lock()
 	// Zero-allocation pseudo-random eviction: Go map iteration order is
-	// randomised, so deleting the first key we encounter is statistically fair
-	// and allocation-free. cacheMaxPerShard is pre-computed — no division here.
+	// randomised — first key encountered is statistically fair. No division,
+	// no sorting, no secondary data structure.
 	if len(shard.items) >= cacheMaxPerShard {
 		for k := range shard.items {
 			delete(shard.items, k)
 			break
 		}
 	}
-	shard.items[key] = cacheItem{msg: stored, expiration: expiration}
+	shard.items[key] = cacheItem{
+		msg:        stored,
+		expiration: expiration,
+		staleUntil: staleUntil,
+		routeName:  routeName,
+	}
 	shard.Unlock()
 }
 

@@ -1,12 +1,25 @@
 /*
 File: main.go
-Version: 1.28.0
-Last Updated: 2026-03-09 16:00 CET
+Version: 1.29.1
+Last Updated: 2026-03-10 13:00 CET
 Description: Application entry point, configuration loading, TLS setup, and
              subsystem initialisation. Defines tiered buffer pools shared across
              server.go and upstream.go.
 
 Changes:
+  1.29.1 - [FIX] Restored getHardenedTLSConfig() which was accidentally dropped
+           during the v1.29.0 rewrite. upstream.go calls it directly 4× for its
+           DoT/DoH/DoH3/DoQ client TLS configs. setupTLS() now builds on it
+           correctly again (was inlining a weaker config without cipher list).
+           generateSelfSignedCert() aligned with the original (pointer receiver,
+           -time.Minute NotBefore instead of -time.Hour).
+  1.29.0 - [FEAT] Cache.NegativeTTL: dedicated TTL floor for NXDOMAIN/NODATA
+           responses, independent of min_ttl. When 0, MinTTL applies to all
+           response types (backwards compat).
+           [FEAT] Cache.StaleTTL: serve-stale window length in seconds per
+           RFC 8767. When 0, disabled. Entries past expiry but within the
+           stale window are served with TTL=0 while background revalidation
+           refreshes the cache entry.
   1.28.0 - [FEAT] Global bootstrap servers: added BootstrapServers []string to
            the Server config struct (yaml: "bootstrap_servers"). Parsed at startup
            into globalBootstrapServers []string, normalising bare IPs to "ip:53".
@@ -114,6 +127,29 @@ type Config struct {
 		Size    int  `yaml:"size"`
 		MinTTL  int  `yaml:"min_ttl"`
 		MaxTTL  int  `yaml:"max_ttl"`
+
+		// NegativeTTL is the TTL floor applied exclusively to negative responses
+		// (NXDOMAIN and NOERROR/NODATA) when no SOA record is present in the
+		// authority section. When 0, MinTTL is used for all response types
+		// (backwards-compatible default). Setting this lower than MinTTL lets you
+		// cache positive records longer while keeping negative entries short.
+		//
+		// Example: min_ttl=60, negative_ttl=15 → positives cached ≥60s,
+		// NXDOMAIN cached ≥15s. Typos and ad-domain blocks expire quickly.
+		NegativeTTL int `yaml:"negative_ttl"`
+
+		// StaleTTL is the number of seconds past a record's TTL expiry during
+		// which the old answer is still served immediately while a background
+		// upstream call silently refreshes the cache. Implements RFC 8767
+		// "serve-stale". 0 = disabled (default, identical behaviour to v1.17.0).
+		//
+		// Served stale responses carry TTL=0 per RFC 8767 §4, signalling to
+		// clients that a fresh answer is expected shortly.
+		//
+		// Example: stale_ttl=300 keeps records alive for 5 extra minutes after
+		// they expire. Any query during that window gets an instant answer while
+		// the refresh happens in the background.
+		StaleTTL int `yaml:"stale_ttl"`
 	} `yaml:"cache"`
 
 	Identity struct {
@@ -191,7 +227,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.28.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.29.1")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -471,6 +507,12 @@ outer:
 		} else {
 			log.Printf("[INIT] Cache TTL bounds: min=%ds, max=unlimited", cfg.Cache.MinTTL)
 		}
+		if cfg.Cache.NegativeTTL > 0 {
+			log.Printf("[INIT] Cache negative TTL: %ds (NXDOMAIN/NODATA floor, independent of min_ttl)", cfg.Cache.NegativeTTL)
+		}
+		if cfg.Cache.StaleTTL > 0 {
+			log.Printf("[INIT] Cache serve-stale window: %ds past expiry (RFC 8767)", cfg.Cache.StaleTTL)
+		}
 	}
 
 	if hasMACRoutes {
@@ -491,29 +533,35 @@ outer:
 		log.Println("[TLS] No encrypted listeners configured — skipping TLS.")
 	}
 
-	// 10. Network listeners
+	// 10. Start listeners
 	StartServers(tlsConfig)
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-
-	log.Println("[BOOT] Shutting down sdproxy...")
+	// 11. Wait for shutdown signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	log.Printf("[BOOT] Received signal %v — shutting down", sig)
 	Shutdown()
 }
 
-func extractPort(addr string, fallback uint16) uint16 {
+// extractPort parses a "host:port" listener address and returns the port as
+// uint16. Returns defaultPort when parsing fails.
+func extractPort(addr string, defaultPort uint16) uint16 {
 	_, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return fallback
+		return defaultPort
 	}
 	p, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return fallback
+		return defaultPort
 	}
 	return uint16(p)
 }
 
+// getHardenedTLSConfig returns a *tls.Config with a conservative cipher suite
+// and curve list, suitable for both server listeners and upstream client dials.
+// Called by upstream.go (4×) for DoT/DoH/DoH3/DoQ client transports, and by
+// setupTLS() below as the base for the server listener config.
 func getHardenedTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -533,6 +581,21 @@ func getHardenedTLSConfig() *tls.Config {
 	}
 }
 
+// setupTLS loads or auto-generates the TLS configuration for encrypted listeners.
+//
+// When tls_cert and tls_key are both set: loads the certificate from disk.
+// When either is empty: generates an ephemeral self-signed P-256 certificate
+// valid for 10 years. The ephemeral cert is regenerated on every restart.
+//
+// Builds on getHardenedTLSConfig() and adds the certificate + ALPN tokens.
+// ALPN tokens cover all three encrypted protocols:
+//   "doq"      — DNS over QUIC (RFC 9250)
+//   "dot"      — DNS over TLS  (RFC 7858)
+//   "h2"       — HTTP/2 for DoH
+//   "http/1.1" — HTTP/1.1 for DoH fallback
+//
+// The DoH listeners in server.go clone this config and restrict ALPN to
+// HTTP-only tokens so strict HTTP/1.1 clients don't reject the handshake.
 func setupTLS() *tls.Config {
 	var (
 		cert tls.Certificate
@@ -545,8 +608,6 @@ func setupTLS() *tls.Config {
 		}
 		log.Println("[TLS] Loaded provided certificates.")
 	} else {
-		// Auto-generate an ephemeral self-signed certificate. Useful for local
-		// testing; for production use a real cert (e.g. from Let's Encrypt).
 		log.Println("[TLS] No cert/key configured — generating ephemeral self-signed certificate.")
 		cert, err = generateSelfSignedCert()
 		if err != nil {
@@ -554,14 +615,14 @@ func setupTLS() *tls.Config {
 		}
 	}
 
-	base := getHardenedTLSConfig()
+	base             := getHardenedTLSConfig()
 	base.Certificates = []tls.Certificate{cert}
-	// Advertise all supported ALPN tokens — the DoH listener clones this and
-	// restricts to HTTP-only tokens before binding.
-	base.NextProtos = []string{"h2", "http/1.1", "dot", "doq"}
+	base.NextProtos   = []string{"h2", "http/1.1", "dot", "doq"}
 	return base
 }
 
+// generateSelfSignedCert creates an ephemeral P-256 ECDSA certificate valid
+// for 10 years. Used when no tls_cert/tls_key are configured.
 func generateSelfSignedCert() (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -1,29 +1,30 @@
 /*
 File: process.go
-Version: 1.38.0
-Last Updated: 2026-03-09 22:00 CET
+Version: 1.39.0
+Last Updated: 2026-03-10 12:00 CET
 Description: Per-query DNS processing pipeline. Receives a parsed dns.Msg from
              server.go and routes it through policy checks, DDR spoofing, local
              identity, cache lookup, upstream forwarding, and response transforms.
 
 Changes:
-  1.38.0 - [FIX] Bug 2: walkDomainMaps now correctly applies most-specific-wins
-           semantics for domain_policy. Previously the policy block lacked the
-           && !policyBlocked guard that domainRoutes already had, so a parent-
-           domain entry would always silently overwrite a more specific child-
-           domain entry during the suffix walk. Example: if both "sub.blocked.com"
-           (NOERROR) and "blocked.com" (NXDOMAIN) were configured, a query for
-           sub.blocked.com would first match NOERROR but then continue walking
-           and overwrite with NXDOMAIN — the exact opposite of expected behaviour.
-           Fix: added && !policyBlocked guard to the inner policy check block,
-           matching the existing && !routeMatched guard on the routes check.
-  1.37.0 - [FIX] DDR step 1a: _dns.resolver.arpa SVCB was always intercepted
-           regardless of ddr.enabled. When disabled the handler wrote an empty
-           SVCB response and returned — the query never reached the upstream.
-           Fixed by gating the entire block on cfg.Server.DDR.Enabled.
-           [FIX] Route selection: LookupMACByIP -> LookupMAC; LookupNameByMACOrIP
-           now receives (mac, ip) — two arguments as per identity.go signature.
-           clientMAC resolved once before identity lookup, reused in route step.
+  1.39.0 - [FEAT] Singleflight coalescing: concurrent cache-miss queries for
+           the same (qname, qtype, routeIdx, clientName) share one upstream call.
+           sfGroup (singleflight.Group) wraps raceExchange. CacheSet moved inside
+           the singleflight closure so only the winning goroutine writes to cache;
+           every caller (winner + waiters) gets its own msg.Copy() of the result.
+           [FEAT] Serve-stale: CacheGet now returns (msg, isStale bool). When
+           isStale=true, ProcessDNS writes the stale response immediately and
+           fires backgroundRevalidate in a goroutine. backgroundRevalidate reuses
+           sfGroup so concurrent stale hits on the same key coalesce into one
+           revalidation upstream call. routeName passed to CacheSet so the
+           revalidation path knows which upstream group to use.
+           [PERF] transformResponse on the upstream path now uses inPlace=true
+           (caller owns a fresh copy from sfResult.msg.Copy()).
+  1.38.0 - [FIX] walkDomainMaps: added && !policyBlocked guard to policy block,
+           enforcing most-specific-wins semantics for domain_policy.
+  1.37.0 - [FIX] DDR step 1a gated on cfg.Server.DDR.Enabled.
+           [FIX] LookupNameByMACOrIP receives (mac, ip) — correct signature.
+           clientMAC resolved once, reused in route step.
   1.36.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
   1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags.
   1.33.0 - [FEAT] Upstream forwarding uses raceExchange.
@@ -35,12 +36,14 @@ Changes:
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
+	"golang.org/x/sync/singleflight"
 )
 
 // logQueries is the hot-path logging gate. Set once at startup from config.
@@ -51,6 +54,23 @@ var logQueries bool
 // clientIDPool holds reusable strings.Builder values for building the
 // "ip (name)" client identifier that appears in every log line.
 var clientIDPool = sync.Pool{New: func() any { return new(strings.Builder) }}
+
+// sfGroup coalesces concurrent cache-miss queries for the same
+// (qname, qtype, routeIdx, clientName) tuple into a single upstream call.
+// All waiters receive the same *dns.Msg and call .Copy() to get their own
+// mutable instance before patching the transaction ID.
+//
+// The group is also used by backgroundRevalidate, so an in-flight
+// revalidation and a simultaneous fresh-miss for the same key merge
+// automatically — no duplicate upstream call, no race on CacheSet.
+var sfGroup singleflight.Group
+
+// sfResult carries the upstream response and the server address that served it.
+// Wrapped in a struct because singleflight.Do returns (any, error, bool).
+type sfResult struct {
+	msg  *dns.Msg
+	addr string
+}
 
 // policyRespCache maps DNS RCODE integers to a pre-packed *dns.Msg template.
 // Built at startup by buildPolicyRespCache(). Policy fast-paths unpack a copy
@@ -275,8 +295,9 @@ func responseContainsNullIP(msg *dns.Msg) bool {
 
 // transformResponse optionally flattens CNAME chains and/or strips authority
 // and additional sections (minimize_answer).
-// inPlace=true:  mutates msg directly (caller owns the copy — cache hit path).
-// inPlace=false: calls msg.Copy() first (upstream response, still needed by cache).
+// inPlace=true:  mutates msg directly (caller owns the copy — cache hit and
+//                upstream singleflight paths both provide a fresh Copy).
+// inPlace=false: calls msg.Copy() first (legacy callers, if any).
 func transformResponse(msg *dns.Msg, qtype uint16, inPlace bool) *dns.Msg {
 	if !cfg.Server.FlattenCNAME && !cfg.Server.MinimizeAnswer {
 		return msg
@@ -307,7 +328,7 @@ func flattenCNAME(out *dns.Msg) {
 	}
 	queryName := first.Hdr.Name
 	minTTL    := first.Hdr.Ttl
-	var finalIPs []dns.RR
+	finalIPs  := make([]dns.RR, 0, len(out.Answer)-1) // pre-alloc avoids 1-2 reallocs
 
 	for _, rr := range out.Answer[1:] {
 		if rr.Header().Ttl < minTTL {
@@ -333,6 +354,48 @@ func flattenCNAME(out *dns.Msg) {
 		rr.Header().Ttl = minTTL
 	}
 	out.Answer = finalIPs
+}
+
+// backgroundRevalidate refreshes a stale cache entry in the background.
+// Called from ProcessDNS after the stale response has already been written
+// to the client — zero additional latency for the end-user.
+//
+// The sfGroup coalesces simultaneous stale hits: if 10 clients all hit the
+// same stale entry at once, only ONE upstream call is made, and CacheSet is
+// called exactly once. Remaining callers get the result for free.
+//
+// The sfKey format is identical to the hot-path key in ProcessDNS, so a
+// background revalidation and a concurrent fresh-miss for the same query
+// also coalesce into a single upstream call automatically.
+//
+// routeUpstreams is a read-only map after startup — no lock needed.
+func backgroundRevalidate(key DNSCacheKey, routeName, clientName string) {
+	upstreams := routeUpstreams[routeName]
+	if len(upstreams) == 0 {
+		upstreams = routeUpstreams["default"]
+	}
+	if len(upstreams) == 0 {
+		return // no upstreams configured for this route — nothing we can do
+	}
+
+	// Reconstruct a minimal forwarding query from the cache key.
+	// dns.Fqdn appends the trailing dot that miekg/dns requires.
+	req := new(dns.Msg)
+	req.SetQuestion(dns.Fqdn(key.Name), key.Qtype)
+	req.Question[0].Qclass = key.Qclass
+	req.RecursionDesired = true
+
+	// Same key format as ProcessDNS so coalescing works across both call sites.
+	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", key.Name, key.Qtype, key.RouteIdx, clientName)
+
+	sfGroup.Do(sfKey, func() (any, error) { //nolint:errcheck — revalidation errors are silent
+		IncrUpstreamCall()
+		msg, _, err := raceExchange(upstreams, req, clientName)
+		if err == nil && msg != nil {
+			CacheSet(key, msg, routeName)
+		}
+		return nil, nil
+	})
 }
 
 // ProcessDNS is the main query handler. Called by all server transports.
@@ -685,17 +748,28 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 	// --- 4. Cache Lookup ---
 	cacheKey := DNSCacheKey{Name: qNameTrimmed, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdx}
-	if cachedResp := CacheGet(cacheKey); cachedResp != nil {
+	if cachedResp, isStale := CacheGet(cacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
-		cachedResp = transformResponse(cachedResp, q.Qtype, true)
+		cachedResp = transformResponse(cachedResp, q.Qtype, true) // inPlace OK — we own the copy
 		w.WriteMsg(cachedResp)
-		if logQueries {
-			status := "CACHE HIT"
-			if responseContainsNullIP(cachedResp) {
-				status = "CACHE HIT (NULL-IP)"
+		if isStale {
+			// Serve-stale path: response is already on the wire.
+			// Kick off background revalidation; sfGroup ensures at most one
+			// upstream call fires even if many clients hit the same stale entry.
+			go backgroundRevalidate(cacheKey, routeName, clientName)
+			if logQueries {
+				log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | STALE (revalidating)",
+					protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName)
 			}
-			log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | %s",
-				protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, status)
+		} else {
+			if logQueries {
+				status := "CACHE HIT"
+				if responseContainsNullIP(cachedResp) {
+					status = "CACHE HIT (NULL-IP)"
+				}
+				log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | %s",
+					protocol, clientID, q.Name, dns.TypeToString[q.Qtype], routeOriginType, routeName, status)
+			}
 		}
 		return
 	}
@@ -706,9 +780,42 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		upstreams = routeUpstreams["default"]
 	}
 
-	// --- 6. Upstream Forwarding ---
-	IncrUpstreamCall()
-	finalResp, upstreamUsed, lastErr := raceExchange(upstreams, r, clientName)
+	// --- 6. Upstream Forwarding — coalesced via singleflight ---
+	//
+	// Concurrent cache-miss queries for the same (qname, qtype, routeIdx,
+	// clientName) share a single upstream call. The "winning" goroutine (the
+	// first to call sfGroup.Do) executes the closure; all others block and
+	// receive the same result when the winner finishes.
+	//
+	// CacheSet is called inside the closure so it happens exactly once, using
+	// the winner's copy of cacheKey/routeName. All callers receive sfResult and
+	// call .msg.Copy() to obtain their own mutable instance.
+	//
+	// IncrUpstreamCall is inside the closure — only one upstream call is
+	// counted per coalesced group, which accurately reflects actual upstream load.
+	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", qNameTrimmed, q.Qtype, routeIdx, clientName)
+
+	v, sfErr, _ := sfGroup.Do(sfKey, func() (any, error) {
+		IncrUpstreamCall()
+		msg, addr, err := raceExchange(upstreams, r, clientName)
+		if err != nil || msg == nil {
+			return sfResult{}, err
+		}
+		// Cache here — only the winning goroutine writes; waiters skip this.
+		CacheSet(cacheKey, msg, routeName)
+		return sfResult{msg: msg, addr: addr}, nil
+	})
+
+	// Extract the shared result. Each caller gets its own .Copy() so they can
+	// independently patch the transaction ID and apply response transforms.
+	var finalResp *dns.Msg
+	var upstreamUsed string
+	if sfErr == nil {
+		if res, ok := v.(sfResult); ok && res.msg != nil {
+			finalResp    = res.msg.Copy()
+			upstreamUsed = res.addr
+		}
+	}
 
 	// --- 7. Handle Error ---
 	// Always log upstream failures regardless of logQueries.
@@ -719,16 +826,17 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 		log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | FAILED: %v",
 			protocol, failLabel, q.Name, dns.TypeToString[q.Qtype],
-			routeOriginType, routeName, lastErr)
+			routeOriginType, routeName, sfErr)
 		dns.HandleFailed(w, r)
 		return
 	}
 
-	// --- 8. Cache (before transforms) ---
-	CacheSet(cacheKey, finalResp)
+	// --- 8. Cache happens inside the sfGroup closure above ---
 
 	// --- 9. Response Transforms ---
-	finalResp = transformResponse(finalResp, q.Qtype, false)
+	// inPlace=true: finalResp is already a fresh Copy owned by this caller.
+	// No second Copy needed — saves one allocation per upstream response.
+	finalResp = transformResponse(finalResp, q.Qtype, true)
 
 	// --- 10. Reply ---
 	finalResp.Id = originalID
