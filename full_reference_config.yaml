@@ -1,10 +1,17 @@
-# File: full_reference_config.yaml
-# Version: 1.26.0
-# Last Updated: 2026-03-10 12:00 CET
-# Description: sdproxy full reference configuration — Simple DNS Proxy.
-#              Every option is documented inline. No separate manual needed.
+# File:    full_reference_config.yaml
+# Version: 1.27.0
+# Updated: 2026-03-12 20:00 CET
+#
+# Description:
+#   sdproxy full reference configuration — Simple DNS Proxy.
+#   Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.27.0 - [FEAT] identity.isc_leases: ISC DHCP block-structured lease files.
+#            [FEAT] identity.kea_leases: Kea DHCP4 CSV lease files.
+#            [FEAT] identity.odhcpd_leases: odhcpd internal state files.
+#            Annotated each lease type with supported formats and common file
+#            locations on OpenWrt, Debian/Ubuntu, RHEL, FreeBSD/pfSense.
 #   1.26.0 - [FEAT] cache.negative_ttl: dedicated TTL floor for NXDOMAIN/NODATA.
 #            [FEAT] cache.stale_ttl: serve-stale window in seconds (RFC 8767).
 #   1.25.0 - [FIX] cache.size comment corrected from "LRU eviction" to
@@ -19,16 +26,21 @@
 #   1.17.0 - Added filter_aaaa option.
 #   1.16.0 - Added memory_limit_mb option. DDR ports derived from listeners.
 
+# =============================================================================
+# SERVER
+# =============================================================================
+
 server:
   # Listener addresses. Multiple addresses supported per protocol.
   # Omit any section to disable that protocol entirely.
   listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
   listen_tcp: ["0.0.0.0:53"]
   listen_dot: ["0.0.0.0:853"]
-  listen_doh: ["0.0.0.0:443"]   # Serves HTTP/1.1, HTTP/2, and HTTP/3 (QUIC)
+  listen_doh: ["0.0.0.0:443"]   # HTTP/1.1, HTTP/2, and HTTP/3 (QUIC)
   listen_doq: ["0.0.0.0:853"]   # DNS over QUIC — RFC 9250
 
   # Number of goroutines in the UDP worker pool.
+  # On Linux each worker gets its own SO_REUSEPORT socket — no shared channel.
   udp_workers: 10
 
   # TLS certificate and key for DoT, DoH, and DoQ listeners.
@@ -37,10 +49,11 @@ server:
   tls_key: ""
 
   # Hard memory ceiling for the Go runtime via debug.SetMemoryLimit.
-  # 0 = disabled (default).
+  # 0 = disabled (default). On a 64 MB router try 48 (leaves room for OS).
   memory_limit_mb: 0
 
   # Filter all AAAA (IPv6) queries by returning an empty NOERROR response.
+  # Useful on IPv4-only networks to prevent unnecessary upstream lookups.
   # false = disabled (default).
   filter_aaaa: false
 
@@ -49,11 +62,13 @@ server:
   # false = disabled (default).
   strict_ptr: false
 
-  # CNAME flattening — collapse CNAME chains in A/AAAA responses.
+  # CNAME flattening — collapse CNAME chains in A/AAAA responses so the client
+  # only sees the final A/AAAA record(s), never the intermediary aliases.
   # false = disabled (default).
   flatten_cname: false
 
-  # Answer minimization — strip authority (NS) and additional sections.
+  # Answer minimization — strip authority (NS) and additional sections from
+  # upstream responses before forwarding to the client.
   # false = disabled (default).
   minimize_answer: false
 
@@ -73,62 +88,60 @@ server:
   ddr:
     enabled: true
     hostnames: ["dns.local.net", "doh.local.net"]
-    ipv4: ["192.168.1.1"]   # Leave empty to use the incoming interface address
+    ipv4: ["192.168.1.1"]   # Leave empty [] to use the incoming interface address
     ipv6: []
 
-  # Staggered parallel upstream queries — eliminates "context deadline exceeded".
-  # 0 = sequential (default). Recommended: 150 for 2-3 upstreams on a home network.
+  # Staggered parallel upstream queries — eliminates "context deadline exceeded"
+  # when the primary upstream is slow. 0 = sequential (default).
+  # Recommended: 150 ms for 2-3 upstreams on a home network.
   upstream_stagger_ms: 150
 
-  # Global bootstrap DNS servers — plain UDP/TCP resolvers used to resolve
-  # upstream hostnames that have no per-URL bootstrap IPs (the #ip1,ip2 syntax).
+  # Global bootstrap DNS servers — plain UDP resolvers used to resolve upstream
+  # hostnames that have no per-URL bootstrap IPs (the #ip1,ip2 syntax).
   #
-  # Format: bare IP address or IP:port. Only IP addresses are accepted here —
-  # no hostnames (chicken-and-egg). Port defaults to 53 when omitted.
+  # Format: bare IP address or IP:port. Only IPs here — no hostnames
+  # (chicken-and-egg). Port defaults to 53 when omitted.
   #
   # Resolution order:
-  #   1. Per-URL bootstrap IPs in the upstream URL  (e.g. "doh://host/path#1.1.1.1")
-  #      — always take precedence over global servers.
-  #   2. Global bootstrap_servers (this list) — used when no per-URL IPs are set
-  #      and the hostname is not already a bare IP.
-  #   3. OS resolver (fallback) — used when both of the above are absent.
+  #   1. Per-URL bootstrap IPs (e.g. "doh://host/path#1.1.1.1") — always wins.
+  #   2. Global bootstrap_servers (this list).
+  #   3. OS resolver (fallback) — not guaranteed to work at startup on routers.
   #
-  # When bootstrap_servers is empty (default), upstreams without per-URL IPs
-  # must use bare IP addresses in their URLs, or rely on the OS resolver
-  # being functional at startup (which is not guaranteed on many routers).
-  #
-  # {client-name} is a LOCAL substitution — replaced at query time using ARP,
-  # DHCP leases, and hosts files. It is never resolved via DNS. What bootstrap
-  # servers resolve is the upstream SERVER hostname itself (e.g. *.controld.com),
-  # which maps to the same IPs regardless of the per-device prefix in front of it.
-  #
-  # For DoT/DoQ with {client-name} IN THE HOSTNAME: the hostname cannot be
-  # resolved at startup (it's still a template). Resolution happens lazily on
-  # the first query for each unique expanded hostname, using bootstrap_servers
-  # if configured, or the OS resolver as fallback. Results are cached for the
-  # process lifetime. Per-URL bootstrap IPs still take precedence and skip
-  # the lazy resolution entirely if you prefer explicit control.
+  # {client-name} is a LOCAL substitution — never resolved via DNS. Bootstrap
+  # servers only resolve the upstream server hostname itself.
   bootstrap_servers: []
+  # bootstrap_servers:
+  #   - "1.1.1.1"
+  #   - "9.9.9.9:53"
+
+# =============================================================================
+# LOGGING
+# =============================================================================
 
 logging:
-  # Per-query logging — logs every DNS query with client IP, route, upstream, etc.
-  # true  = log every query (default). false = suppress per-query lines.
+  # Per-query logging — logs every DNS query with client IP, route, upstream,
+  # and timing. true = log every query (default). false = suppress query lines.
   log_queries: true
 
   # strip_time removes the date/time prefix from log lines. Useful under
   # supervisors (systemd, procd) that add their own timestamps.
   strip_time: false
 
+# =============================================================================
 # QUERY-TYPE POLICY
+# =============================================================================
 # Maps specific DNS RR query types to an immediate RCODE.
 # Fired at step 0 in ProcessDNS — before cache, identity, DDR, and upstream.
+
 rtype_policy:
   ANY:   "REFUSED"   # RFC 8482 — amplification vector
   AXFR:  "REFUSED"   # Zone transfers not valid on a forwarding resolver
   IXFR:  "REFUSED"   # Same rationale as AXFR
   HINFO: "NOTIMP"    # Historical record, no modern use case
 
+# =============================================================================
 # DOMAIN POLICY
+# =============================================================================
 # Maps domain suffixes to an immediate RCODE — no upstream forwarding.
 # A single entry covers the apex AND all sub-domains.
 # Fired at step 0d — after qtype checks but before DDR, identity, and routing.
@@ -139,6 +152,7 @@ rtype_policy:
 # IMPORTANT: most-specific-wins semantics apply. If both "sub.example.com" and
 # "example.com" are configured, a query for sub.example.com will match the
 # sub.example.com entry and stop — the example.com entry is NOT applied.
+
 domain_policy:
   "onion":         "NXDOMAIN"   # RFC 7686 — Tor hidden services
   "local":         "NXDOMAIN"   # RFC 6762 — mDNS (use domain_routes for LAN zones)
@@ -150,7 +164,9 @@ domain_policy:
   "example.org":   "NXDOMAIN"   # RFC 2606
   "test":          "NXDOMAIN"   # RFC 6761
 
+# =============================================================================
 # UPSTREAM GROUPS
+# =============================================================================
 # The "default" group is required — all other groups are optional.
 #
 # PROTOCOL SCHEMES
@@ -164,18 +180,17 @@ domain_policy:
 # PER-URL BOOTSTRAP IPs  (appended after #, comma-separated)
 #   Bypasses DNS for the upstream hostname itself. Always takes precedence
 #   over bootstrap_servers above. Required for {client-name} in hostnames.
-#   Syntax:  "scheme://host/path#ip1,ip2"
+#   Syntax: "scheme://host/path#ip1,ip2"
 #
 # PRIVACY NOTE
 #   All outgoing queries have EDNS0 options stripped (removes ECS, cookies, etc.).
 #   Encrypted upstreams additionally get RFC 7830/8467 padding applied.
 #   UDP payload size is always normalised to 4096 bytes before forwarding.
-#
+
 upstreams:
   default:
     - "udp://1.1.1.1:53"
-    # Cloudflare DoH — hostname resolved via bootstrap_servers if configured,
-    # or via per-URL IPs if you prefer explicit control:
+    # Cloudflare DoH — per-URL IPs bypass the need for bootstrap_servers:
     - "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
   kids:
     - "tcp://1.1.1.3:53"
@@ -186,19 +201,31 @@ upstreams:
   local_network:
     - "udp://192.168.1.1:53"
 
+# =============================================================================
 # MAC-BASED ROUTES
+# =============================================================================
+# Maps a client's hardware MAC address to a specific upstream group.
+# Optional client_name overrides the DHCP/hosts-derived name for that client.
+
 routes:
   "00:11:22:33:44:55":
     upstream: "kids"
     client_name: "kids-ipad-override"
 
+# =============================================================================
 # DOMAIN-BASED ROUTES
+# =============================================================================
 # Suffix matching checked before cache and upstream selection.
 # NOTE: domain_policy is checked BEFORE domain_routes.
+
 domain_routes:
   "lan":           "local_network"
   "home.arpa":     "local_network"
   "corp.internal": "local_network"
+
+# =============================================================================
+# CACHE
+# =============================================================================
 
 cache:
   enabled: true
@@ -255,15 +282,164 @@ cache:
   # the same RAM as the main cache when setting this (it's bounded by cache.size).
   stale_ttl: 0   # 0 = disabled (backwards-compatible default)
 
+# =============================================================================
+# IDENTITY
+# =============================================================================
+# Identity maps DHCP client hostnames to their IPs (and MACs) for:
+#   a) {client-name} substitution in upstream URLs
+#   b) local A/AAAA/PTR answers without hitting an upstream at all
+#
+# All five source types can be used simultaneously — entries are merged.
+# When the same hostname appears in multiple files, all its IPs are kept.
+# The mtime of each file is checked on every poll tick; unchanged files are
+# never re-read or re-parsed.
+#
+# QUICK SETUP GUIDE BY ROUTER TYPE
+# ---------------------------------
+# OpenWrt with dnsmasq (standard):
+#   hosts_files:    ["/tmp/hosts/odhcpd", "/etc/hosts"]
+#   dnsmasq_leases: ["/tmp/dhcp.leases"]
+#
+# OpenWrt with odhcpd standalone (no dnsmasq):
+#   hosts_files:    ["/etc/hosts"]
+#   odhcpd_leases:  ["/var/lib/odhcpd/dhcp.leases"]
+#
+# Debian/Ubuntu with ISC DHCP:
+#   hosts_files:    ["/etc/hosts"]
+#   isc_leases:     ["/var/lib/dhcp/dhcpd.leases"]
+#
+# pfSense / OPNsense:
+#   hosts_files:    ["/etc/hosts"]
+#   isc_leases:     ["/var/db/dhcpd.leases"]        # pfSense ISC
+#   kea_leases:     ["/var/lib/kea/kea-leases4.csv"] # OPNsense Kea (23.7+)
+#
+# Synology NAS / generic Kea install:
+#   hosts_files:    ["/etc/hosts"]
+#   kea_leases:     ["/var/lib/kea/kea-leases4.csv"]
+
 identity:
-  # Hosts files to load for local A/AAAA/PTR resolution.
+  # ---------------------------------------------------------------------------
+  # hosts_files — standard /etc/hosts format
+  # ---------------------------------------------------------------------------
+  # One IP per line followed by one or more space-separated hostnames.
+  # Inline comments (#) are stripped. All aliases on a line are stored.
+  #
+  # On OpenWrt with dnsmasq+odhcpd: /tmp/hosts/odhcpd is written by odhcpd
+  # in hosts format and should be listed here (not in odhcpd_leases).
+  #
+  # Common locations:
+  #   /etc/hosts                    All platforms — base host file
+  #   /tmp/hosts/odhcpd             OpenWrt — odhcpd DHCPv6 client names
+  #   /tmp/hosts/dhcp               OpenWrt — additional dnsmasq host records
   hosts_files:
     - "/etc/hosts"
+  # hosts_files:
+  #   - "/etc/hosts"
+  #   - "/tmp/hosts/odhcpd"         # add this on OpenWrt with dnsmasq+odhcpd
+  #   - "/tmp/hosts/dhcp"
 
-  # dnsmasq lease files for DHCP client name resolution.
+  # ---------------------------------------------------------------------------
+  # dnsmasq_leases — dnsmasq flat-file lease database
+  # ---------------------------------------------------------------------------
+  # One record per line, five space-separated fields:
+  #   <expiry-epoch> <mac> <ip> <hostname> <client-id>
+  # Hostname '*' means the client didn't supply one — entry is skipped.
+  #
+  # Common locations:
+  #   /tmp/dhcp.leases              OpenWrt (tmpfs — lost on reboot, fine for polling)
+  #   /var/lib/misc/dnsmasq.leases  Most Linux distros (default datadir)
+  #   /var/lib/dnsmasq/dnsmasq.leases  Debian/Ubuntu with --dhcp-leasefile override
+  #   /etc/dnsmasq.d/dnsmasq.leases    Some minimal embedded distros
   dnsmasq_leases:
     - "/var/lib/misc/dnsmasq.leases"
+  # dnsmasq_leases:
+  #   - "/tmp/dhcp.leases"          # OpenWrt
+  #   - "/var/lib/misc/dnsmasq.leases"
 
-  # How often (seconds) to re-read identity files. 0 = once at startup only.
+  # ---------------------------------------------------------------------------
+  # isc_leases — ISC DHCP block-structured lease database
+  # ---------------------------------------------------------------------------
+  # Block format with one "lease <ip> { ... }" block per client.
+  # Only blocks with "binding state active" or "binding state static" are
+  # imported. ISC appends new blocks on renewal — the last active block wins.
+  # A block without a "client-hostname" line is silently skipped.
+  #
+  # Common locations:
+  #   /var/lib/dhcp/dhcpd.leases    Debian / Ubuntu / Raspberry Pi OS
+  #   /var/lib/dhcpd/dhcpd.leases   RHEL / CentOS / Fedora / AlmaLinux
+  #   /var/db/dhcpd.leases          FreeBSD / pfSense (ISC DHCP backend)
+  #   /var/state/dhcp/dhcpd.leases  Some OpenWrt builds with ISC DHCP package
+  #   /etc/dhcpd.leases             Legacy / minimal single-file installs
+  isc_leases: []
+  # isc_leases:
+  #   - "/var/lib/dhcp/dhcpd.leases"       # Debian/Ubuntu
+  #   - "/var/lib/dhcpd/dhcpd.leases"      # RHEL/CentOS/Fedora
+  #   - "/var/db/dhcpd.leases"             # FreeBSD/pfSense
+
+  # ---------------------------------------------------------------------------
+  # kea_leases — Kea DHCP4 CSV lease file
+  # ---------------------------------------------------------------------------
+  # CSV file with a mandatory header row starting with "address,".
+  # Column layout (0-indexed):
+  #   0=address  1=hwaddr  2=client_id  3=valid_lifetime  4=expire
+  #   5=subnet_id  6=fqdn_fwd  7=fqdn_rev  8=hostname  9=state  10=user_context
+  # Only rows with state=0 (active) are imported. Trailing FQDN dot in the
+  # hostname field is stripped automatically.
+  #
+  # The lease file path is configured in kea-dhcp4.conf under:
+  #   "lease-database": { "type": "memfile", "name": "/path/to/leases4.csv" }
+  #
+  # Common locations:
+  #   /var/lib/kea/kea-leases4.csv              Default Kea install (most distros)
+  #   /var/lib/kea/dhcp4.leases                 Alternative name in some packages
+  #   /usr/local/var/lib/kea/kea-leases4.csv    FreeBSD ports / pkgsrc installs
+  #   /run/kea/kea-leases4.csv                  Some containers / minimal setups
+  #   /etc/kea/leases4.csv                      Custom path via kea-dhcp4.conf
+  #   /var/db/kea/kea-leases4.csv               OPNsense (Kea backend, 23.7+)
+  kea_leases: []
+  # kea_leases:
+  #   - "/var/lib/kea/kea-leases4.csv"          # standard Linux
+  #   - "/var/db/kea/kea-leases4.csv"           # OPNsense
+
+  # ---------------------------------------------------------------------------
+  # odhcpd_leases — odhcpd internal state file (OpenWrt, standalone mode)
+  # ---------------------------------------------------------------------------
+  # odhcpd is the OpenWrt DHCPv4/DHCPv6/RA daemon. Its internal state file
+  # uses '#' as the DATA line prefix (not a comment marker). Format per line:
+  #   # <ifname> <mac-or-duid> <iaid> <hostname> <remaining-secs> [<ip/plen>...]
+  #
+  # Field details:
+  #   mac-or-duid — DHCPv4: colon-separated MAC (e.g. "1c:69:7a:65:b4:ae")
+  #                 DHCPv6: hex DUID without colons (e.g. "0003000100aabbcc...")
+  #   hostname    — '-' means no hostname supplied; entry is skipped
+  #   ip/plen     — one or more addresses with prefix length, e.g.:
+  #                   "192.168.1.42/32"  (DHCPv4 always /32)
+  #                   "fd12:3456::1/128" (DHCPv6 always /128)
+  #                 The /plen suffix is stripped before parsing.
+  #
+  # IMPORTANT — standard OpenWrt setup (dnsmasq + odhcpd):
+  #   odhcpd writes /tmp/hosts/odhcpd in hosts format for dnsmasq to read.
+  #   That file is already handled by parseHostsBytes — add it to hosts_files,
+  #   NOT here. Only use odhcpd_leases when running odhcpd STANDALONE
+  #   (no dnsmasq), where the internal state file is the authoritative source.
+  #
+  # odhcpd UCI config (/etc/config/dhcp) for standalone mode:
+  #   config odhcpd 'odhcpd'
+  #     option leasefile '/tmp/hosts/odhcpd'    # hosts format → use hosts_files
+  #     # The internal state file path depends on how odhcpd was started:
+  #     # check the -S flag or the compiled-in default below.
+  #
+  # Common locations (internal state file):
+  #   /var/lib/odhcpd/dhcp.leases   Default when odhcpd persists its state
+  #   /tmp/odhcpd/dhcp.leases       tmpfs variant (lost on reboot)
+  odhcpd_leases: []
+  # odhcpd_leases:
+  #   - "/var/lib/odhcpd/dhcp.leases"    # odhcpd standalone
+  #   - "/tmp/odhcpd/dhcp.leases"        # tmpfs variant
+
+  # How often (seconds) to re-check all identity files for changes.
+  # mtime is checked first — unchanged files are never re-read or re-parsed.
+  # 0 = load once at startup and never poll again.
+  # Minimum enforced value: 5 seconds.
   poll_interval: 60
 

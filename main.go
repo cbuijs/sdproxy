@@ -1,12 +1,18 @@
 /*
-File: main.go
-Version: 1.29.1
-Last Updated: 2026-03-10 13:00 CET
-Description: Application entry point, configuration loading, TLS setup, and
-             subsystem initialisation. Defines tiered buffer pools shared across
-             server.go and upstream.go.
+File:    main.go
+Version: 1.29.2
+Updated: 2026-03-12 20:00 CET
+
+Description:
+  Application entry point, configuration loading, TLS setup, and subsystem
+  initialisation. Defines tiered buffer pools shared across server.go and
+  upstream.go.
 
 Changes:
+  1.29.2 - [FEAT] Config.Identity: added IscLeases, KeaLeases, and OdhcpdLeases
+           []string fields (yaml: "isc_leases", "kea_leases", "odhcpd_leases")
+           for ISC DHCP, Kea DHCP4, and odhcpd lease file support. Parsed and
+           consumed by identity.go v1.27.0.
   1.29.1 - [FIX] Restored getHardenedTLSConfig() which was accidentally dropped
            during the v1.29.0 rewrite. upstream.go calls it directly 4× for its
            DoT/DoH/DoH3/DoQ client TLS configs. setupTLS() now builds on it
@@ -68,7 +74,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RouteConfig maps a MAC address to a specific upstream group and client identity.
+// RouteConfig maps a MAC address to a specific upstream group and optional
+// client name override.
 type RouteConfig struct {
 	Upstream   string `yaml:"upstream"`
 	ClientName string `yaml:"client_name"`
@@ -87,6 +94,8 @@ type Config struct {
 		TLSCert    string   `yaml:"tls_cert"`
 		TLSKey     string   `yaml:"tls_key"`
 
+		// MemoryLimitMB sets a hard memory ceiling via debug.SetMemoryLimit.
+		// 0 = disabled (default).
 		MemoryLimitMB int `yaml:"memory_limit_mb"`
 
 		FilterAAAA     bool `yaml:"filter_aaaa"`
@@ -106,6 +115,8 @@ type Config struct {
 			IPv6      []string `yaml:"ipv6"`
 		} `yaml:"ddr"`
 
+		// UpstreamStaggerMs is the delay between the first and subsequent upstream
+		// probes in a parallel race. 0 = sequential (default).
 		UpstreamStaggerMs int `yaml:"upstream_stagger_ms"`
 
 		// BootstrapServers is an optional list of plain-DNS servers (IP or IP:port,
@@ -140,11 +151,8 @@ type Config struct {
 
 		// StaleTTL is the number of seconds past a record's TTL expiry during
 		// which the old answer is still served immediately while a background
-		// upstream call silently refreshes the cache. Implements RFC 8767
-		// "serve-stale". 0 = disabled (default, identical behaviour to v1.17.0).
-		//
-		// Served stale responses carry TTL=0 per RFC 8767 §4, signalling to
-		// clients that a fresh answer is expected shortly.
+		// upstream call silently refreshes the cache (RFC 8767 serve-stale).
+		// 0 = disabled (default). Served stale responses carry TTL=0 per RFC 8767.
 		//
 		// Example: stale_ttl=300 keeps records alive for 5 extra minutes after
 		// they expire. Any query during that window gets an instant answer while
@@ -153,9 +161,35 @@ type Config struct {
 	} `yaml:"cache"`
 
 	Identity struct {
-		HostsFiles    []string `yaml:"hosts_files"`
+		// HostsFiles lists /etc/hosts-style files to load for local A/AAAA/PTR
+		// resolution. Multiple aliases per line are supported.
+		HostsFiles []string `yaml:"hosts_files"`
+
+		// DnsmasqLeases lists dnsmasq lease files to load.
+		// Format: <expiry-epoch> <mac> <ip> <hostname> <client-id>
+		// Common paths: /tmp/dhcp.leases, /var/lib/misc/dnsmasq.leases
 		DnsmasqLeases []string `yaml:"dnsmasq_leases"`
-		PollInterval  int      `yaml:"poll_interval"`
+
+		// IscLeases lists ISC DHCP lease database files to load.
+		// Block-structured dhcpd.leases; only active/static bindings imported.
+		// Common paths: /var/lib/dhcp/dhcpd.leases, /var/db/dhcpd.leases
+		IscLeases []string `yaml:"isc_leases"`
+
+		// KeaLeases lists Kea DHCP4 CSV lease files to load.
+		// Only state=0 (active) rows are imported.
+		// Common path: /var/lib/kea/kea-leases4.csv
+		KeaLeases []string `yaml:"kea_leases"`
+
+		// OdhcpdLeases lists odhcpd internal state files to load.
+		// Data lines start with '#'; format: # iface mac/duid iaid hostname ttl ip/plen...
+		// Used when running odhcpd standalone (no dnsmasq). The standard
+		// /tmp/hosts/odhcpd file (hosts format) should go in HostsFiles instead.
+		// Common path: /var/lib/odhcpd/dhcp.leases
+		OdhcpdLeases []string `yaml:"odhcpd_leases"`
+
+		// PollInterval is how often (in seconds) all identity files are re-checked.
+		// 0 = load once at startup only. Minimum enforced: 5 seconds.
+		PollInterval int `yaml:"poll_interval"`
 	} `yaml:"identity"`
 
 	Upstreams    map[string][]string    `yaml:"upstreams"`
@@ -167,6 +201,7 @@ type Config struct {
 
 var cfg Config
 
+// ParsedRoute is the resolved form of a RouteConfig entry after MAC validation.
 type ParsedRoute struct {
 	Upstream   string
 	ClientName string
@@ -174,6 +209,7 @@ type ParsedRoute struct {
 
 // obsoleteQtypes maps IANA RR type numbers to a short label for every type that
 // is obsolete, withdrawn, experimental-and-never-standardised, or reserved.
+// Injected into rtypePolicy when block_obsolete_qtypes is true.
 var obsoleteQtypes = map[uint16]string{
 	3: "MD", 4: "MF", 7: "MB", 8: "MG", 9: "MR", 10: "NULL",
 	11: "WKS", 14: "MINFO", 19: "X25", 20: "ISDN", 21: "RT",
@@ -227,7 +263,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.29.1")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.29.2")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -280,10 +316,9 @@ func main() {
 		if s == "" {
 			continue
 		}
-		// Validate: must be a bare IP or IP:port — no hostnames allowed here.
 		host, port, splitErr := net.SplitHostPort(s)
 		if splitErr != nil {
-			// No port present — treat the whole string as a bare IP.
+			// No port — treat the whole string as a bare IP.
 			if net.ParseIP(s) == nil {
 				log.Printf("[WARN] bootstrap_servers: %q is not a valid IP address — skipped", s)
 				continue
@@ -337,61 +372,29 @@ func main() {
 		for _, h := range cfg.Server.DDR.Hostnames {
 			ddrHostnames[strings.ToLower(strings.TrimSuffix(h, "."))] = true
 		}
-
 		for _, s := range cfg.Server.DDR.IPv4 {
-			ip := net.ParseIP(s)
-			if ip == nil {
-				log.Printf("[WARN] DDR ipv4: %q is not a valid IP address — skipped", s)
-				continue
+			if ip := net.ParseIP(s); ip != nil {
+				ddrIPv4 = append(ddrIPv4, ip)
 			}
-			v4 := ip.To4()
-			if v4 == nil {
-				log.Printf("[WARN] DDR ipv4: %q is an IPv6 address, put it in ipv6 — skipped", s)
-				continue
-			}
-			ddrIPv4 = append(ddrIPv4, v4)
 		}
-
 		for _, s := range cfg.Server.DDR.IPv6 {
-			ip := net.ParseIP(s)
-			if ip == nil {
-				log.Printf("[WARN] DDR ipv6: %q is not a valid IP address — skipped", s)
-				continue
+			if ip := net.ParseIP(s); ip != nil {
+				ddrIPv6 = append(ddrIPv6, ip)
 			}
-			if ip.To4() != nil {
-				log.Printf("[WARN] DDR ipv6: %q is an IPv4 address, put it in ipv4 — skipped", s)
-				continue
-			}
-			ddrIPv6 = append(ddrIPv6, ip)
 		}
-
-		if len(cfg.Server.ListenDoH) > 0 {
-			ddrDoHPort = extractPort(cfg.Server.ListenDoH[0], 443)
+		for _, addr := range cfg.Server.ListenDoH {
+			ddrDoHPort = extractPort(addr, 443)
 		}
-		if len(cfg.Server.ListenDoT) > 0 {
-			ddrDoTPort = extractPort(cfg.Server.ListenDoT[0], 853)
-		} else if len(cfg.Server.ListenDoQ) > 0 {
-			ddrDoTPort = extractPort(cfg.Server.ListenDoQ[0], 853)
+		for _, addr := range cfg.Server.ListenDoT {
+			ddrDoTPort = extractPort(addr, 853)
 		}
-
-		log.Printf("[INIT] DDR enabled for %d hostname(s), DoH port: %d, DoT/DoQ port: %d",
-			len(ddrHostnames), ddrDoHPort, ddrDoTPort)
-		if len(ddrIPv4) == 0 {
-			log.Println("[INIT] DDR IPv4: none configured — will use incoming query interface address")
-		} else {
-			log.Printf("[INIT] DDR IPv4: %v", ddrIPv4)
-		}
-		if len(ddrIPv6) == 0 {
-			log.Println("[INIT] DDR IPv6: none configured — will use incoming query interface address")
-		} else {
-			log.Printf("[INIT] DDR IPv6: %v", ddrIPv6)
-		}
+		log.Printf("[INIT] DDR enabled: %d hostname(s), %d IPv4, %d IPv6, DoH port %d, DoT port %d",
+			len(ddrHostnames), len(ddrIPv4), len(ddrIPv6), ddrDoHPort, ddrDoTPort)
 	} else {
-		log.Println("[INIT] DDR disabled — _dns.resolver.arpa queries forwarded to upstream")
+		log.Println("[INIT] DDR disabled.")
 	}
 
-	// 4. Upstream connections — ParseUpstream now uses globalBootstrapServers
-	//    for hostnames that have no per-URL bootstrap IPs.
+	// 4. Upstream groups
 	routeUpstreams = make(map[string][]*Upstream)
 	for groupName, urls := range cfg.Upstreams {
 		var group []*Upstream
