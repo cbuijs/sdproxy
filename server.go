@@ -1,12 +1,17 @@
 /*
 File: server.go
-Version: 1.20.1
-Last Updated: 2026-03-09 13:00 CET
+Version: 1.21.0
+Last Updated: 2026-03-13 12:00 CET
 Description: High-performance listeners for UDP, TCP, DoT, DoH (HTTP/1.1 + HTTP/2),
              DoH3 (QUIC), and DoQ. Aggressive timeouts to conserve memory on embedded
              targets. Supports RFC 8484 GET and POST for DoH.
 
 Changes:
+  1.21.0 - [FEAT] DoH responses now carry an Alt-Svc header advertising DoH3
+           availability (RFC 7838 + RFC 9114). Port is derived from the actual
+           listener address so non-443 deployments work without any extra config.
+           ma=86400 (24 h) prevents clients from re-probing on every request —
+           critical on low-resource routers. buildAltSvc() helper added.
   1.20.1 - [FIX] quic-go compatibility: Updated DoQ connection and stream handling to
            use concrete struct pointers (*quic.Conn, *quic.Stream). In newer quic-go
            versions (v0.40+), the quic.Connection and quic.Stream interfaces were
@@ -134,7 +139,25 @@ func StartServers(tlsConf *tls.Config) {
 	for _, addr := range cfg.Server.ListenDoH {
 		addr := addr
 		mux := http.NewServeMux()
-		mux.HandleFunc("/dns-query", handleDoH)
+
+		// Build the Alt-Svc value once per listener address (not per request).
+		// The value advertises the co-located DoH3 (HTTP/3 over QUIC) endpoint
+		// so that HTTP/1.1 and HTTP/2 clients can discover and upgrade to QUIC.
+		// Port is derived from addr so non-443 deployments stay correct.
+		altSvc := buildAltSvc(addr)
+
+		// Wrap handleDoH to inject the Alt-Svc header before every response.
+		// Set unconditionally — both h2 and h3 share this mux, so even an
+		// HTTP/1.1 client learns about DoH3 and can upgrade on its next request.
+		mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+			// Alt-Svc (RFC 7838): advertise DoH3 on the same port.
+			// h3=":<port>"  — RFC 9114 ALPN token; no draft suffix needed.
+			// ma=86400      — cache for 24 h so clients go straight to QUIC
+			//                 after the first discovery, avoiding re-probe overhead
+			//                 on every request (costly on a constrained router).
+			w.Header().Set("Alt-Svc", altSvc)
+			handleDoH(w, r)
+		})
 
 		// Clone the shared TLS config and restrict ALPN to HTTP-only tokens.
 		// The shared tlsConf carries "doq" and "dot" which cause strict HTTP/1.1
@@ -202,6 +225,8 @@ func StartServers(tlsConf *tls.Config) {
 		}()
 	}
 }
+
+// --- Protocol handlers ---
 
 func handleTCP(w dns.ResponseWriter, r *dns.Msg) {
 	var ip string
@@ -314,8 +339,8 @@ func handleDoQConnection(conn *quic.Conn) {
 			// Connection closed or reset — stop accepting streams.
 			return
 		}
-		
-		// We accept *quic.Stream since quic.Stream is now a struct type and requires 
+
+		// We accept *quic.Stream since quic.Stream is now a struct type and requires
 		// a pointer to implement io.Reader / io.Writer correctly.
 		go func(s *quic.Stream) {
 			defer s.Close()
@@ -341,6 +366,26 @@ func handleDoQConnection(conn *quic.Conn) {
 			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host, localIP: localIP}, msg, host, "DoQ")
 		}(stream)
 	}
+}
+
+// --- Helpers ---
+
+// buildAltSvc returns the Alt-Svc header value for a given DoH listener address.
+// Extracts the port from addr ("host:port") so the value stays correct even when
+// DoH is not on the default port 443.
+//
+// Example outputs:
+//   addr "0.0.0.0:443"  → `h3=":443"; ma=86400`
+//   addr "0.0.0.0:8443" → `h3=":8443"; ma=86400`
+func buildAltSvc(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		port = "443" // safe fallback; should never happen with validated config
+	}
+	// RFC 9114 §3.1 uses "h3" as the ALPN token — no draft suffix needed for
+	// any client that shipped in the past two years (Chrome 87+, Firefox 88+,
+	// curl 7.66+). ma=86400: cache for 24 h so clients skip re-probe overhead.
+	return `h3=":` + port + `"; ma=86400`
 }
 
 // --- Response Writer Adapters ---
@@ -369,8 +414,8 @@ func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 		return err
 	}
 	dw.w.Header().Set("Content-Type", "application/dns-message")
-	_, err = dw.w.Write(packed)  // Write BEFORE Put — buffer is still owned here
-	smallBufPool.Put(bufPtr)      // safe now: HTTP layer has consumed all of packed
+	_, err = dw.w.Write(packed) // Write BEFORE Put — buffer is still owned here
+	smallBufPool.Put(bufPtr)     // safe now: HTTP layer has consumed all of packed
 	return err
 }
 
