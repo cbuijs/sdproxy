@@ -1,61 +1,36 @@
 /*
-File: cache.go
-Version: 1.18.0
-Last Updated: 2026-03-10 12:00 CET
+File:    cache.go
+Version: 1.19.0
+Updated: 2026-03-14 15:00 CET
 Description: High-performance, sharded, non-blocking DNS cache.
              Caches positive (NOERROR), negative (NXDOMAIN), and empty (NOERROR
              with no answer records) responses per RFC 2308.
              Optimised for embedded: struct-based zero-allocation cache keys,
              pseudo-random eviction.
 
-             NEW — SERVE-STALE / BACKGROUND REVALIDATION (stale_ttl)
-             ──────────────────────────────────────────────────────────
-             Each cacheItem now carries two time boundaries:
-               expiration  — the TTL-derived "fresh" window. CacheGet returns
-                             (msg, isStale=false) while now < expiration.
-               staleUntil  — expiration + cfg.Cache.StaleTTL. While the entry
-                             lives in this extra window, CacheGet returns
-                             (msg, isStale=true). ProcessDNS serves the stale
-                             response immediately (zero latency for the client)
-                             and fires a backgroundRevalidate goroutine.
-                             When StaleTTL=0 (default), staleUntil==expiration
-                             and behaviour is identical to v1.17.0.
-             The background sweeper was updated to delete on now>staleUntil,
-             keeping stale entries in memory for the full stale window.
-             Per RFC 8767, stale responses are served with TTL=0 so clients
-             know the answer may be refreshed shortly.
-
-             NEW — DEDICATED NEGATIVE TTL (negative_ttl)
-             ──────────────────────────────────────────────────────────
-             negative_ttl gives operators a separate TTL floor specifically
-             for NXDOMAIN and NOERROR/NODATA responses, independent of
-             min_ttl (which now applies only to positive responses when
-             negative_ttl is set). Useful on routers where you want to
-             cache positive records for 60 s but cap negative/mistyped
-             entries at 30 s to avoid long wait times after a typo.
-             When negative_ttl=0 (default), behaviour is identical to v1.17.0
-             (MinTTL applies as the floor for all response types).
-
-             NEW — routeName stored in cacheItem
-             ──────────────────────────────────────────────────────────
-             cacheItem.routeName is the upstream group that produced this
-             entry (e.g. "default", "kids"). Stored so backgroundRevalidate
-             in process.go can look up the correct upstream group without
-             needing a reverse routeIdx→name map.
-
 Changes:
+  1.19.0 - [FIX] Bug 4: CacheGet sub-second fresh-window edge case now falls
+           through to the stale path when stale_ttl > 0, instead of returning a
+           miss. Previously a record with <1s of TTL left was evicted from the
+           fresh path but was never handed to backgroundRevalidate — causing an
+           unnecessary synchronous upstream call in the last second of every TTL.
+           When stale_ttl=0 the old miss behaviour is preserved.
+           [FIX] Bug 6: Background sweeper now uses a two-phase
+           read-then-write strategy. Phase 1 collects expired keys under a
+           cheap RLock. Phase 2 re-acquires a full Lock only when there is
+           actually work to do, and re-checks staleUntil before deleting to
+           avoid evicting a freshly-populated entry that arrived between the
+           two lock phases. On a MIPS/ARM home router where map iteration over
+           128 items takes measurable time, this eliminates the periodic
+           read-latency spike that the old full-write-lock-during-scan caused.
   1.18.0 - [FEAT] Serve-stale / background revalidation (RFC 8767).
            cacheItem gains staleUntil time.Time; CacheGet returns (msg, isStale bool).
            Stale entries served with TTL=0. Sweeper uses staleUntil as deletion fence.
            [FEAT] Dedicated NegativeTTL floor for NXDOMAIN/NODATA responses.
-           Separates the min_ttl concern: positives use MinTTL, negatives use
-           NegativeTTL (when set), falling back to MinTTL for backwards compat.
            [FEAT] cacheItem.routeName stored for background revalidation.
-           CacheSet gains routeName string parameter; all callers updated.
   1.17.0 - [PERF] shardCount 16→32. cacheItem stores *dns.Msg (not packed bytes).
-           CacheGet returns a fresh deep copy; CacheSet stores its own deep copy.
   1.16.0 - [PERF] Pre-computed cacheMaxPerShard in InitCache.
-  1.15.0 - [FEAT] max_ttl support. CacheGet rewrites TTLs in Ns/Extra sections.
+  1.15.0 - [FEAT] max_ttl support.
   1.14.0 - [PERF] Inline FNV-1a shard selector, RouteIdx uint8 cache key.
   1.13.0 - [PERF] Single time.Now() per CacheGet call.
   1.12.0 - [FIX]  Negative responses cached per RFC 2308.
@@ -98,9 +73,12 @@ const shardCount = 32
 //
 // expiration — the TTL-derived "fresh" deadline. Beyond this, isStale=true.
 // staleUntil — expiration + StaleTTL. Beyond this, the entry is treated as a
-//              miss. When StaleTTL=0, staleUntil==expiration (no stale window).
+//
+//	miss. When StaleTTL=0, staleUntil==expiration (no stale window).
+//
 // routeName  — the upstream group that produced this entry; used by the
-//              backgroundRevalidate path in process.go to find the right upstreams.
+//
+//	backgroundRevalidate path in process.go to find the right upstreams.
 type cacheItem struct {
 	msg        *dns.Msg  // immutable after store; callers always get a Copy
 	expiration time.Time // end of fresh window
@@ -136,25 +114,49 @@ func InitCache(maxSize int, _ int) {
 	}
 
 	// Background sweeper — reclaims entries whose stale window has passed.
-	// 60 s is safe: CacheGet already rejects expired entries on read; the
-	// sweeper only affects memory, not query correctness.
-	// Entries in the stale window (expiration < now < staleUntil) are kept
-	// alive intentionally so backgroundRevalidate can serve them.
+	//
+	// 60 s tick is safe: CacheGet already rejects expired entries on read; the
+	// sweeper only affects memory, not query correctness. Entries inside the
+	// stale window (expiration < now < staleUntil) are kept alive intentionally
+	// so backgroundRevalidate can serve them.
+	//
+	// Bug 6 fix: two-phase read-then-write strategy.
+	//   Phase 1: collect expired keys under a cheap RLock — other readers and
+	//            writers on this shard are not blocked.
+	//   Phase 2: re-acquire a full Lock and delete. The staleUntil check is
+	//            repeated inside the write lock to handle the race where a fresh
+	//            upstream response re-populated the same key between the two
+	//            phases; we must not evict an entry that just came back to life.
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			now := time.Now()
 			for i := range shards {
-				shards[i].Lock()
-				for k, v := range shards[i].items {
-					// Delete only after the full stale window has passed.
-					// When StaleTTL=0, staleUntil==expiration — same behaviour as before.
+				shard := shards[i]
+
+				// Phase 1: cheap read scan.
+				shard.RLock()
+				var toDelete []DNSCacheKey
+				for k, v := range shard.items {
 					if now.After(v.staleUntil) {
-						delete(shards[i].items, k)
+						toDelete = append(toDelete, k)
 					}
 				}
-				shards[i].Unlock()
+				shard.RUnlock()
+
+				// Phase 2: delete only when there is actual work, and re-check
+				// staleUntil under the write lock to avoid evicting a freshly
+				// re-populated entry that arrived between the two phases.
+				if len(toDelete) > 0 {
+					shard.Lock()
+					for _, k := range toDelete {
+						if v, ok := shard.items[k]; ok && now.After(v.staleUntil) {
+							delete(shard.items, k)
+						}
+					}
+					shard.Unlock()
+				}
 			}
 		}
 	}()
@@ -185,11 +187,10 @@ func getShard(key DNSCacheKey) *cacheShard {
 // CacheGet returns a caller-owned copy of a cached response with TTLs rewritten
 // to the remaining lifetime, plus an isStale flag.
 //
-//   isStale=false — fresh entry; TTLs reflect remaining lifetime normally.
-//   isStale=true  — entry is past its TTL but inside the stale window.
-//                   TTLs are set to 0 (RFC 8767 §4) so clients know the answer
-//                   may be refreshed soon. ProcessDNS will fire a background
-//                   revalidation after writing the stale response.
+//	isStale=false — fresh entry; TTLs reflect remaining lifetime normally.
+//	isStale=true  — entry is past its TTL but inside the stale window.
+//	                TTLs are set to 0 (RFC 8767 §4) so clients know the answer
+//	                may be refreshed soon. ProcessDNS fires backgroundRevalidate.
 //
 // Returns (nil, false) on a complete miss or when the stale window has passed.
 func CacheGet(key DNSCacheKey) (*dns.Msg, bool) {
@@ -216,25 +217,32 @@ func CacheGet(key DNSCacheKey) (*dns.Msg, bool) {
 
 	isStale := now.After(item.expiration)
 
-	// Stale window only active when StaleTTL > 0. Otherwise reject expired entries.
+	// Stale window only active when StaleTTL > 0. Reject expired entries otherwise.
 	if isStale && cfg.Cache.StaleTTL <= 0 {
 		return nil, false
 	}
 
 	// Compute remaining TTL for fresh entries.
-	// Stale entries get TTL=0 per RFC 8767 §4 — the answer is valid but the
-	// client should expect a fresh record soon.
+	// Stale entries get TTL=0 per RFC 8767 §4.
 	var remaining uint32
 	if !isStale {
 		r := item.expiration.Sub(now).Seconds()
 		if r < 1 {
-			// Sub-second fresh window — effectively expired; avoid TTL=0 confusion
-			// with a deliberate stale response. Treat as miss.
-			return nil, false
+			// Bug 4 fix: sub-second fresh window — the entry is functionally expired.
+			// When serve-stale is enabled, promote it to the stale path so
+			// backgroundRevalidate fires and the client gets TTL=0 instead of a miss
+			// that forces a synchronous upstream round-trip. Without serve-stale,
+			// keep the old miss behaviour so the next query fetches fresh data.
+			if cfg.Cache.StaleTTL <= 0 {
+				return nil, false
+			}
+			// remaining stays 0, same wire behaviour as a deliberate stale hit.
+			isStale = true
+		} else {
+			remaining = uint32(r)
 		}
-		remaining = uint32(r)
 	}
-	// remaining=0 for stale responses — intentional.
+	// remaining==0 for stale responses — intentional (RFC 8767 §4).
 
 	// Deep copy: caller owns the result and may mutate it (patch ID, transforms).
 	out := item.msg.Copy()
@@ -260,16 +268,11 @@ func CacheGet(key DNSCacheKey) (*dns.Msg, bool) {
 // routeName is the upstream group that produced this response; stored in the
 // item so backgroundRevalidate can look up the correct upstreams later.
 //
-// Storing a deep copy ensures the caller may mutate msg after CacheSet returns
-// without corrupting the cached entry (needed by the in-place transform path).
-//
 // TTL derivation:
-//   Positive (NOERROR with answers):  minimum TTL across all answer RRs.
-//   Negative (NXDOMAIN or NODATA):    SOA minimum from authority section;
-//                                     falls back to NegativeTTL or MinTTL.
 //
-// NegativeTTL acts as an independent floor for negative responses when set,
-// allowing a shorter cache lifetime for NXDOMAIN without affecting positive TTLs.
+//	Positive (NOERROR with answers):  minimum TTL across all answer RRs.
+//	Negative (NXDOMAIN or NODATA):    SOA minimum from authority section;
+//	                                  falls back to NegativeTTL or MinTTL.
 func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 	if !cfg.Cache.Enabled || msg == nil {
 		return
@@ -327,8 +330,6 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 	// Floor enforcement:
 	//   Positive responses  → MinTTL.
 	//   Negative responses  → NegativeTTL when explicitly set; else MinTTL.
-	// This lets operators write `min_ttl: 60, negative_ttl: 30` to get a
-	// shorter cache window for NXDOMAIN without affecting positive records.
 	effectiveMin := cfg.Cache.MinTTL
 	if isNeg && cfg.Cache.NegativeTTL > 0 {
 		effectiveMin = cfg.Cache.NegativeTTL
@@ -342,13 +343,11 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 		ttl = uint32(cfg.Cache.MaxTTL)
 	}
 
-	// Compute time boundaries.
-	now := time.Now()
+	now        := time.Now()
 	expiration := now.Add(time.Duration(ttl) * time.Second)
 
 	// staleUntil extends past expiration by StaleTTL seconds.
-	// When StaleTTL=0 (default), staleUntil==expiration — no stale window,
-	// behaviour is identical to v1.17.0.
+	// When StaleTTL=0 (default), staleUntil==expiration — no stale window.
 	staleUntil := expiration
 	if cfg.Cache.StaleTTL > 0 {
 		staleUntil = expiration.Add(time.Duration(cfg.Cache.StaleTTL) * time.Second)

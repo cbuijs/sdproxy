@@ -1,7 +1,7 @@
 /*
 File:    main.go
-Version: 1.30.0
-Updated: 2026-03-14 12:00 CET
+Version: 1.31.0
+Updated: 2026-03-14 15:00 CET
 
 Description:
   Application entry point, configuration loading, TLS setup, and subsystem
@@ -9,6 +9,10 @@ Description:
   upstream.go.
 
 Changes:
+  1.31.0 - [FIX] Bug 3: Added ddrDoQPort global (default 853), populated from
+           listen_doq addresses at DDR init time. DoT and DoQ no longer share a
+           single port in DDR SVCB records — process.go now emits separate SVCB
+           records for each. Updated DDR log line to show all four ports.
   1.30.0 - [FEAT] bypass_local per-route flag: when true, local A/AAAA/PTR
            answers from hosts/leases files are skipped for that route and the
            query goes straight to the upstream. Client identification (clientName
@@ -22,22 +26,14 @@ Changes:
            blocks for MAC routes (step 1), domain routes (step 2), and the
            route index table (step 7) accordingly.
   1.29.2 - [FEAT] Config.Identity: added IscLeases, KeaLeases, and OdhcpdLeases
-           []string fields (yaml: "isc_leases", "kea_leases", "odhcpd_leases")
-           for ISC DHCP, Kea DHCP4, and odhcpd lease file support.
+           []string fields for ISC DHCP, Kea DHCP4, and odhcpd lease support.
   1.29.1 - [FIX] Restored getHardenedTLSConfig() which was accidentally dropped
-           during the v1.29.0 rewrite. upstream.go calls it directly 4× for its
-           DoT/DoH/DoH3/DoQ client TLS configs. setupTLS() now builds on it
-           correctly again. generateSelfSignedCert() aligned with the original.
-  1.29.0 - [FEAT] Cache.NegativeTTL: dedicated TTL floor for NXDOMAIN/NODATA
-           responses, independent of min_ttl.
-           [FEAT] Cache.StaleTTL: serve-stale window length in seconds per
-           RFC 8767.
-  1.28.0 - [FEAT] Global bootstrap servers: added BootstrapServers []string to
-           the Server config struct (yaml: "bootstrap_servers").
+           during the v1.29.0 rewrite.
+  1.29.0 - [FEAT] Cache.NegativeTTL and Cache.StaleTTL config fields.
+  1.28.0 - [FEAT] Global bootstrap servers (BootstrapServers []string).
   1.27.0 - [FEAT] InitThrottle() called after InitIdentity().
-  1.26.1 - [FEAT] Pre-pack policy RCODE response templates for zero-alloc
-           policy fast-paths.
-  1.25.0 - [FEAT] domain_policy config section: maps domain suffixes to RCODE.
+  1.26.1 - [FEAT] Pre-pack policy RCODE response templates.
+  1.25.0 - [FEAT] domain_policy config section.
   1.24.0 - [FEAT] block_obsolete_qtypes config flag.
   1.23.0 - [FEAT] Cache.MaxTTL config field.
   1.22.0 - [FEAT] DDR.IPv4/IPv6 changed to []string for multiple addresses.
@@ -102,12 +98,9 @@ type DomainRouteConfig struct {
 // expanded map form ({ upstream: "name", bypass_local: true }).
 func (d *DomainRouteConfig) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind == yaml.ScalarNode {
-		// Old compact string form — just an upstream group name.
 		d.Upstream = value.Value
 		return nil
 	}
-	// New expanded map form — decode normally. Use a type alias to avoid
-	// infinite recursion through this same UnmarshalYAML.
 	type plain DomainRouteConfig
 	return value.Decode((*plain)(d))
 }
@@ -161,8 +154,6 @@ type Config struct {
 		// UDP only) used to resolve upstream hostnames that have no per-URL
 		// bootstrap IPs. Entries without a port default to :53.
 		// Per-URL bootstrap IPs always take precedence over these global servers.
-		// When empty, upstreams with hostnames (not bare IPs) and no per-URL
-		// bootstrap IPs fall back to the OS resolver at connection time.
 		BootstrapServers []string `yaml:"bootstrap_servers"`
 	} `yaml:"server"`
 
@@ -190,19 +181,14 @@ type Config struct {
 
 		// IscLeases lists ISC DHCP block-structured lease files to load.
 		// Block-structured dhcpd.leases; only active/static bindings imported.
-		// Common paths: /var/lib/dhcp/dhcpd.leases, /var/db/dhcpd.leases
 		IscLeases []string `yaml:"isc_leases"`
 
 		// KeaLeases lists Kea DHCP4 CSV lease files to load.
 		// Only state=0 (active) rows are imported.
-		// Common path: /var/lib/kea/kea-leases4.csv
 		KeaLeases []string `yaml:"kea_leases"`
 
 		// OdhcpdLeases lists odhcpd internal state files to load.
-		// Data lines start with '#'; format: # iface mac/duid iaid hostname ttl ip/plen...
-		// Used when running odhcpd standalone (no dnsmasq). The standard
-		// /tmp/hosts/odhcpd file (hosts format) should go in HostsFiles instead.
-		// Common path: /var/lib/odhcpd/dhcp.leases
+		// Used when running odhcpd standalone (no dnsmasq).
 		OdhcpdLeases []string `yaml:"odhcpd_leases"`
 
 		// PollInterval is how often (in seconds) all identity files are re-checked.
@@ -212,9 +198,6 @@ type Config struct {
 
 	Upstreams    map[string][]string          `yaml:"upstreams"`
 	Routes       map[string]RouteConfig       `yaml:"routes"`
-	// DomainRoutes maps domain suffixes to upstream groups. Both forms are valid:
-	//   compact:  "lan": "local_network"
-	//   expanded: "lan": { upstream: "local_network", bypass_local: true }
 	DomainRoutes map[string]DomainRouteConfig `yaml:"domain_routes"`
 	RtypePolicy  map[string]string            `yaml:"rtype_policy"`
 	DomainPolicy map[string]string            `yaml:"domain_policy"`
@@ -224,8 +207,8 @@ var cfg Config
 
 // ParsedRoute is the resolved form of a RouteConfig entry after MAC validation.
 type ParsedRoute struct {
-	Upstream    string
-	ClientName  string
+	Upstream   string
+	ClientName string
 	// BypassLocal mirrors RouteConfig.BypassLocal — carried into the hot-path.
 	BypassLocal bool
 }
@@ -251,8 +234,13 @@ var (
 	ddrIPv4 []net.IP
 	ddrIPv6 []net.IP
 
+	// ddrDoHPort / ddrDoTPort / ddrDoQPort are derived from the configured
+	// listener addresses at startup. Each protocol gets its own port so that
+	// DDR SVCB records are accurate even when DoT and DoQ run on different ports.
+	// Defaults match the IANA-assigned port numbers.
 	ddrDoHPort uint16 = 443
 	ddrDoTPort uint16 = 853
+	ddrDoQPort uint16 = 853 // Bug 3 fix: separate from ddrDoTPort
 
 	rtypePolicy  map[uint16]int
 	domainPolicy map[string]int
@@ -286,7 +274,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.30.0")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.31.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -388,8 +376,6 @@ func main() {
 	log.Printf("[INIT] MAC routes: %d entries (ARP polling enabled: %v)", len(macRoutes), hasMACRoutes)
 
 	// 2. Domain-based routes
-	// DomainRouteConfig.UnmarshalYAML handles both compact ("lan": "upstream")
-	// and expanded ("lan": { upstream: "...", bypass_local: true }) YAML forms.
 	domainRoutes = make(map[string]domainRouteEntry, len(cfg.DomainRoutes))
 	for domain, dr := range cfg.DomainRoutes {
 		if dr.Upstream == "" {
@@ -410,6 +396,8 @@ func main() {
 	hasDomainRoutes = len(domainRoutes) > 0
 
 	// 3. DDR spoofing
+	// Each protocol port is read independently so SVCB records are accurate
+	// even when DoT and DoQ share hardware but run on different ports.
 	if cfg.Server.DDR.Enabled {
 		ddrHostnames = make(map[string]bool)
 		for _, h := range cfg.Server.DDR.Hostnames {
@@ -431,8 +419,14 @@ func main() {
 		for _, addr := range cfg.Server.ListenDoT {
 			ddrDoTPort = extractPort(addr, 853)
 		}
-		log.Printf("[INIT] DDR enabled: %d hostname(s), %d IPv4, %d IPv6, DoH port %d, DoT port %d",
-			len(ddrHostnames), len(ddrIPv4), len(ddrIPv6), ddrDoHPort, ddrDoTPort)
+		// Bug 3 fix: populate ddrDoQPort separately from ddrDoTPort.
+		// DoQ and DoT may use the same port (853) or different ones — we track
+		// them independently so process.go can emit separate SVCB records.
+		for _, addr := range cfg.Server.ListenDoQ {
+			ddrDoQPort = extractPort(addr, 853)
+		}
+		log.Printf("[INIT] DDR enabled: %d hostname(s), %d IPv4, %d IPv6, DoH=%d DoT=%d DoQ=%d",
+			len(ddrHostnames), len(ddrIPv4), len(ddrIPv6), ddrDoHPort, ddrDoTPort, ddrDoQPort)
 	} else {
 		log.Println("[INIT] DDR disabled.")
 	}
@@ -535,7 +529,6 @@ outer:
 	for groupName := range cfg.Upstreams {
 		assignIdx(groupName)
 	}
-	// DomainRouteConfig used here — iterate over the parsed structs.
 	for _, dr := range cfg.DomainRoutes {
 		assignIdx(dr.Upstream)
 	}
@@ -636,12 +629,6 @@ func getHardenedTLSConfig() *tls.Config {
 // valid for 10 years. The ephemeral cert is regenerated on every restart.
 //
 // Builds on getHardenedTLSConfig() and adds the certificate + ALPN tokens.
-// ALPN tokens cover all three encrypted protocols:
-//
-//	"doq"      — DNS over QUIC (RFC 9250)
-//	"dot"      — DNS over TLS  (RFC 7858)
-//	"h2"       — HTTP/2 for DoH
-//	"http/1.1" — HTTP/1.1 for DoH fallback
 func setupTLS() *tls.Config {
 	var (
 		cert tls.Certificate

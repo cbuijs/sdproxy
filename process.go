@@ -1,7 +1,7 @@
 /*
 File:    process.go
-Version: 1.40.0
-Updated: 2026-03-14 12:00 CET
+Version: 1.41.0
+Updated: 2026-03-14 15:00 CET
 
 Description:
   Per-query DNS processing pipeline. Receives a parsed dns.Msg from server.go
@@ -9,28 +9,35 @@ Description:
   cache lookup, upstream forwarding, and response transforms.
 
 Changes:
+  1.41.0 - [FIX] Bug 1: sfKey no longer includes clientName when
+           hasClientNameUpstream=false. Previously every uniquely-named device
+           on the LAN produced a separate singleflight key, causing N upstream
+           calls instead of 1 for a shared cache miss. Now clientName is only
+           included in the key when the upstream URL itself varies per client
+           (i.e., when hasClientNameUpstream=true). Same fix applied to the
+           backgroundRevalidate sfKey for consistency.
+           [FIX] Bug 2: DDR hostname spoofing (step 1b) default case now returns
+           NODATA (NOERROR + empty answer) instead of NXDOMAIN. NXDOMAIN means
+           "this name does not exist", which is wrong — we actively answer
+           A/AAAA/HTTPS for it. The incorrect NXDOMAIN was cached by clients and
+           broke subsequent A/AAAA lookups for DDR hostnames until expiry.
+           [FIX] Bug 3: DDR SVCB discovery (step 1a) now emits separate records
+           for DoT (priority 2) and DoQ (priority 3), each referencing its own
+           port from ddrDoTPort and ddrDoQPort respectively. Previously DoT and
+           DoQ were bundled into one record sharing ddrDoTPort, so DoQ clients
+           could not find the service when the ports differed.
+           [FIX] Bug 5: backgroundRevalidate is now guarded by a non-blocking
+           semaphore (revalSem, capacity 32). During a stale storm, excess
+           goroutines are silently dropped instead of accumulating — the next
+           client hit for the same stale key will either get the result of an
+           in-flight revalidation (via sfGroup coalescing) or retry the semaphore.
+           This keeps the goroutine count from inflating the throttle pressure
+           signal and triggering unnecessary AIMD back-off on real client traffic.
   1.40.0 - [FEAT] bypass_local support: route selection (step 2) now runs BEFORE
-           local identity A/AAAA/PTR resolution (step 3) so the selected route's
-           bypass_local flag is known in time to conditionally skip local answers.
-           Client identity lookup (clientName for logging/{client-name}) is
-           unaffected — it always runs regardless of bypass_local.
-           walkDomainMaps updated: domainRoutes map type changed from
-           map[string]string to map[string]domainRouteEntry; returns
-           routeBypassLocal bool as an additional 4th return value.
-  1.39.0 - [FEAT] Singleflight coalescing: concurrent cache-miss queries for
-           the same (qname, qtype, routeIdx, clientName) share one upstream call.
-           sfGroup (singleflight.Group) wraps raceExchange. CacheSet moved inside
-           the singleflight closure so only the winning goroutine writes to cache;
-           every caller (winner + waiters) gets its own msg.Copy() of the result.
-           [FEAT] Serve-stale: CacheGet now returns (msg, isStale bool). When
-           isStale=true, ProcessDNS writes the stale response immediately and
-           fires backgroundRevalidate in a goroutine.
-           [PERF] transformResponse on the upstream path now uses inPlace=true.
-  1.38.0 - [FIX] walkDomainMaps: added && !policyBlocked guard to policy block,
-           enforcing most-specific-wins semantics for domain_policy.
+           local identity A/AAAA/PTR resolution (step 3).
+  1.39.0 - [FEAT] Singleflight coalescing and serve-stale support.
+  1.38.0 - [FIX] walkDomainMaps: most-specific-wins semantics enforced.
   1.37.0 - [FIX] DDR step 1a gated on cfg.Server.DDR.Enabled.
-           [FIX] LookupNameByMACOrIP receives (mac, ip) — correct signature.
-           clientMAC resolved once, reused in route step.
   1.36.0 - [FEAT] DDR hostname spoofing extended with HTTPS record support.
   1.34.0 - [PERF] Feature-gated hot-path skipping via startup bool flags.
   1.33.0 - [FEAT] Upstream forwarding uses raceExchange.
@@ -62,7 +69,7 @@ var logQueries bool
 var clientIDPool = sync.Pool{New: func() any { return new(strings.Builder) }}
 
 // sfGroup coalesces concurrent cache-miss queries for the same
-// (qname, qtype, routeIdx, clientName) tuple into a single upstream call.
+// (qname, qtype, routeIdx, [clientName]) tuple into a single upstream call.
 // All waiters receive the same *dns.Msg and call .Copy() to get their own
 // mutable instance before patching the transaction ID.
 //
@@ -77,6 +84,25 @@ type sfResult struct {
 	msg  *dns.Msg
 	addr string
 }
+
+// revalSem is a non-blocking semaphore that caps simultaneous background
+// revalidation goroutines at 32.
+//
+// Without this guard, a stale storm (many unique entries expiring at the same
+// moment) can spawn hundreds of goroutines at once. Those goroutines are not
+// counted against queryLimit, but they DO inflate runtime.NumGoroutine(), which
+// feeds the throttler's goroutine-spike signal and can trigger AIMD back-off on
+// perfectly healthy client traffic. 32 is a deliberately generous cap — on a
+// home router with stale_ttl enabled, simultaneous stale entries in the dozens
+// is already a very busy scenario.
+//
+// When the semaphore is full the goroutine is simply dropped. The stale response
+// was already written to the client. sfGroup coalescing ensures that the next
+// client hit for the same stale key will either coalesce with an already-running
+// revalidation or, if all semaphore slots are free again, start a fresh one.
+const revalSemCap = 32
+
+var revalSem = make(chan struct{}, revalSemCap)
 
 // policyRespCache maps DNS RCODE integers to a pre-packed *dns.Msg template.
 // Built at startup by buildPolicyRespCache(). Policy fast-paths unpack a copy
@@ -167,23 +193,16 @@ func isValidReversePTR(name string) bool {
 // checking both domainPolicy and domainRoutes simultaneously.
 //
 // Most-specific-wins semantics: once a match is found in either map, further
-// suffix iterations cannot overwrite it. This ensures "sub.example.com" config
-// takes precedence over a "example.com" config when both are present.
-//
-// Returns routeBypassLocal=true when the matched domain route has
-// bypass_local: true — signals ProcessDNS to skip local identity resolution
-// and send the query straight to the upstream instead.
+// suffix iterations cannot overwrite it.
 func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUpstream string, routeBypassLocal bool, routeMatched bool) {
 	search := qname
 	for {
-		// Only record the first (most specific) matching policy entry.
 		if hasDomainPolicy && !policyBlocked {
 			if rc, ok := domainPolicy[search]; ok {
 				policyRcode   = rc
 				policyBlocked = true
 			}
 		}
-		// Only record the first (most specific) matching route entry.
 		if hasDomainRoutes && !routeMatched {
 			if entry, ok := domainRoutes[search]; ok {
 				routeUpstream    = entry.upstream
@@ -191,7 +210,6 @@ func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUps
 				routeMatched     = true
 			}
 		}
-		// Early exit: both maps have been matched — no need to keep walking.
 		if policyBlocked && routeMatched {
 			return
 		}
@@ -364,13 +382,30 @@ func flattenCNAME(out *dns.Msg) {
 // Called from ProcessDNS after the stale response has already been written
 // to the client — zero additional latency for the end-user.
 //
+// Bug 5 fix: a non-blocking semaphore (revalSem) caps the number of concurrent
+// revalidation goroutines at revalSemCap. When the cap is reached the goroutine
+// exits immediately; the stale response has already been served and the next
+// client hit will retry. This prevents goroutine accumulation during stale storms
+// from inflating the throttler's goroutine-spike pressure signal.
+//
+// Bug 1 fix: the sfKey only includes clientName when hasClientNameUpstream=true.
+// Without this, every uniquely-named device missing the same cache entry would
+// generate its own upstream call, bypassing singleflight coalescing entirely.
+//
 // sfGroup coalesces simultaneous stale hits on the same key into a single
-// upstream call. The sfKey format matches the hot-path key in ProcessDNS,
-// so a background revalidation and a concurrent fresh-miss for the same
-// query also coalesce automatically.
+// upstream call. The sfKey format matches the hot-path key in ProcessDNS so
+// that a background revalidation and a concurrent fresh-miss coalesce too.
 //
 // routeUpstreams is read-only after startup — no lock needed.
 func backgroundRevalidate(key DNSCacheKey, routeName, clientName string) {
+	// Non-blocking acquire — drop the goroutine if the semaphore is full.
+	select {
+	case revalSem <- struct{}{}:
+	default:
+		return
+	}
+	defer func() { <-revalSem }()
+
 	upstreams := routeUpstreams[routeName]
 	if len(upstreams) == 0 {
 		upstreams = routeUpstreams["default"]
@@ -384,7 +419,13 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string) {
 	req.Question[0].Qclass = key.Qclass
 	req.RecursionDesired    = true
 
-	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", key.Name, key.Qtype, key.RouteIdx, clientName)
+	// Bug 1 fix: only vary the key by clientName when the upstream URL actually
+	// differs per client. Otherwise all clients share the same revalidation call.
+	sfClientName := ""
+	if hasClientNameUpstream {
+		sfClientName = clientName
+	}
+	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", key.Name, key.Qtype, key.RouteIdx, sfClientName)
 
 	sfGroup.Do(sfKey, func() (any, error) { //nolint:errcheck — revalidation errors are silent
 		IncrUpstreamCall()
@@ -481,8 +522,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 	// --- Domain maps pre-computation ---
 	// Single label walk checks both domainPolicy and domainRoutes at once.
-	// walkRouteBypassLocal carries the domain route's bypass_local flag forward
-	// into the route selection step below.
 	var (
 		walkPolicyRcode      int
 		walkPolicyBlocked    bool
@@ -509,6 +548,16 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	// all queries fall through to the normal cache + upstream pipeline.
 
 	// 1a. _dns.resolver.arpa SVCB — RFC 9462 discovery endpoint.
+	//
+	// Bug 3 fix: DoT and DoQ now get separate SVCB records with their own ports.
+	// RFC 9460 §2.4.1 states that each SVCB record describes a single service
+	// endpoint; combining protocols with different port numbers in one record is
+	// incorrect and prevents DoQ clients from connecting when ports differ.
+	//
+	// Priority layout (lowest = preferred):
+	//   1 — DoH  (h2/h3/http1.1)
+	//   2 — DoT  (dot, RFC 7858)
+	//   3 — DoQ  (doq, RFC 9250)
 	if cfg.Server.DDR.Enabled && q.Qtype == dns.TypeSVCB && qNameTrimmed == "_dns.resolver.arpa" {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
@@ -519,38 +568,57 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		for host := range ddrHostnames {
 			target := dns.Fqdn(host)
 
-			svcbHTTPS := &dns.SVCB{
+			// DoH record — priority 1.
+			svcbDoH := &dns.SVCB{
 				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
 				Priority: 1,
 				Target:   target,
 			}
-			svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
-			svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBPort{Port: ddrDoHPort})
-			svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
+			svcbDoH.Value = append(svcbDoH.Value, &dns.SVCBAlpn{Alpn: []string{"h2", "h3", "http/1.1"}})
+			svcbDoH.Value = append(svcbDoH.Value, &dns.SVCBPort{Port: ddrDoHPort})
+			svcbDoH.Value = append(svcbDoH.Value, &dns.SVCBDoHPath{Template: "/dns-query{?dns}"})
 			if len(ipv4s) > 0 {
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
+				svcbDoH.Value = append(svcbDoH.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
 			}
 			if len(ipv6s) > 0 {
-				svcbHTTPS.Value = append(svcbHTTPS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
+				svcbDoH.Value = append(svcbDoH.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
 			}
-			resp.Answer = append(resp.Answer, svcbHTTPS)
+			resp.Answer = append(resp.Answer, svcbDoH)
 
-			svcbTLS := &dns.SVCB{
+			// DoT record — priority 2. Separate from DoQ so each has its own port.
+			svcbDoT := &dns.SVCB{
 				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
 				Priority: 2,
 				Target:   target,
 			}
-			svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBAlpn{Alpn: []string{"dot", "doq"}})
-			svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBPort{Port: ddrDoTPort})
+			svcbDoT.Value = append(svcbDoT.Value, &dns.SVCBAlpn{Alpn: []string{"dot"}})
+			svcbDoT.Value = append(svcbDoT.Value, &dns.SVCBPort{Port: ddrDoTPort})
 			if len(ipv4s) > 0 {
-				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
+				svcbDoT.Value = append(svcbDoT.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
 			}
 			if len(ipv6s) > 0 {
-				svcbTLS.Value = append(svcbTLS.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
+				svcbDoT.Value = append(svcbDoT.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
 			}
-			resp.Answer = append(resp.Answer, svcbTLS)
+			resp.Answer = append(resp.Answer, svcbDoT)
+
+			// DoQ record — priority 3. Own port (ddrDoQPort, set from listen_doq).
+			svcbDoQ := &dns.SVCB{
+				Hdr:      dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSVCB, Class: dns.ClassINET, Ttl: 60},
+				Priority: 3,
+				Target:   target,
+			}
+			svcbDoQ.Value = append(svcbDoQ.Value, &dns.SVCBAlpn{Alpn: []string{"doq"}})
+			svcbDoQ.Value = append(svcbDoQ.Value, &dns.SVCBPort{Port: ddrDoQPort})
+			if len(ipv4s) > 0 {
+				svcbDoQ.Value = append(svcbDoQ.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
+			}
+			if len(ipv6s) > 0 {
+				svcbDoQ.Value = append(svcbDoQ.Value, &dns.SVCBIPv6Hint{Hint: ipv6s})
+			}
+			resp.Answer = append(resp.Answer, svcbDoQ)
 		}
 
+		// Glue records — one A/AAAA per configured DDR hostname.
 		for _, ip := range ipv4s {
 			for host := range ddrHostnames {
 				resp.Extra = append(resp.Extra, &dns.A{
@@ -577,6 +645,12 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// 1b. DDR hostname spoofing — A, AAAA, and HTTPS for configured resolver hostnames.
+	//
+	// Bug 2 fix: the default case now returns NODATA (NOERROR + empty answer)
+	// instead of NXDOMAIN. NXDOMAIN asserts "this name does not exist", which is
+	// wrong — we actively answer A/AAAA/HTTPS for this name. An incorrect NXDOMAIN
+	// gets cached by resolvers and breaks subsequent A/AAAA lookups for DDR
+	// hostnames until the negative cache entry expires.
 	if cfg.Server.DDR.Enabled && ddrHostnames[qNameTrimmed] {
 		resp := new(dns.Msg)
 		resp.SetReply(r)
@@ -629,8 +703,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 				})
 			}
 		default:
-			resp.SetRcode(r, dns.RcodeNameError)
-			label = "DDR NXDOMAIN"
+			// Bug 2 fix: this name exists (we serve A/AAAA/HTTPS for it), it just
+			// has no records of this type. Return NODATA = NOERROR + empty answer.
+			// Do NOT return NXDOMAIN — that would be cached and break A/AAAA lookups.
+			resp.SetRcode(r, dns.RcodeSuccess)
+			label = "DDR NODATA"
 		}
 
 		w.WriteMsg(resp)
@@ -677,7 +754,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	// --- 3. Route Selection (runs BEFORE local identity resolution) ---
 	// Route selection must precede the local identity step so that the route's
 	// bypass_local flag is known in time to conditionally skip local answers.
-	// Client naming (above) is unaffected and always runs regardless.
 	routeName   := "default"
 	routeIdx    := routeIdxDefault
 	bypassLocal := false
@@ -692,29 +768,21 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			if route.ClientName != "" {
 				clientName = route.ClientName
 			}
-			// Carry the MAC route's bypass flag; may be overridden below by a
-			// more-specific domain route if this query matches one.
 			bypassLocal = route.BypassLocal
 		}
 	}
 
 	// Domain-based route — overrides MAC route for domain-specific queries.
-	// Also overrides bypassLocal so a domain route can independently control
-	// whether local identity resolution is used, regardless of the MAC route.
 	routeOriginType := "CLIENT"
 	if walkRouteMatched {
-		routeName        = walkRouteUpstream
-		routeIdx         = getRouteIdx(walkRouteUpstream)
-		routeOriginType  = "DOMAIN"
-		bypassLocal      = walkRouteBypassLocal // domain route wins for this query
+		routeName       = walkRouteUpstream
+		routeIdx        = getRouteIdx(walkRouteUpstream)
+		routeOriginType = "DOMAIN"
+		bypassLocal     = walkRouteBypassLocal
 	}
 
 	// --- 4. Local A/AAAA/PTR responses from identity tables ---
-	// Skipped entirely when the selected route has bypass_local: true — the query
-	// goes directly to the upstream instead of being answered locally. This is
-	// useful when a client or domain should always resolve via an upstream (e.g. a
-	// filtered DNS service for a kids' device) while still being identifiable in
-	// logs and {client-name} upstream substitutions via the identity tables.
+	// Skipped entirely when the selected route has bypass_local: true.
 	if !bypassLocal {
 		switch q.Qtype {
 		case dns.TypeA, dns.TypeAAAA:
@@ -773,9 +841,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		cachedResp = transformResponse(cachedResp, q.Qtype, true) // inPlace OK — we own the copy
 		w.WriteMsg(cachedResp)
 		if isStale {
-			// Serve-stale path: response is already on the wire. Kick off background
-			// revalidation; sfGroup ensures at most one upstream call fires even if
-			// many clients hit the same stale entry simultaneously.
 			go backgroundRevalidate(cacheKey, routeName, clientName)
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | STALE (revalidating)",
@@ -802,18 +867,15 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 	// --- 7. Upstream Forwarding — coalesced via singleflight ---
 	//
-	// Concurrent cache-miss queries for the same (qname, qtype, routeIdx,
-	// clientName) share a single upstream call. The "winning" goroutine (the
-	// first to call sfGroup.Do) executes the closure; all others block and
-	// receive the same result when the winner finishes.
-	//
-	// CacheSet is called inside the closure so it happens exactly once, using
-	// the winner's copy of cacheKey/routeName. All callers receive sfResult and
-	// call .msg.Copy() to obtain their own mutable instance.
-	//
-	// IncrUpstreamCall is inside the closure — only one upstream call is
-	// counted per coalesced group, which accurately reflects actual upstream load.
-	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", qNameTrimmed, q.Qtype, routeIdx, clientName)
+	// Bug 1 fix: only include clientName in the key when the upstream URL
+	// actually varies per client (hasClientNameUpstream=true). When false, all
+	// clients with different names would produce distinct sfKeys and each miss
+	// a separate upstream call, defeating coalescing entirely.
+	sfClientName := ""
+	if hasClientNameUpstream {
+		sfClientName = clientName
+	}
+	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", qNameTrimmed, q.Qtype, routeIdx, sfClientName)
 
 	v, sfErr, _ := sfGroup.Do(sfKey, func() (any, error) {
 		IncrUpstreamCall()
@@ -825,8 +887,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return sfResult{msg: msg, addr: addr}, nil
 	})
 
-	// Extract the shared result. Each caller gets its own .Copy() so they can
-	// independently patch the transaction ID and apply response transforms.
 	var finalResp *dns.Msg
 	var upstreamUsed string
 	if sfErr == nil {
@@ -837,7 +897,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 8. Handle Error ---
-	// Always log upstream failures regardless of logQueries.
 	if finalResp == nil {
 		failLabel := clientIP
 		if clientName != "" {
@@ -851,7 +910,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 9. Response Transforms ---
-	// inPlace=true: finalResp is already a fresh Copy owned by this caller.
 	finalResp = transformResponse(finalResp, q.Qtype, true)
 
 	// --- 10. Reply ---
