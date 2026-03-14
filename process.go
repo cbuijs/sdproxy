@@ -1,12 +1,22 @@
 /*
-File: process.go
-Version: 1.39.0
-Last Updated: 2026-03-10 12:00 CET
-Description: Per-query DNS processing pipeline. Receives a parsed dns.Msg from
-             server.go and routes it through policy checks, DDR spoofing, local
-             identity, cache lookup, upstream forwarding, and response transforms.
+File:    process.go
+Version: 1.40.0
+Updated: 2026-03-14 12:00 CET
+
+Description:
+  Per-query DNS processing pipeline. Receives a parsed dns.Msg from server.go
+  and routes it through policy checks, DDR spoofing, local identity resolution,
+  cache lookup, upstream forwarding, and response transforms.
 
 Changes:
+  1.40.0 - [FEAT] bypass_local support: route selection (step 2) now runs BEFORE
+           local identity A/AAAA/PTR resolution (step 3) so the selected route's
+           bypass_local flag is known in time to conditionally skip local answers.
+           Client identity lookup (clientName for logging/{client-name}) is
+           unaffected — it always runs regardless of bypass_local.
+           walkDomainMaps updated: domainRoutes map type changed from
+           map[string]string to map[string]domainRouteEntry; returns
+           routeBypassLocal bool as an additional 4th return value.
   1.39.0 - [FEAT] Singleflight coalescing: concurrent cache-miss queries for
            the same (qname, qtype, routeIdx, clientName) share one upstream call.
            sfGroup (singleflight.Group) wraps raceExchange. CacheSet moved inside
@@ -14,12 +24,8 @@ Changes:
            every caller (winner + waiters) gets its own msg.Copy() of the result.
            [FEAT] Serve-stale: CacheGet now returns (msg, isStale bool). When
            isStale=true, ProcessDNS writes the stale response immediately and
-           fires backgroundRevalidate in a goroutine. backgroundRevalidate reuses
-           sfGroup so concurrent stale hits on the same key coalesce into one
-           revalidation upstream call. routeName passed to CacheSet so the
-           revalidation path knows which upstream group to use.
-           [PERF] transformResponse on the upstream path now uses inPlace=true
-           (caller owns a fresh copy from sfResult.msg.Copy()).
+           fires backgroundRevalidate in a goroutine.
+           [PERF] transformResponse on the upstream path now uses inPlace=true.
   1.38.0 - [FIX] walkDomainMaps: added && !policyBlocked guard to policy block,
            enforcing most-specific-wins semantics for domain_policy.
   1.37.0 - [FIX] DDR step 1a gated on cfg.Server.DDR.Enabled.
@@ -164,12 +170,10 @@ func isValidReversePTR(name string) bool {
 // suffix iterations cannot overwrite it. This ensures "sub.example.com" config
 // takes precedence over a "example.com" config when both are present.
 //
-// BUG FIX (v1.38.0): added && !policyBlocked guard to the policy lookup block.
-// Previously the guard was missing — each suffix iteration unconditionally
-// overwrote policyRcode/policyBlocked, so the least-specific (widest) matching
-// entry always won, which is the exact opposite of expected behaviour.
-// The domainRoutes block already had && !routeMatched; policyBlocked now matches.
-func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUpstream string, routeMatched bool) {
+// Returns routeBypassLocal=true when the matched domain route has
+// bypass_local: true — signals ProcessDNS to skip local identity resolution
+// and send the query straight to the upstream instead.
+func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUpstream string, routeBypassLocal bool, routeMatched bool) {
 	search := qname
 	for {
 		// Only record the first (most specific) matching policy entry.
@@ -180,10 +184,11 @@ func walkDomainMaps(qname string) (policyRcode int, policyBlocked bool, routeUps
 			}
 		}
 		// Only record the first (most specific) matching route entry.
-		if hasDomainRoutes {
-			if up, ok := domainRoutes[search]; ok && !routeMatched {
-				routeUpstream = up
-				routeMatched  = true
+		if hasDomainRoutes && !routeMatched {
+			if entry, ok := domainRoutes[search]; ok {
+				routeUpstream    = entry.upstream
+				routeBypassLocal = entry.bypassLocal
+				routeMatched     = true
 			}
 		}
 		// Early exit: both maps have been matched — no need to keep walking.
@@ -295,8 +300,7 @@ func responseContainsNullIP(msg *dns.Msg) bool {
 
 // transformResponse optionally flattens CNAME chains and/or strips authority
 // and additional sections (minimize_answer).
-// inPlace=true:  mutates msg directly (caller owns the copy — cache hit and
-//                upstream singleflight paths both provide a fresh Copy).
+// inPlace=true:  mutates msg directly (caller owns the copy).
 // inPlace=false: calls msg.Copy() first (legacy callers, if any).
 func transformResponse(msg *dns.Msg, qtype uint16, inPlace bool) *dns.Msg {
 	if !cfg.Server.FlattenCNAME && !cfg.Server.MinimizeAnswer {
@@ -328,7 +332,7 @@ func flattenCNAME(out *dns.Msg) {
 	}
 	queryName := first.Hdr.Name
 	minTTL    := first.Hdr.Ttl
-	finalIPs  := make([]dns.RR, 0, len(out.Answer)-1) // pre-alloc avoids 1-2 reallocs
+	finalIPs  := make([]dns.RR, 0, len(out.Answer)-1)
 
 	for _, rr := range out.Answer[1:] {
 		if rr.Header().Ttl < minTTL {
@@ -360,32 +364,26 @@ func flattenCNAME(out *dns.Msg) {
 // Called from ProcessDNS after the stale response has already been written
 // to the client — zero additional latency for the end-user.
 //
-// The sfGroup coalesces simultaneous stale hits: if 10 clients all hit the
-// same stale entry at once, only ONE upstream call is made, and CacheSet is
-// called exactly once. Remaining callers get the result for free.
+// sfGroup coalesces simultaneous stale hits on the same key into a single
+// upstream call. The sfKey format matches the hot-path key in ProcessDNS,
+// so a background revalidation and a concurrent fresh-miss for the same
+// query also coalesce automatically.
 //
-// The sfKey format is identical to the hot-path key in ProcessDNS, so a
-// background revalidation and a concurrent fresh-miss for the same query
-// also coalesce into a single upstream call automatically.
-//
-// routeUpstreams is a read-only map after startup — no lock needed.
+// routeUpstreams is read-only after startup — no lock needed.
 func backgroundRevalidate(key DNSCacheKey, routeName, clientName string) {
 	upstreams := routeUpstreams[routeName]
 	if len(upstreams) == 0 {
 		upstreams = routeUpstreams["default"]
 	}
 	if len(upstreams) == 0 {
-		return // no upstreams configured for this route — nothing we can do
+		return
 	}
 
-	// Reconstruct a minimal forwarding query from the cache key.
-	// dns.Fqdn appends the trailing dot that miekg/dns requires.
 	req := new(dns.Msg)
 	req.SetQuestion(dns.Fqdn(key.Name), key.Qtype)
 	req.Question[0].Qclass = key.Qclass
-	req.RecursionDesired = true
+	req.RecursionDesired    = true
 
-	// Same key format as ProcessDNS so coalescing works across both call sites.
 	sfKey := fmt.Sprintf("%s\x00%d\x00%d\x00%s", key.Name, key.Qtype, key.RouteIdx, clientName)
 
 	sfGroup.Do(sfKey, func() (any, error) { //nolint:errcheck — revalidation errors are silent
@@ -483,14 +481,17 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 
 	// --- Domain maps pre-computation ---
 	// Single label walk checks both domainPolicy and domainRoutes at once.
+	// walkRouteBypassLocal carries the domain route's bypass_local flag forward
+	// into the route selection step below.
 	var (
-		walkPolicyRcode   int
-		walkPolicyBlocked bool
-		walkRouteUpstream string
-		walkRouteMatched  bool
+		walkPolicyRcode      int
+		walkPolicyBlocked    bool
+		walkRouteUpstream    string
+		walkRouteBypassLocal bool
+		walkRouteMatched     bool
 	)
 	if hasDomainPolicy || hasDomainRoutes {
-		walkPolicyRcode, walkPolicyBlocked, walkRouteUpstream, walkRouteMatched = walkDomainMaps(qNameTrimmed)
+		walkPolicyRcode, walkPolicyBlocked, walkRouteUpstream, walkRouteBypassLocal, walkRouteMatched = walkDomainMaps(qNameTrimmed)
 	}
 
 	// --- 0e. Domain Policy ---
@@ -641,8 +642,10 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 	}
 
 	// --- 2. Client Identity ---
-	// clientMAC is resolved first — used both here (identity lookup) and in
-	// step 3 (MAC-based route selection), avoiding a double ARP table read.
+	// clientMAC is resolved first — used here for client naming and in step 3
+	// for MAC-based route selection, avoiding a double ARP table read.
+	// clientName is always resolved regardless of bypass_local: it is needed
+	// for log lines and {client-name} upstream URL substitution.
 	needsClientName := logQueries || hasClientNameUpstream
 	var clientMAC, clientName string
 
@@ -653,7 +656,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		clientName = LookupNameByMACOrIP(clientMAC, clientIP)
 	}
 
-	// Build the "ip (name)" string used in log lines.
+	// Build the "ip (name)" string used in every log line.
 	// Only allocated when logQueries is true.
 	var clientID string
 	if logQueries {
@@ -671,59 +674,13 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
-	// Local A/AAAA responses from identity tables.
-	switch q.Qtype {
-	case dns.TypeA, dns.TypeAAAA:
-		if ips := resolveLocalIdentity(qNameTrimmed); len(ips) > 0 {
-			resp := new(dns.Msg)
-			resp.SetReply(r)
-			resp.Authoritative = true
-			for _, ip := range ips {
-				v4 := ip.To4()
-				if q.Qtype == dns.TypeA && v4 != nil {
-					resp.Answer = append(resp.Answer, &dns.A{
-						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
-						A:   v4,
-					})
-				} else if q.Qtype == dns.TypeAAAA && v4 == nil {
-					resp.Answer = append(resp.Answer, &dns.AAAA{
-						Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
-						AAAA: ip,
-					})
-				}
-			}
-			if len(resp.Answer) > 0 {
-				w.WriteMsg(resp)
-				if logQueries {
-					log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY",
-						protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
-				}
-				return
-			}
-		}
-	case dns.TypePTR:
-		if names := resolveLocalPTR(qNameTrimmed); len(names) > 0 {
-			resp := new(dns.Msg)
-			resp.SetReply(r)
-			resp.Authoritative = true
-			for _, name := range names {
-				resp.Answer = append(resp.Answer, &dns.PTR{
-					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 60},
-					Ptr: dns.Fqdn(name),
-				})
-			}
-			w.WriteMsg(resp)
-			if logQueries {
-				log.Printf("[DNS] [%s] %s -> %s PTR | LOCAL PTR",
-					protocol, clientID, q.Name)
-			}
-			return
-		}
-	}
-
-	// --- 3. Route Selection ---
-	routeName := "default"
-	routeIdx  := routeIdxDefault
+	// --- 3. Route Selection (runs BEFORE local identity resolution) ---
+	// Route selection must precede the local identity step so that the route's
+	// bypass_local flag is known in time to conditionally skip local answers.
+	// Client naming (above) is unaffected and always runs regardless.
+	routeName   := "default"
+	routeIdx    := routeIdxDefault
+	bypassLocal := false
 
 	// MAC-based route — highest priority.
 	if hasMACRoutes && clientMAC != "" {
@@ -735,27 +692,90 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 			if route.ClientName != "" {
 				clientName = route.ClientName
 			}
+			// Carry the MAC route's bypass flag; may be overridden below by a
+			// more-specific domain route if this query matches one.
+			bypassLocal = route.BypassLocal
 		}
 	}
 
 	// Domain-based route — overrides MAC route for domain-specific queries.
+	// Also overrides bypassLocal so a domain route can independently control
+	// whether local identity resolution is used, regardless of the MAC route.
 	routeOriginType := "CLIENT"
 	if walkRouteMatched {
-		routeName       = walkRouteUpstream
-		routeIdx        = getRouteIdx(walkRouteUpstream)
-		routeOriginType = "DOMAIN"
+		routeName        = walkRouteUpstream
+		routeIdx         = getRouteIdx(walkRouteUpstream)
+		routeOriginType  = "DOMAIN"
+		bypassLocal      = walkRouteBypassLocal // domain route wins for this query
 	}
 
-	// --- 4. Cache Lookup ---
+	// --- 4. Local A/AAAA/PTR responses from identity tables ---
+	// Skipped entirely when the selected route has bypass_local: true — the query
+	// goes directly to the upstream instead of being answered locally. This is
+	// useful when a client or domain should always resolve via an upstream (e.g. a
+	// filtered DNS service for a kids' device) while still being identifiable in
+	// logs and {client-name} upstream substitutions via the identity tables.
+	if !bypassLocal {
+		switch q.Qtype {
+		case dns.TypeA, dns.TypeAAAA:
+			if ips := resolveLocalIdentity(qNameTrimmed); len(ips) > 0 {
+				resp := new(dns.Msg)
+				resp.SetReply(r)
+				resp.Authoritative = true
+				for _, ip := range ips {
+					v4 := ip.To4()
+					if q.Qtype == dns.TypeA && v4 != nil {
+						resp.Answer = append(resp.Answer, &dns.A{
+							Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+							A:   v4,
+						})
+					} else if q.Qtype == dns.TypeAAAA && v4 == nil {
+						resp.Answer = append(resp.Answer, &dns.AAAA{
+							Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+							AAAA: ip,
+						})
+					}
+				}
+				if len(resp.Answer) > 0 {
+					w.WriteMsg(resp)
+					if logQueries {
+						log.Printf("[DNS] [%s] %s -> %s %s | LOCAL IDENTITY",
+							protocol, clientID, q.Name, dns.TypeToString[q.Qtype])
+					}
+					return
+				}
+			}
+		case dns.TypePTR:
+			if names := resolveLocalPTR(qNameTrimmed); len(names) > 0 {
+				resp := new(dns.Msg)
+				resp.SetReply(r)
+				resp.Authoritative = true
+				for _, name := range names {
+					resp.Answer = append(resp.Answer, &dns.PTR{
+						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: 60},
+						Ptr: dns.Fqdn(name),
+					})
+				}
+				w.WriteMsg(resp)
+				if logQueries {
+					log.Printf("[DNS] [%s] %s -> %s PTR | LOCAL PTR",
+						protocol, clientID, q.Name)
+				}
+				return
+			}
+		}
+	}
+
+	// --- 5. Cache Lookup ---
 	cacheKey := DNSCacheKey{Name: qNameTrimmed, Qtype: q.Qtype, Qclass: q.Qclass, RouteIdx: routeIdx}
 	if cachedResp, isStale := CacheGet(cacheKey); cachedResp != nil {
 		cachedResp.Id = originalID
 		cachedResp = transformResponse(cachedResp, q.Qtype, true) // inPlace OK — we own the copy
 		w.WriteMsg(cachedResp)
 		if isStale {
-			// Serve-stale path: response is already on the wire.
-			// Kick off background revalidation; sfGroup ensures at most one
-			// upstream call fires even if many clients hit the same stale entry.
+			// Serve-stale path: response is already on the wire. Kick off background
+			// revalidation; sfGroup ensures at most one upstream call fires even if
+			// many clients hit the same stale entry simultaneously.
 			go backgroundRevalidate(cacheKey, routeName, clientName)
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s %s | ROUTE(%s): %s | STALE (revalidating)",
@@ -774,13 +794,13 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
-	// --- 5. Upstream Selection ---
+	// --- 6. Upstream Selection ---
 	upstreams, exists := routeUpstreams[routeName]
 	if !exists || len(upstreams) == 0 {
 		upstreams = routeUpstreams["default"]
 	}
 
-	// --- 6. Upstream Forwarding — coalesced via singleflight ---
+	// --- 7. Upstream Forwarding — coalesced via singleflight ---
 	//
 	// Concurrent cache-miss queries for the same (qname, qtype, routeIdx,
 	// clientName) share a single upstream call. The "winning" goroutine (the
@@ -801,7 +821,6 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		if err != nil || msg == nil {
 			return sfResult{}, err
 		}
-		// Cache here — only the winning goroutine writes; waiters skip this.
 		CacheSet(cacheKey, msg, routeName)
 		return sfResult{msg: msg, addr: addr}, nil
 	})
@@ -817,7 +836,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		}
 	}
 
-	// --- 7. Handle Error ---
+	// --- 8. Handle Error ---
 	// Always log upstream failures regardless of logQueries.
 	if finalResp == nil {
 		failLabel := clientIP
@@ -831,11 +850,8 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP string, protocol stri
 		return
 	}
 
-	// --- 8. Cache happens inside the sfGroup closure above ---
-
 	// --- 9. Response Transforms ---
 	// inPlace=true: finalResp is already a fresh Copy owned by this caller.
-	// No second Copy needed — saves one allocation per upstream response.
 	finalResp = transformResponse(finalResp, q.Qtype, true)
 
 	// --- 10. Reply ---

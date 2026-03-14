@@ -1,21 +1,27 @@
 # File:    full_reference_config.yaml
-# Version: 1.27.0
-# Updated: 2026-03-12 20:00 CET
+# Version: 1.28.0
+# Updated: 2026-03-14 12:00 CET
 #
 # Description:
 #   sdproxy full reference configuration — Simple DNS Proxy.
 #   Every option is documented inline. No separate manual needed.
 #
 # Changes:
+#   1.28.0 - [FEAT] bypass_local flag for MAC routes (routes section) and domain
+#            routes (domain_routes section). When true, local A/AAAA/PTR answers
+#            from hosts/leases identity files are skipped for that route and the
+#            query goes straight to the upstream. Client identification for logging
+#            and {client-name} substitution is not affected — the identity tables
+#            are still consulted for naming purposes only.
+#            domain_routes now supports both compact and expanded YAML forms:
+#              compact:  "lan": "local_network"   (unchanged, still valid)
+#              expanded: "lan": { upstream: "local_network", bypass_local: true }
 #   1.27.0 - [FEAT] identity.isc_leases: ISC DHCP block-structured lease files.
 #            [FEAT] identity.kea_leases: Kea DHCP4 CSV lease files.
 #            [FEAT] identity.odhcpd_leases: odhcpd internal state files.
-#            Annotated each lease type with supported formats and common file
-#            locations on OpenWrt, Debian/Ubuntu, RHEL, FreeBSD/pfSense.
 #   1.26.0 - [FEAT] cache.negative_ttl: dedicated TTL floor for NXDOMAIN/NODATA.
 #            [FEAT] cache.stale_ttl: serve-stale window in seconds (RFC 8767).
-#   1.25.0 - [FIX] cache.size comment corrected from "LRU eviction" to
-#            "pseudo-random eviction".
+#   1.25.0 - [FIX] cache.size comment corrected from "LRU" to "pseudo-random eviction".
 #   1.24.0 - Added bootstrap_servers global option.
 #   1.23.0 - Added domain_policy section with IETF-reserved TLD examples.
 #   1.22.0 - Added cache.max_ttl option.
@@ -144,7 +150,7 @@ rtype_policy:
 # =============================================================================
 # Maps domain suffixes to an immediate RCODE — no upstream forwarding.
 # A single entry covers the apex AND all sub-domains.
-# Fired at step 0d — after qtype checks but before DDR, identity, and routing.
+# Fired at step 0e — after qtype checks but before DDR, identity, and routing.
 #
 # IMPORTANT: domain_policy fires BEFORE domain_routes. Don't add zones here
 # that are also in domain_routes — the block wins and routing never fires.
@@ -205,23 +211,85 @@ upstreams:
 # MAC-BASED ROUTES
 # =============================================================================
 # Maps a client's hardware MAC address to a specific upstream group.
-# Optional client_name overrides the DHCP/hosts-derived name for that client.
+#
+# Fields:
+#   upstream     — upstream group to use for this client (required).
+#   client_name  — overrides the DHCP/hosts-derived name for this client in
+#                  logs and {client-name} upstream URL substitutions (optional).
+#   bypass_local — when true, local A/AAAA/PTR answers from hosts/leases files
+#                  are skipped for this client. Every query goes to the upstream
+#                  instead. Client identification (name in logs, {client-name}
+#                  substitution) still works — only the DNS answer source changes.
+#                  Default: false.
+#
+# USE CASE for bypass_local on a MAC route:
+#   A kids' tablet is on the "kids" filtered upstream. You want the tablet
+#   name to appear in logs, but you do NOT want a local /etc/hosts entry for
+#   "gaming-site.com" to short-circuit the parental filter. bypass_local: true
+#   ensures the tablet always asks the upstream, even for locally-known names.
 
 routes:
   "00:11:22:33:44:55":
-    upstream: "kids"
-    client_name: "kids-ipad-override"
+    upstream:     "kids"
+    client_name:  "kids-ipad"
+    bypass_local: true     # always ask the upstream — never answer from local hosts/leases
+
+  "aa:bb:cc:dd:ee:ff":
+    upstream: "secure"
+    # bypass_local omitted → defaults to false (local identity answers enabled)
 
 # =============================================================================
 # DOMAIN-BASED ROUTES
 # =============================================================================
 # Suffix matching checked before cache and upstream selection.
 # NOTE: domain_policy is checked BEFORE domain_routes.
+#
+# TWO YAML FORMS — both are valid and can be mixed freely in the same section:
+#
+#   Compact (original form — unchanged, fully supported):
+#     "domain": "upstream_group"
+#
+#   Expanded (new form — required when setting bypass_local: true):
+#     "domain":
+#       upstream:     "upstream_group"
+#       bypass_local: true
+#
+# bypass_local — when true, local A/AAAA/PTR answers from hosts/leases files
+#   are skipped for queries matching this domain suffix. The query goes straight
+#   to the configured upstream. Client identification is still resolved from
+#   the identity tables — only the DNS answer source changes.
+#   Default: false.
+#
+# IMPORTANT: most-specific-wins semantics apply for domain suffix matching.
+# "sub.example.com" takes precedence over "example.com" when both are present.
+#
+# PRECEDENCE when both a MAC route and a domain route match the same query:
+#   The domain route's bypass_local value wins, overriding the MAC route's flag.
+#   This mirrors the existing routing behaviour where domain routes override MAC
+#   routes for domain-specific queries.
+#
+# USE CASE for bypass_local on a domain route:
+#   "corp.internal" resolves via the internal upstream, but some of those names
+#   also appear in /etc/hosts for emergency use. bypass_local: true ensures
+#   clients always get the live upstream answer instead of a possibly stale
+#   static hosts entry. The hosts entry is still used for client naming.
 
 domain_routes:
+  # Compact form — local identity answers enabled (bypass_local defaults to false).
   "lan":           "local_network"
   "home.arpa":     "local_network"
-  "corp.internal": "local_network"
+
+  # Expanded form — bypass_local: true. Queries for corp.internal always go
+  # to the upstream, ignoring any local hosts/leases entries for those names.
+  "corp.internal":
+    upstream:     "local_network"
+    bypass_local: true
+
+  # Another example: YouTube always resolves via the kids upstream, even if
+  # youtube.com or a subdomain happens to be in the local hosts file.
+  "youtube.com":
+    upstream:     "kids"
+    bypass_local: true
 
 # =============================================================================
 # CACHE
@@ -249,37 +317,24 @@ cache:
   #   NOERROR/NODATA (name exists but no records of the queried type)
   #
   # When negative_ttl=0 (default), min_ttl is used for all response types —
-  # exactly the behaviour before v1.18.0. No config change needed to keep it.
+  # exactly the behaviour before v1.18.0.
   #
-  # Setting negative_ttl lower than min_ttl lets you cache ad-blocker NXDOMAINs
-  # and mistyped names for a shorter time without reducing the floor for positive
-  # records. Example: min_ttl=60, negative_ttl=15 means:
-  #   • A google.com           cached ≥60 s
-  #   • NXDOMAIN gogle.com     cached ≥15 s (typo expires quickly)
-  #
-  # Note: max_ttl still applies as the ceiling for negative responses too.
+  # Setting negative_ttl lower than min_ttl lets you cache NXDOMAINs for a
+  # shorter time without reducing the floor for positive records.
+  # Example: min_ttl=60, negative_ttl=15 means:
+  #   • A google.com        cached ≥60 s
+  #   • NXDOMAIN gogle.com  cached ≥15 s (typo expires quickly)
   negative_ttl: 0   # 0 = use min_ttl for negatives (backwards-compatible default)
 
   # stale_ttl — serve-stale window in seconds past a record's TTL expiry (RFC 8767).
   #
   # When stale_ttl=0 (default), expired entries are treated as misses and the
-  # client waits for a fresh upstream response — unchanged behaviour from v1.17.0.
+  # client waits for a fresh upstream response — unchanged pre-v1.18.0 behaviour.
   #
-  # When stale_ttl>0, an expired-but-still-within-window entry is served
-  # IMMEDIATELY with TTL=0 (the RFC 8767 stale signal) while a background goroutine
-  # silently refreshes the cache. For the client this means zero wait time on
-  # common repeated queries. The next query after revalidation completes gets
-  # a fresh TTL.
-  #
-  # Concurrent stale hits on the same entry are automatically coalesced via
-  # singleflight — only ONE background upstream call fires regardless of how many
-  # clients trigger the revalidation simultaneously.
-  #
-  # Recommended starting value for a home router: 300 (5 minutes). This keeps
-  # a smooth browsing experience when records expire mid-session.
-  #
-  # Note: stale_ttl extends the in-memory lifetime of entries. Budget roughly
-  # the same RAM as the main cache when setting this (it's bounded by cache.size).
+  # When stale_ttl>0, an expired-but-within-window entry is served immediately
+  # with TTL=0 while a background goroutine refreshes the cache. Concurrent stale
+  # hits are coalesced via singleflight — only ONE background upstream call fires.
+  # Recommended starting value for a home router: 300 (5 minutes).
   stale_ttl: 0   # 0 = disabled (backwards-compatible default)
 
 # =============================================================================
@@ -288,11 +343,16 @@ cache:
 # Identity maps DHCP client hostnames to their IPs (and MACs) for:
 #   a) {client-name} substitution in upstream URLs
 #   b) local A/AAAA/PTR answers without hitting an upstream at all
+#   c) client identification in log lines
 #
 # All five source types can be used simultaneously — entries are merged.
 # When the same hostname appears in multiple files, all its IPs are kept.
 # The mtime of each file is checked on every poll tick; unchanged files are
 # never re-read or re-parsed.
+#
+# NOTE: bypass_local (on routes or domain_routes) only suppresses the DNS
+# answer from these files. The files are still read and the names are still
+# used for logging and {client-name} substitution.
 #
 # QUICK SETUP GUIDE BY ROUTER TYPE
 # ---------------------------------
@@ -422,12 +482,6 @@ identity:
   #   That file is already handled by parseHostsBytes — add it to hosts_files,
   #   NOT here. Only use odhcpd_leases when running odhcpd STANDALONE
   #   (no dnsmasq), where the internal state file is the authoritative source.
-  #
-  # odhcpd UCI config (/etc/config/dhcp) for standalone mode:
-  #   config odhcpd 'odhcpd'
-  #     option leasefile '/tmp/hosts/odhcpd'    # hosts format → use hosts_files
-  #     # The internal state file path depends on how odhcpd was started:
-  #     # check the -S flag or the compiled-in default below.
   #
   # Common locations (internal state file):
   #   /var/lib/odhcpd/dhcp.leases   Default when odhcpd persists its state

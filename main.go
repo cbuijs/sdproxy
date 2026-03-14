@@ -1,7 +1,7 @@
 /*
 File:    main.go
-Version: 1.29.2
-Updated: 2026-03-12 20:00 CET
+Version: 1.30.0
+Updated: 2026-03-14 12:00 CET
 
 Description:
   Application entry point, configuration loading, TLS setup, and subsystem
@@ -9,32 +9,32 @@ Description:
   upstream.go.
 
 Changes:
+  1.30.0 - [FEAT] bypass_local per-route flag: when true, local A/AAAA/PTR
+           answers from hosts/leases files are skipped for that route and the
+           query goes straight to the upstream. Client identification (clientName
+           for logging and {client-name} substitution) is unaffected — the
+           identity tables are still consulted for that purpose.
+           Added BypassLocal bool to RouteConfig and ParsedRoute (MAC routes).
+           Added DomainRouteConfig struct with custom UnmarshalYAML so existing
+           compact "domain": "upstream" YAML entries remain valid unchanged.
+           Added domainRouteEntry runtime struct. Changed domainRoutes global
+           from map[string]string to map[string]domainRouteEntry. Updated init
+           blocks for MAC routes (step 1), domain routes (step 2), and the
+           route index table (step 7) accordingly.
   1.29.2 - [FEAT] Config.Identity: added IscLeases, KeaLeases, and OdhcpdLeases
            []string fields (yaml: "isc_leases", "kea_leases", "odhcpd_leases")
-           for ISC DHCP, Kea DHCP4, and odhcpd lease file support. Parsed and
-           consumed by identity.go v1.27.0.
+           for ISC DHCP, Kea DHCP4, and odhcpd lease file support.
   1.29.1 - [FIX] Restored getHardenedTLSConfig() which was accidentally dropped
            during the v1.29.0 rewrite. upstream.go calls it directly 4× for its
            DoT/DoH/DoH3/DoQ client TLS configs. setupTLS() now builds on it
-           correctly again (was inlining a weaker config without cipher list).
-           generateSelfSignedCert() aligned with the original (pointer receiver,
-           -time.Minute NotBefore instead of -time.Hour).
+           correctly again. generateSelfSignedCert() aligned with the original.
   1.29.0 - [FEAT] Cache.NegativeTTL: dedicated TTL floor for NXDOMAIN/NODATA
-           responses, independent of min_ttl. When 0, MinTTL applies to all
-           response types (backwards compat).
+           responses, independent of min_ttl.
            [FEAT] Cache.StaleTTL: serve-stale window length in seconds per
-           RFC 8767. When 0, disabled. Entries past expiry but within the
-           stale window are served with TTL=0 while background revalidation
-           refreshes the cache entry.
+           RFC 8767.
   1.28.0 - [FEAT] Global bootstrap servers: added BootstrapServers []string to
-           the Server config struct (yaml: "bootstrap_servers"). Parsed at startup
-           into globalBootstrapServers []string, normalising bare IPs to "ip:53".
-           Used by ParseUpstream in upstream.go when no per-URL bootstrap IPs are
-           present. When empty, bootstrapping is disabled for upstreams without
-           per-URL IPs (those must use bare IPs in the URL, existing behaviour).
-  1.27.0 - [FEAT] InitThrottle() called after InitIdentity(). Derives initial
-           query and upstream concurrency limits from udp_workers and starts
-           the 500 ms AIMD pressure monitor. No new config keys needed.
+           the Server config struct (yaml: "bootstrap_servers").
+  1.27.0 - [FEAT] InitThrottle() called after InitIdentity().
   1.26.1 - [FEAT] Pre-pack policy RCODE response templates for zero-alloc
            policy fast-paths.
   1.25.0 - [FEAT] domain_policy config section: maps domain suffixes to RCODE.
@@ -43,8 +43,6 @@ Changes:
   1.22.0 - [FEAT] DDR.IPv4/IPv6 changed to []string for multiple addresses.
   1.21.0 - [PERF] Four feature-presence flags set at startup for hot-path gating.
   1.20.0 - [PERF] Route index table: upstream group names mapped to uint8 indices.
-  1.19.0 - [FEAT] RType Policy config section.
-  1.18.0 - [PERF] logging.log_queries config option.
 */
 
 package main
@@ -74,11 +72,51 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RouteConfig maps a MAC address to a specific upstream group and optional
-// client name override.
+// RouteConfig maps a MAC address to a specific upstream group, an optional
+// client name override, and the optional bypass_local flag.
 type RouteConfig struct {
 	Upstream   string `yaml:"upstream"`
 	ClientName string `yaml:"client_name"`
+	// BypassLocal — when true, local A/AAAA/PTR answers from hosts/leases files
+	// are not returned for queries from this client. Queries always go to the
+	// upstream instead. Identity lookups for {client-name} and logging are
+	// unaffected — the identity tables are still used for naming purposes.
+	BypassLocal bool `yaml:"bypass_local"`
+}
+
+// DomainRouteConfig is the per-entry configuration for domain_routes.
+// Supports both the compact string form and the new expanded map form:
+//
+//	compact:  "lan": "local_network"
+//	expanded: "lan": { upstream: "local_network", bypass_local: true }
+//
+// The custom UnmarshalYAML makes both forms transparent — no migration needed.
+type DomainRouteConfig struct {
+	Upstream string `yaml:"upstream"`
+	// BypassLocal — when true, local A/AAAA/PTR answers from hosts/leases files
+	// are skipped for queries matching this domain suffix. See RouteConfig.BypassLocal.
+	BypassLocal bool `yaml:"bypass_local"`
+}
+
+// UnmarshalYAML handles both the compact scalar form ("upstream_name") and the
+// expanded map form ({ upstream: "name", bypass_local: true }).
+func (d *DomainRouteConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.ScalarNode {
+		// Old compact string form — just an upstream group name.
+		d.Upstream = value.Value
+		return nil
+	}
+	// New expanded map form — decode normally. Use a type alias to avoid
+	// infinite recursion through this same UnmarshalYAML.
+	type plain DomainRouteConfig
+	return value.Decode((*plain)(d))
+}
+
+// domainRouteEntry is the normalised runtime form of a DomainRouteConfig entry.
+// Stored in the domainRoutes map after startup; read on every query by walkDomainMaps.
+type domainRouteEntry struct {
+	upstream    string
+	bypassLocal bool
 }
 
 // Config is the structured representation of config.yaml.
@@ -129,48 +167,28 @@ type Config struct {
 	} `yaml:"server"`
 
 	Logging struct {
-		StripTime  bool  `yaml:"strip_time"`
 		LogQueries *bool `yaml:"log_queries"`
+		StripTime  bool  `yaml:"strip_time"`
 	} `yaml:"logging"`
 
 	Cache struct {
-		Enabled bool `yaml:"enabled"`
-		Size    int  `yaml:"size"`
-		MinTTL  int  `yaml:"min_ttl"`
-		MaxTTL  int  `yaml:"max_ttl"`
-
-		// NegativeTTL is the TTL floor applied exclusively to negative responses
-		// (NXDOMAIN and NOERROR/NODATA) when no SOA record is present in the
-		// authority section. When 0, MinTTL is used for all response types
-		// (backwards-compatible default). Setting this lower than MinTTL lets you
-		// cache positive records longer while keeping negative entries short.
-		//
-		// Example: min_ttl=60, negative_ttl=15 → positives cached ≥60s,
-		// NXDOMAIN cached ≥15s. Typos and ad-domain blocks expire quickly.
-		NegativeTTL int `yaml:"negative_ttl"`
-
-		// StaleTTL is the number of seconds past a record's TTL expiry during
-		// which the old answer is still served immediately while a background
-		// upstream call silently refreshes the cache (RFC 8767 serve-stale).
-		// 0 = disabled (default). Served stale responses carry TTL=0 per RFC 8767.
-		//
-		// Example: stale_ttl=300 keeps records alive for 5 extra minutes after
-		// they expire. Any query during that window gets an instant answer while
-		// the refresh happens in the background.
-		StaleTTL int `yaml:"stale_ttl"`
+		Enabled     bool `yaml:"enabled"`
+		Size        int  `yaml:"size"`
+		MinTTL      int  `yaml:"min_ttl"`
+		MaxTTL      int  `yaml:"max_ttl"`
+		NegativeTTL int  `yaml:"negative_ttl"`
+		StaleTTL    int  `yaml:"stale_ttl"`
 	} `yaml:"cache"`
 
 	Identity struct {
-		// HostsFiles lists /etc/hosts-style files to load for local A/AAAA/PTR
-		// resolution. Multiple aliases per line are supported.
+		// HostsFiles lists standard /etc/hosts-format files to load.
 		HostsFiles []string `yaml:"hosts_files"`
 
-		// DnsmasqLeases lists dnsmasq lease files to load.
-		// Format: <expiry-epoch> <mac> <ip> <hostname> <client-id>
-		// Common paths: /tmp/dhcp.leases, /var/lib/misc/dnsmasq.leases
+		// DnsmasqLeases lists dnsmasq flat-file lease databases to load.
+		// Format: <expiry> <mac> <ip> <hostname> <clientid>
 		DnsmasqLeases []string `yaml:"dnsmasq_leases"`
 
-		// IscLeases lists ISC DHCP lease database files to load.
+		// IscLeases lists ISC DHCP block-structured lease files to load.
 		// Block-structured dhcpd.leases; only active/static bindings imported.
 		// Common paths: /var/lib/dhcp/dhcpd.leases, /var/db/dhcpd.leases
 		IscLeases []string `yaml:"isc_leases"`
@@ -192,19 +210,24 @@ type Config struct {
 		PollInterval int `yaml:"poll_interval"`
 	} `yaml:"identity"`
 
-	Upstreams    map[string][]string    `yaml:"upstreams"`
-	Routes       map[string]RouteConfig `yaml:"routes"`
-	DomainRoutes map[string]string      `yaml:"domain_routes"`
-	RtypePolicy  map[string]string      `yaml:"rtype_policy"`
-	DomainPolicy map[string]string      `yaml:"domain_policy"`
+	Upstreams    map[string][]string          `yaml:"upstreams"`
+	Routes       map[string]RouteConfig       `yaml:"routes"`
+	// DomainRoutes maps domain suffixes to upstream groups. Both forms are valid:
+	//   compact:  "lan": "local_network"
+	//   expanded: "lan": { upstream: "local_network", bypass_local: true }
+	DomainRoutes map[string]DomainRouteConfig `yaml:"domain_routes"`
+	RtypePolicy  map[string]string            `yaml:"rtype_policy"`
+	DomainPolicy map[string]string            `yaml:"domain_policy"`
 }
 
 var cfg Config
 
 // ParsedRoute is the resolved form of a RouteConfig entry after MAC validation.
 type ParsedRoute struct {
-	Upstream   string
-	ClientName string
+	Upstream    string
+	ClientName  string
+	// BypassLocal mirrors RouteConfig.BypassLocal — carried into the hot-path.
+	BypassLocal bool
 }
 
 // obsoleteQtypes maps IANA RR type numbers to a short label for every type that
@@ -221,7 +244,7 @@ var obsoleteQtypes = map[uint16]string{
 
 var (
 	macRoutes      map[string]ParsedRoute
-	domainRoutes   map[string]string
+	domainRoutes   map[string]domainRouteEntry // key: lowercase trimmed domain suffix
 	routeUpstreams map[string][]*Upstream
 	ddrHostnames   map[string]bool
 
@@ -263,7 +286,7 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	flag.Parse()
 
-	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.29.2")
+	log.Println("[BOOT] Starting sdproxy (Simple DNS Proxy) - v1.30.0")
 
 	data, err := os.ReadFile(*configFile)
 	if err != nil {
@@ -345,24 +368,44 @@ func main() {
 	// 1. MAC-based routes
 	macRoutes = make(map[string]ParsedRoute)
 	for macStr, route := range cfg.Routes {
-		if parsedMAC, err := net.ParseMAC(macStr); err == nil {
-			macRoutes[parsedMAC.String()] = ParsedRoute{
-				Upstream:   route.Upstream,
-				ClientName: route.ClientName,
-			}
-		} else {
+		parsedMAC, err := net.ParseMAC(macStr)
+		if err != nil {
 			log.Printf("[WARN] Invalid MAC in routes: %s", macStr)
+			continue
+		}
+		macRoutes[parsedMAC.String()] = ParsedRoute{
+			Upstream:    route.Upstream,
+			ClientName:  route.ClientName,
+			BypassLocal: route.BypassLocal,
+		}
+		if route.BypassLocal {
+			log.Printf("[INIT] MAC Route: %s -> %s (bypass_local=true)", parsedMAC, route.Upstream)
+		} else {
+			log.Printf("[INIT] MAC Route: %s -> %s", parsedMAC, route.Upstream)
 		}
 	}
 	hasMACRoutes = len(macRoutes) > 0
 	log.Printf("[INIT] MAC routes: %d entries (ARP polling enabled: %v)", len(macRoutes), hasMACRoutes)
 
 	// 2. Domain-based routes
-	domainRoutes = make(map[string]string)
-	for domain, upstream := range cfg.DomainRoutes {
+	// DomainRouteConfig.UnmarshalYAML handles both compact ("lan": "upstream")
+	// and expanded ("lan": { upstream: "...", bypass_local: true }) YAML forms.
+	domainRoutes = make(map[string]domainRouteEntry, len(cfg.DomainRoutes))
+	for domain, dr := range cfg.DomainRoutes {
+		if dr.Upstream == "" {
+			log.Printf("[WARN] domain_routes: entry %q has no upstream — skipped", domain)
+			continue
+		}
 		clean := strings.ToLower(strings.TrimSuffix(domain, "."))
-		domainRoutes[clean] = upstream
-		log.Printf("[INIT] Domain Route: *.%s -> %s", clean, upstream)
+		domainRoutes[clean] = domainRouteEntry{
+			upstream:    dr.Upstream,
+			bypassLocal: dr.BypassLocal,
+		}
+		if dr.BypassLocal {
+			log.Printf("[INIT] Domain Route: *.%s -> %s (bypass_local=true)", clean, dr.Upstream)
+		} else {
+			log.Printf("[INIT] Domain Route: *.%s -> %s", clean, dr.Upstream)
+		}
 	}
 	hasDomainRoutes = len(domainRoutes) > 0
 
@@ -478,7 +521,8 @@ outer:
 
 	buildPolicyRespCache()
 
-	// 7. Route index table
+	// 7. Route index table — assigns a compact uint8 index to each upstream group
+	// name. Used as part of the cache key to keep per-route cache entries separate.
 	routeIdxByName = make(map[string]uint8, len(cfg.Upstreams)+4)
 	routeIdxByName["local"] = routeIdxLocal
 	nextIdx := uint8(1)
@@ -491,8 +535,9 @@ outer:
 	for groupName := range cfg.Upstreams {
 		assignIdx(groupName)
 	}
-	for _, upstream := range cfg.DomainRoutes {
-		assignIdx(upstream)
+	// DomainRouteConfig used here — iterate over the parsed structs.
+	for _, dr := range cfg.DomainRoutes {
+		assignIdx(dr.Upstream)
 	}
 	for _, route := range cfg.Routes {
 		if route.Upstream != "" {
@@ -592,13 +637,11 @@ func getHardenedTLSConfig() *tls.Config {
 //
 // Builds on getHardenedTLSConfig() and adds the certificate + ALPN tokens.
 // ALPN tokens cover all three encrypted protocols:
-//   "doq"      — DNS over QUIC (RFC 9250)
-//   "dot"      — DNS over TLS  (RFC 7858)
-//   "h2"       — HTTP/2 for DoH
-//   "http/1.1" — HTTP/1.1 for DoH fallback
 //
-// The DoH listeners in server.go clone this config and restrict ALPN to
-// HTTP-only tokens so strict HTTP/1.1 clients don't reject the handshake.
+//	"doq"      — DNS over QUIC (RFC 9250)
+//	"dot"      — DNS over TLS  (RFC 7858)
+//	"h2"       — HTTP/2 for DoH
+//	"http/1.1" — HTTP/1.1 for DoH fallback
 func setupTLS() *tls.Config {
 	var (
 		cert tls.Certificate
