@@ -1,0 +1,1375 @@
+# File:    full_reference_config.yaml
+# Version: 1.101.0
+# Updated: 07-May-2026 09:20 CEST
+#
+# Description:
+#   Complete reference configuration for sdproxy. Every supported option is
+#   documented here with its type, default, and guidance notes. Copy this file,
+#   strip what you don't need, and adjust to taste. The comments are the manual.
+#
+# Changes:
+#   1.101.0 - [FEAT] Implemented `rrs:` (Spoofed Records) engine natively to allow 
+#             explicit A/AAAA/CNAME overrides. Supports global and per-group 
+#             configurations, taking absolute precedence over all other logic.
+#   1.100.0 - [FEAT] Added `force: true` constraint inside client `routes:` mappings. 
+#             Organically prioritizes explicitly labeled rules over high-tier default 
+#             routes (e.g. bypassing a MAC rule with a forced specific IP designation).
+#   1.99.0  - [FEAT] Added `user_agent` to the server block to allow configuring 
+#             the HTTP User-Agent for outbound DoH/DoH3 requests and blocklist updates.
+
+# =============================================================================
+# SERVER
+# =============================================================================
+
+server:
+  # Listener addresses. Multiple addresses supported per protocol.
+  # Omit any section to disable that protocol entirely.
+  listen_udp: ["0.0.0.0:53", "127.0.0.1:5353"]
+  listen_tcp: ["0.0.0.0:53"]
+  listen_dot: ["0.0.0.0:853"]
+  listen_doh: ["0.0.0.0:443"]   # HTTP/1.1, HTTP/2, and HTTP/3 (QUIC)
+  listen_doq: ["0.0.0.0:853"]   # DNS over QUIC — RFC 9250
+
+  # Select which IP versions to support globally in resource loaders.
+  # This affects Category lists, ASN databases, Hosts files, and DHCP Leases.
+  # Any IP or subnet found in these sources that does not match this setting
+  # will be discarded during the loading phase to save memory and CPU.
+  #
+  # Options: "both" (default), "ipv4", "ipv6".
+  #
+  # Note: This setting can be overridden at runtime via command-line flags
+  #       (-4 or --ipv4 for IPv4-only, -6 or --ipv6 for IPv6-only). If both IPv4 
+  #       and IPv6 flags are passed, it resolves to "both".
+  support_ip_version: "both"
+  
+  # Global Action for blocked queries. Applies to all Parental, Route, and Domain blocks 
+  # where the outcome is resolved to "BLOCK".
+  # Options: 
+  #   "NULL"     - Returns 0.0.0.0 or :: for A/AAAA queries, NXDOMAIN for others (default).
+  #   "DROP"     - Silently drops the query without returning any response to the client.
+  #   "LOG"      - Audit mode. Safely logs the block but allows the query to resolve normally.
+  #   "IP"       - Sinkholes the domain by returning the custom IPs defined in `block_ips`.
+  #   "NXDOMAIN" - Returns standard DNS NXDOMAIN for all query types natively.
+  #   "REFUSED"  - Returns standard DNS REFUSED.
+  block_action: "NULL"
+
+  # Custom IP addresses to return when `block_action` is set to "IP".
+  # Automatically maps IPv4 strings to A queries and IPv6 strings to AAAA queries.
+  # If left empty and `block_action` is "IP", it inherently defaults back to "NULL".
+  block_ips:
+    - "192.168.1.100"
+    - "2001:db8::1"
+
+  # Number of goroutines in the UDP worker pool.
+  # On Linux each worker gets its own SO_REUSEPORT socket — no shared channel.
+  # Default: 10. Tune to number of CPU cores on fast hardware.
+  udp_workers: 10
+
+  # TLS certificate and private key for DoT / DoH / DoQ.
+  # When absent and any encrypted listener is configured, a self-signed
+  # certificate is generated automatically at startup.
+  tls_cert: "/etc/sdproxy/cert.pem"
+  tls_key:  "/etc/sdproxy/key.pem"
+
+  # ---------------------------------------------------------------------------
+  # ENCRYPTED CLIENT HELLO (ECH) - SERVER LISTENER
+  # ---------------------------------------------------------------------------
+  # Protects the SNI (Server Name Indication) from being intercepted by ISPs or 
+  # network monitors during TLS handshakes when clients connect to sdproxy.
+  # 
+  # To enable ECH, you must provide both the public ECHConfigList and the HPKE private key.
+  #
+  # Generate these using a tool like Cloudflare's ECH key generator or BoringSSL.
+  #
+  # Example BoringSSL (bssl) command to generate an ECH keypair:
+  #   bssl generate-ech -out-private-key /etc/sdproxy/ech.key -out-ech-config /etc/sdproxy/ech_config.bin -out-ech-config-list /etc/sdproxy/ech_config_list.bin -public-name dns.home.arpa -config-id 1
+  # 
+  # sdproxy will automatically decrypt incoming ECH client hellos and advertise 
+  # the 'ech=' configuration natively in its DDR (Discovery of Designated Resolvers) responses.
+  ech_config_list: "" # Path to the raw binary ECHConfigList file (e.g., /etc/sdproxy/ech_config_list.bin)
+  ech_key: ""         # Path to the private key file (Raw 32-byte X25519 seed or PEM) (e.g., /etc/sdproxy/ech.key)
+
+  # Hard memory ceiling in MiB, applied via runtime/debug.SetMemoryLimit.
+  # Triggers aggressive GC before the process hits the limit.
+  # 0 = disabled (Go runtime default). Recommended for routers: 64–128.
+  memory_limit_mb: 64
+
+  # Maximum concurrent TCP, DoT, and DoH connections allowed globally across all
+  # listeners. Protects the router from File Descriptor (FD) exhaustion and TCP 
+  # Slowloris volumetric attacks by strictly capping connection limits.
+  # Default: 250.
+  max_tcp_connections: 250
+
+  # ---------------------------------------------------------------------------
+  # DNS ACCESS CONTROL LISTS (Public Resolver Hardening)
+  # ---------------------------------------------------------------------------
+  # Limit which IPs are allowed to query this DNS server. Crucial for limiting
+  # exposure if bound to public interfaces. Accepts IPs or CIDRs.
+  # Queries from denied/unauthorized IPs are silently dropped.
+  acl:
+    # Explicitly denied IPs or Subnets (e.g. ["1.2.3.4", "10.10.10.0/24"]).
+    # Overrides allow list.
+    deny: []
+    # Explicitly allowed IPs or Subnets. If left empty, ALL IPs are allowed
+    # (provided they are not in the deny list).
+    # e.g., ["192.168.0.0/16", "10.0.0.0/8", "127.0.0.1"]
+    allow: []
+
+  # ---------------------------------------------------------------------------
+  # PER-CLIENT RATE LIMITING (Public Resolver Hardening)
+  # ---------------------------------------------------------------------------
+  # Essential when exposing sdproxy to the public internet. Prevents malicious
+  # actors from exhausting global query slots, participating in amplification
+  # attacks, or causing Denial of Service. Violators are silently dropped.
+  rate_limit:
+    enabled: false
+    # Sustained queries per second allowed per client.
+    qps: 20
+    # Maximum burst size allowed before the limit is enforced.
+    burst: 100
+    # Subnet grouping for rate limiting. Attackers often rotate IPs within a /64
+    # or /24. These masks group traffic by prefix.
+    # Default: 32 (IPv4) and 128 (IPv6) - tracks individual IPs.
+    ipv4_prefix_length: 32
+    ipv6_prefix_length: 128
+    # Cap the absolute maximum number of tracked IPs/subnets to prevent 
+    # out-of-memory (OOM) situations during intense spoofed source-IP floods. 
+    # Default: 1000.
+    max_tracked_ips: 1000
+
+    # IPs or Subnets that explicitly bypass rate limiting and the penalty box entirely.
+    # These entries will have unlimited access and will never be blackholed.
+    # E.g., ["127.0.0.1", "192.168.1.50", "10.0.0.0/8"]
+    exempt: []
+    
+    # ── PENALTY BOX ────────────────────────────────────────────────────────
+    # Automatically blackholes clients who repeatedly violate rate limits or 
+    # transmit malformed/exploitative payloads. While in the penalty box, ALL 
+    # traffic from that IP/Subnet is silently dropped to preserve I/O capacity.
+    penalty_box:
+      enabled: true
+      # How many consecutive dropped queries trigger a blackhole event. 
+      # Sending malformed payloads incurs an instant ban regardless of threshold.
+      strike_threshold: 100
+      # Duration (in minutes) to keep the client completely blackholed.
+      ban_duration_min: 15
+
+  # ---------------------------------------------------------------------------
+  # EXFILTRATION / DNS TUNNELING DETECTION (Public Resolver Hardening)
+  # ---------------------------------------------------------------------------
+  # Tracks the volumetric byte baseline (Payload Sizes) for every client natively.
+  # Detects sudden massive bursts of data exiting the network over DNS (Tunneling/
+  # Data Exfiltration) and terminates the payloads autonomously.
+  exfiltration:
+    enabled: false
+    
+    # The absolute minimum sustained Bytes Per Second (BPS) a client must be transmitting
+    # before the anomaly engine even evaluates them. Bypasses false-positives for casual browsing.
+    # Default: 1500 (1.5 KB/s)
+    min_threshold_bps: 1500
+    
+    # How much the active traffic must spike relative to the client's historical 
+    # Exponential Moving Average (EMA) to be classified as an active data exfiltration event.
+    # Default: 3.0 (300% spike over baseline)
+    anomaly_multiplier: 3.0
+
+    # Action taken when DNS Tunneling is successfully detected.
+    # Valid options: "BLOCK" (Uses global_block_action), "DROP", "LOG", or RCODE (e.g., "NXDOMAIN")
+    action: "LOG"
+
+    # Prefix groupings allow you to track the volumetric capacity of entire subnets collectively.
+    ipv4_prefix_length: 32
+    ipv6_prefix_length: 128
+    max_tracked_ips: 50000
+
+    exempt: [] # Subnets or IPs permitted to transmit unlimited telemetry/data without profiling.
+    
+    # ── EXFILTRATION PENALTY BOX ──────────────────────────────────────────
+    penalty_box:
+      enabled: true
+      strike_threshold: 3 # Strikes are accrued on consecutive seconds of anomalous throughput
+      ban_duration_min: 15
+
+  # ---------------------------------------------------------------------------
+  # DGA (Domain Generation Algorithm) ML DETECTION
+  # ---------------------------------------------------------------------------
+  # Employs a local, zero-allocation Logistic Regression ML model to analyze
+  # domain entropy, vowel/consonant skew, and n-gram characteristics natively.
+  # Instantly identifies and intercepts algorithmically generated domains 
+  # (used by botnets, malware, and C2 infrastructure).
+  dga:
+    enabled: false
+    
+    # Probabilistic threshold (0.0 to 100.0). Higher numbers require the model 
+    # to be more absolutely certain it's a DGA before blocking, resulting in 
+    # fewer false positives but potentially missing highly sophisticated strings.
+    # Default: 80.0
+    threshold: 80.0
+    
+    # Action taken when a DGA is successfully detected.
+    # Valid options: "BLOCK" (Uses global_block_action), "DROP", "LOG", or RCODE (e.g., "NXDOMAIN")
+    action: "LOG"
+
+  # ---------------------------------------------------------------------------
+  # DNS REBINDING PROTECTION (Public Resolver Hardening)
+  # ---------------------------------------------------------------------------
+  # Protects users and internal networks from DNS Rebinding and SSRF attacks.
+  # When true, sdproxy drops any upstream response containing private/bogon IPs
+  # (RFC1918, loopback, ULAs) returning NXDOMAIN. Default: false.
+  rebinding_protection: false
+
+  # Drop all AAAA (IPv6) query responses, returning NOERROR with an empty
+  # answer section. Useful on IPv4-only networks to avoid IPv6 resolution
+  # delays on clients that still try. Default: false.
+  filter_aaaa: false
+
+  # When true, IP addresses in A/AAAA responses from upstream are checked
+  # against parental category allow/blocklists. If an IP matches a category
+  # blocked for the client, it is filtered out of the response. If all IPs are
+  # filtered, the query is blocked completely. Default: false.
+  filter_ips: false
+
+  # When true, PTR queries for IPs that do not appear in any identity source
+  # (hosts files / leases) return NXDOMAIN instead of being forwarded.
+  # Prevents upstream PTR leakage of LAN addresses. Default: false.
+  strict_ptr: false
+
+  # When true, CNAME chains in upstream responses are collapsed into a single
+  # A/AAAA record (the final resolved IP only). Reduces response size and
+  # prevents CNAME-based tracking. Default: false.
+  flatten_cname: false
+
+  # When true, sdproxy checks the target domain-names of CNAME, MX, NS, PTR, 
+  # SRV, SOA, SVCB, and HTTPS records in responses against domain_policy and 
+  # parental block rules. If a target is blocked, the query is treated as blocked. 
+  # This check is performed before cname-flattening. Default: false.
+  target_name: false
+
+  # When true, responses are trimmed to include only the records that directly
+  # answer the query — no additional or authority records are forwarded to the
+  # client. Default: false.
+  minimize_answer: false
+
+  # When true, all IANA-obsolete / withdrawn / experimental query types (e.g.
+  # MD, WKS, A6) are automatically blocked with NOTIMP. Individual types can
+  # still be overridden via rtype_policy:. Default: false.
+  block_obsolete_qtypes: false
+
+  # DDR — Discovery of Designated Resolvers (RFC 9462).
+  # Advertises encrypted resolver endpoints to clients that support DDR.
+  ddr:
+    enabled:   true
+    hostnames: ["dns.home.arpa"]
+    ipv4:      ["192.168.1.1"]    # When left empty, the IP of the incomimg
+    ipv6:      []                 # interface is used in the response/spoof.
+
+  # ---------------------------------------------------------------------------
+  # UPSTREAM EXECUTION
+  # ---------------------------------------------------------------------------
+
+  # Global Upstream Selection Strategy. When an upstream group has multiple unique 
+  # IP addresses, this specifies how sdproxy uses them to resolve queries.
+  #   "stagger"     — Default. Launch query 1. If no response is received within
+  #                   `upstream_stagger_ms`, fire query 2. Fastest to respond wins.
+  #   "round-robin" — Cycles sequentially through all available upstreams.
+  #   "random"      — Randomly selects an upstream from the group.
+  #   "fastest"     — Tracks Exponential Moving Averages (EMA) of RTT per upstream.
+  #                   Sticks to the fastest one with a 5% Epsilon-Greedy exploration 
+  #                   rate to test other endpoints.
+  #   "secure"      — Queries ALL upstreams simultaneously to enforce consensus validation.
+  #                   The specific behavior is controlled by the group's `mode` setting:
+  #                     `loose` (Default): Dynamically filters out connection timeouts, 
+  #                                        execution errors, and any RCODE other than NOERROR 
+  #                                        or NXDOMAIN. Consensus is built purely from the 
+  #                                        healthy, valid responses that successfully arrive.
+  #                     `strict`: Demands 100% participation. All dialed upstreams MUST respond 
+  #                               flawlessly. Any timeout or failure instantly aborts the query. 
+  #                               Additionally, it deep-inspects the end-answers (e.g., IPs 
+  #                               behind CNAMEs) to ensure they are mathematically identical 
+  #                               across all upstreams.
+  #                   In both modes, NOERROR answers cannot be mixed with empty answers, and 
+  #                   NULL-IPs (0.0.0.0 / ::) immediately void the consensus.
+  upstream_selection: "stagger"
+
+  # Upstream stagger — delay (ms) between the first upstream probe and
+  # subsequently spawned parallel probes. 0 = sequential (first upstream wins
+  # or fails before the next is tried). >0 = racing: all probes fire within
+  # stagger_ms of each other; fastest response wins. Default: 0.
+  # NOTE: Only applies when using the "stagger" strategy.
+  upstream_stagger_ms: 0
+
+  # Hard per-exchange deadline for upstream DNS calls, in milliseconds.
+  # When set, each call to an upstream receives a context.WithTimeout so a slow 
+  # or unreachable upstream cannot hold a goroutine indefinitely.
+  #
+  # Without this setting the upstream's own TCP/TLS connect timeout governs
+  # (typically 3–30 s depending on OS and transport). That is safe for stable
+  # connections but can cause goroutine pile-up when a DoH server is slow or
+  # a QUIC path has high packet loss.
+  #
+  # Guidelines:
+  #   0          — no deadline (default; keep for stable single-upstream setups)
+  #   3000–5000  — recommended for home routers with WAN upstreams
+  #   1000–2000  — aggressive; only useful with stagger racing so a fast
+  #                upstream wins before the timeout fires on slower ones
+  upstream_timeout_ms: 0
+
+  # Global bootstrap DNS servers for resolving upstream hostnames that have no
+  # per-URL bootstrap IPs appended with #.
+  # Supports plain IPs or full URLs (DoH, DoH3, DoT, DoQ) like upstream definitions.
+  # MUST contain a mandatory IP address (e.g., #1.1.1.1) to avoid resolution deadlocks.
+  # Multiple entries are executed securely in strict failover order.
+  bootstrap_servers:
+    - "1.1.1.1"
+    - "doh://dns.quad9.net/dns-query#9.9.9.9"
+
+  # ---------------------------------------------------------------------------
+  # UPSTREAM ENCRYPTED CLIENT HELLO (ECH) & DYNAMIC DoH3 UPGRADES
+  # ---------------------------------------------------------------------------
+  # Determines how sdproxy connects to encrypted upstreams (DoT, DoH, DoQ).
+  # Protects the SNI (Server Name Indication) from being intercepted by ISPs.
+  # Options:
+  #   "disable" - Do not use ECH for upstream connections. Manual configs are ignored.
+  #   "try"     - Attempt to discover ECH keys natively via DNS HTTPS/SVCB records or DDR. 
+  #               If the connection fails or no ECH config is found, falls back to plaintext SNI.
+  #   "strict"  - Mandates ECH. Discovers ECH keys natively. If no ECH config is found, 
+  #               or the connection drops, the upstream will actively fail without fallback.
+  # Default: "disable"
+  use_upstream_ech: "disable"
+
+  # Defines how strictly sdproxy validates the target hostname in HTTPS/SVCB records
+  # during ECH discovery (DDR).
+  # Options:
+  #   "strict" - (Default) The SVCB Target must be exactly identical to the expected upstream hostname.
+  #   "loose"  - Accepts the exact expected hostname or the fallback "." target.
+  #   "apex"   - Accepts the fallback "." target, or any hostname sharing the same domain apex (eTLD+1) as the expected hostname.
+  #   "any"    - Accepts any SVCB target returned by the discovery process, bypassing identity bounds.
+  hostname_ech: "strict"
+
+  # Automatically upgrade standard DNS-over-HTTPS (DoH) upstreams to DNS-over-QUIC 
+  # (HTTP/3) if the upstream dynamically advertises support via `Alt-Svc` headers. 
+  # Features robust UDP-fallback mechanisms to instantly revert to HTTP/2 if the 
+  # connection drops or your ISP heavily throttles QUIC.
+  # Default: false
+  upgrade_doh3: false
+
+  # Directory where downloaded Domain Policy databases are cached.
+  # This makes the lists persistent across reboots and speeds up startup.
+  # If empty, remote lists are kept only in memory.
+  # Default: ""
+  policy_cache_dir: "/var/lib/sdproxy/policy"
+
+  # How often to check for newer versions of the remote Domain Policy URLs.
+  # Accepts Go duration strings (e.g., "6h", "24h").
+  # Default: "6h". Set to "0s" or empty to load once at startup and never poll.
+  policy_poll_interval: "6h"
+
+  # The HTTP User-Agent string transmitted during outbound DoH/DoH3 queries 
+  # and blocklist fetching operations natively.
+  # Default: "sdproxy/1.0"
+  #
+  # ADVICE FOR STRICT UPSTREAMS:
+  # If your chosen upstream provider or blocklist host employs a strict Web Application 
+  # Firewall (WAF) (e.g., Cloudflare, Quad9, or enterprise proxies) that actively drops 
+  # unrecognized or generic tools, you should masquerade as a standard web browser. 
+  # Try setting this to a modern browser string, such as:
+  # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  # "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+  # "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"
+  # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.3912.98"
+  user_agent: "sdproxy/1.0"
+
+  # TTL (seconds) placed on every DNS record that sdproxy synthesises locally.
+  # Applies to:
+  #   • DDR responses  — SVCB, A, AAAA, and HTTPS records for _dns.resolver.arpa
+  #                      and resolver hostnames (RFC 9462 / RFC 9461).
+  #   • Local identity — A, AAAA, and PTR answers served from hosts/lease files.
+  #   • NXDOMAIN policy SOA — the fake SOA authority record injected into
+  #                      domain_policy NXDOMAIN replies so stub resolvers cache
+  #                      the negative response for this long (RFC 2308 §3).
+  #                      rtype_policy REFUSED/NOTIMP replies carry no RRs and
+  #                      are unaffected — those codes have no caching semantics.
+  #
+  # 0 = use built-in default of 60 s.
+  # Low values (e.g. 10) help during testing; 300–600 suits stable production
+  # setups. Parental-block TTL is controlled separately by the parental: section.
+  synthetic_ttl: 60
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+logging:
+  # Per-query log lines (e.g. "[DNS] [udp] 192.168.1.5 -> example.com A | UPSTREAM").
+  # Set false to suppress per-query lines entirely — only init/error/parental
+  # lines remain. Handy on busy home routers to reduce log volume. Default: true.
+  log_queries: true
+
+  # Strip the date/time prefix from all log lines (log.SetFlags(0)).
+  # Useful when the process supervisor (systemd, procd) already timestamps logs.
+  # Default: false.
+  strip_time: false
+
+  # Include Autonomous System Number (ASN), Owner Name, and Country of the client 
+  # IP address in the logs (when identity.ipinfo_asn is configured).
+  # Default: false.
+  log_asn_details: false
+
+  # Output verbose [STRATEGY] log lines detailing the exact pool evaluations, 
+  # EMA latency metrics, and algorithmic selection logic when utilizing advanced 
+  # routing strategies like 'fastest' and 'secure'. 
+  # Default: false.
+  log_strategy: false
+
+# =============================================================================
+# CACHE
+# =============================================================================
+
+cache:
+  enabled: true
+
+  # Maximum number of DNS responses to cache. Each entry is ~300–600 bytes.
+  # 5000 entries ≈ 2–3 MB. Tune to available RAM. Default: 5000.
+  size: 5000
+
+  # Minimum TTL (seconds) to enforce on cached responses, overriding shorter
+  # upstream TTLs. 0 = honour upstream TTL as-is. Default: 0.
+  min_ttl: 0
+
+  # Maximum TTL (seconds) to cap on cached responses. 0 = no cap. Default: 0.
+  # Useful to force periodic re-resolution of high-TTL records.
+  max_ttl: 0
+
+  # TTL (seconds) to apply to NXDOMAIN and NODATA (empty answer) responses.
+  # 0 = use the TTL from the SOA record in the upstream response.
+  # When no SOA is present, falls back to min_ttl. Default: 0.
+  negative_ttl: 0
+
+  # Extra seconds beyond TTL expiry during which a stale entry may still be
+  # served (RFC 8767 serve-stale). A background revalidation fires immediately.
+  # 0 = disabled (default). Recommended: 30–300 for resilience on flaky WANs.
+  stale_ttl: 0
+
+  # Serve expired cache records indefinitely when all upstreams return timeouts 
+  # or connection failures. Disables the cache sweeper. Default: false.
+  serve_stale_infinite: false
+
+  # Background prefetch: seconds before TTL expiry to trigger a refresh for
+  # popular entries. 0 = disabled. Pair with prefetch_min_hits. Default: 0.
+  # Recommended pairing: prefetch_before: 10, prefetch_min_hits: 2
+  prefetch_before: 0
+
+  # Minimum number of cache hits an entry must accumulate before it qualifies
+  # for prefetch. Prevents pre-fetching one-off queries. Default: 0.
+  # Recommended pairing: prefetch_before: 10, prefetch_min_hits: 2
+  prefetch_min_hits: 0
+
+  # How often (seconds) the background sweeper scans all cache shards for
+  # entries whose stale window has passed and reclaims their memory.
+  # 0 = default 60 s.
+  #
+  # The sweeper does NOT affect query correctness — CacheGet independently
+  # rejects expired entries on read regardless. The sweeper only frees memory.
+  #
+  # Lower values reclaim RAM faster but add background CPU:
+  #   15–30 s — low-RAM routers (32–64 MB) or large cache sizes
+  #   60 s    — default, suitable for most home routers
+  #   120 s+  — quiet environments where memory is not a concern
+  sweep_interval_s: 60
+
+  # NXDOMAIN, rtype_policy blocks, filter_aaaa, strict_ptr, obsolete qtypes.
+  # On repeat queries the cache hit at step 3 skips domain walks, policy
+  # map lookups, and qtype checks entirely. Default: false.
+  cache_synthetic: false
+
+  # Cache local identity A/AAAA/PTR responses from hosts_files / *_leases sources.
+  # WARNING: only safe when synthetic_ttl ≤ identity.poll_interval.
+  # If synthetic_ttl > poll_interval, stale local addresses may be served
+  # in the gap between a file change and the next poll. Default: false.
+  cache_local_identity: false
+
+  # Cache upstream NXDOMAIN and NODATA (NOERROR + empty answer) responses.
+  # Set false to always forward negative queries upstream — useful when
+  # upstream blocklists change frequently. Default: true (RFC 2308).
+  cache_upstream_negative: true
+
+  # Sort A/AAAA IP addresses in the Answer section before sending them to the client.
+  # Because the cache is updated with the new order, this allows true round-robin 
+  # or random rotation of IP lists per DNS request.
+  # Only affects record sets that contain 2 or more A/AAAA responses.
+  # Valid options: "none", "round-robin", "random", "ip-sort". Default: "none".
+  answer_sort: "none"
+
+# =============================================================================
+# IDENTITY
+# =============================================================================
+# Maps IP addresses and MAC addresses to hostnames using local files.
+# Enables:
+#   • Local A/AAAA/PTR responses without upstream forwarding.
+#   • Client name resolution for log lines and {client-name} URL substitution.
+#   • MAC-to-name mapping for ARP-identified clients.
+#
+# All file formats are parsed incrementally — only changed files are re-read.
+
+identity:
+  # Standard hosts file(s) — one IP per line followed by one or more
+  # space-separated hostnames. Inline comments (#) are stripped.
+  hosts_files:
+    - "/etc/hosts"
+  # hosts_files:
+  #   - "/etc/hosts"
+  #   - "/tmp/hosts/odhcpd"   # OpenWrt dnsmasq+odhcpd
+
+  # dnsmasq flat-file lease database.
+  # Format: <expiry> <mac> <ip> <hostname> <client-id> (one per line).
+  # Hostname '*' means the client didn't supply one — entry is skipped.
+  dnsmasq_leases: []
+  # dnsmasq_leases:
+  #   - "/tmp/dhcp.leases"
+
+  # ISC DHCP block-structured lease files.
+  # Only active/static bindings are imported; last active block for a given
+  # IP wins (ISC append semantics).
+  isc_leases: []
+  # isc_leases:
+  #   - "/var/lib/dhcp/dhcpd.leases"
+
+  # Kea DHCP4 CSV lease files.
+  # Only state=0 (active) rows are imported. Header row is skipped.
+  kea_leases: []
+  # kea_leases:
+  #   - "/var/lib/kea/kea-leases4.csv"
+
+  # odhcpd internal state files.
+  # Used when running odhcpd standalone (no dnsmasq).
+  # Hostname '-' means no name was supplied — entry is skipped.
+  odhcpd_leases: []
+  # odhcpd_leases:
+  #   - "/var/lib/odhcpd/dhcp.leases"
+
+  # IPinfo ASN Databases (JSON or GZ)
+  # Allows routing clients dynamically based on their Autonomous System.
+  # Supports both the Free tier (IP-Ranges) and Lite tier (CIDR networks).
+  # Get free databases from:
+  #   Free: https://ipinfo.io/data/free/asn.json.gz?token=YOUR_TOKEN
+  #   Lite: https://ipinfo.io/data/ipinfo_lite.json.gz?token=YOUR_TOKEN
+  # Supports both remote URLs and local files. GZIP is auto-detected natively.
+  ipinfo_asn: []
+  # ipinfo_asn:
+  #   - "https://ipinfo.io/data/ipinfo_lite.json.gz?&token=YOUR_TOKEN"
+  #   - "/etc/sdproxy/asn.json"
+
+  # Directory where downloaded and processed IPinfo ASN databases are cached.
+  # This makes the databases persistent across reboots and speeds up startup.
+  # If empty, remote databases are kept only in memory.
+  # Default: "/var/lib/sdproxy/asn"
+  asn_cache_dir: "/var/lib/sdproxy/asn"
+
+  # How often to check for newer versions of the IPinfo ASN databases.
+  # Accepts Go duration strings (e.g., "6h", "24h").
+  # Default: "6h". Set to "0s" or empty to load once at startup and never poll.
+  asn_poll_interval: "6h"
+
+  # FastStart: when true, sdproxy will immediately start answering queries at boot
+  # even if ASN databases have not finished downloading/parsing. This makes
+  # startup non-interruptive, but some traffic might lack ASN routing initially. 
+  # When false, sdproxy waits for the ASN DB to load before starting.
+  # Default: false.
+  asn_fast_start: false
+
+  # How often (seconds) to re-check all local identity files (leases/hosts) for changes.
+  # mtime is checked first — unchanged files are never re-read or re-parsed.
+  # 0 = load once at startup and never poll again.
+  poll_interval: 60
+
+# =============================================================================
+# SPOOFED RECORDS (RRs)
+# =============================================================================
+# Maps an explicit domain to static IP addresses or a CNAME target natively.
+# This takes absolute precedence over all other policies, caching, and upstream routing.
+# If a domain is listed here, but the client requests an unsupported type (e.g., TXT or MX),
+# sdproxy instantly returns an NXDOMAIN to forcefully protect the alias structure.
+#
+# You cannot mix IPs (A/AAAA) with CNAMEs.
+# CNAME targets are dynamically resolved via the upstream engine to return
+# complete A/AAAA payloads (CNAME Flattening/Recursive Resolution), mimicking
+# standard DNS mechanics transparently to the client.
+
+rrs:
+#  "test.example.com": "1.2.3.4"  # A Record
+#  "www.example.com": 
+#    - "33.12.3.1"
+#    - "2001:db8::1"  # A and AAAA record
+#  "google.com": "forcesafesearch.google.com"  # CNAME recursive alias
+
+# =============================================================================
+# QUERY-TYPE POLICY
+# =============================================================================
+# Maps specific DNS RR query types to an immediate action or RCODE.
+# Fired before cache, identity, DDR, and upstream on every query.
+#
+# Valid actions: "BLOCK" (null-ip/NXDOMAIN), "DROP" (silently ignore), or any standard DNS RCODE (e.g., "REFUSED", "NXDOMAIN").
+#
+# Note: You can group multiple QTypes by separating them with commas.
+
+rtype_policy:
+  "ANY, AXFR, IXFR": "DROP"
+  "HINFO, RESINFO":  "NOTIMP"
+  #"HTTPS", "SVCB": "NOERROR" # Prohibit ECH of Application DNS usage
+
+# You can also supply an external file with a list of RTypes for a specific action.
+# The file should contain one RType per line. Empty lines and inline comments (#) are ignored.
+# rtype_policy_files:
+#   "/etc/sdproxy/drop_rtypes.txt": "DROP"
+#   "/etc/sdproxy/block_rtypes.txt": "BLOCK"
+
+# =============================================================================
+# DOMAIN POLICY
+# =============================================================================
+# Maps domain suffixes to an immediate action or RCODE — no upstream forwarding.
+# A single entry covers the apex AND all subdomains.
+# Valid actions: "BLOCK" (null-ip/NXDOMAIN), "DROP" (silently ignore), or any standard DNS RCODE.
+#
+# Fired before DDR, identity, and routing.
+#
+# IMPORTANT: domain_policy fires BEFORE domain_routes. Don't add zones here
+# that are also in domain_routes — the block wins and routing never fires.
+#
+# IMPORTANT: most-specific-wins semantics apply. "sub.example.com" takes
+# precedence over "example.com" when both are present.
+#
+# Note: You can group multiple Domains by separating them with commas.
+
+domain_policy:
+  # Prohibit ECH or Application DNS usage
+  #"use-application-dns.net": "NXDOMAIN"
+
+  # =================================================================================================
+  # DOCUMENTATION, EXAMPLES & TESTING
+  # Domains reserved strictly for use in documentation, sample code, and local testing.
+  # =================================================================================================
+  "example, example.com, example.net, example.org": "NXDOMAIN" # RFC 2606 | Reserved for documentation and examples
+  "invalid, test":                                  "NXDOMAIN" # RFC 6761 | Reserved for obviously invalid names and testing
+
+  # =================================================================================================
+  # LOCAL & PRIVATE NETWORK SUFFIXES
+  # Domains commonly used (formally or informally) for local routing, home networks, and LANs.
+  # =================================================================================================
+  "belkin, router, modem, gw":                           "NXDOMAIN" # Common gateway/captive portal administration sinkholes
+  "corp, domain, internal, intranet, priv, private, main": "NXDOMAIN" # Common internal network suffixes
+  "lan, localdomain, workgroup":                         "NXDOMAIN" # Informally used for local area networks and Windows
+  "home.arpa, localhost, local":                         "NXDOMAIN" # RFC 8375/6761/6762 | Special-use and loopback routing
+
+  # =================================================================================================
+  # IPv4 REVERSE MAPPING & SPECIAL BLOCKS (in-addr.arpa)
+  # Reverse DNS zones for reserved, private, multicast, and special-purpose IPv4 ranges.
+  # =================================================================================================
+  "0.in-addr.arpa, 127.in-addr.arpa": "NXDOMAIN" # RFC 1122 | IPv4 "This host on this network" and Loopback 
+  "10.in-addr.arpa":                  "NXDOMAIN" # RFC 6761 | Private IPv4 reverse mapping (10.0.0.0/8)
+  "254.169.in-addr.arpa":             "NXDOMAIN" # RFC 3927 | IPv4 Link-Local (169.254.0.0/16) reverse mapping
+  
+  # Grouped 172.16.0.0/12 block - RFC 6761 | Private IPv4 reverse mapping (172.16.0.0/12)
+  "16.172.in-addr.arpa, 17.172.in-addr.arpa, 18.172.in-addr.arpa, 19.172.in-addr.arpa, 20.172.in-addr.arpa, 21.172.in-addr.arpa, 22.172.in-addr.arpa, 23.172.in-addr.arpa, 24.172.in-addr.arpa, 25.172.in-addr.arpa, 26.172.in-addr.arpa, 27.172.in-addr.arpa, 28.172.in-addr.arpa, 29.172.in-addr.arpa, 30.172.in-addr.arpa, 31.172.in-addr.arpa": "NXDOMAIN"
+  
+  "170.0.0.192.in-addr.arpa, 171.0.0.192.in-addr.arpa": "NXDOMAIN"  # RFC 8880 | Special-purpose IPv4 reserved for NAT64/DNS64
+  "168.192.in-addr.arpa":                               "NXDOMAIN"  # RFC 6761 | Private IPv4 reverse mapping (192.168.0.0/16)
+  "100.51.198.in-addr.arpa, 113.0.203.in-addr.arpa":    "NXDOMAIN"  # RFC 5737 | Reverse mapping for TEST-NET-2/3
+  
+  # Grouped IPv4 Multicast (224-239) - RFC 5771
+  "224.in-addr.arpa, 225.in-addr.arpa, 226.in-addr.arpa, 227.in-addr.arpa, 228.in-addr.arpa, 229.in-addr.arpa, 230.in-addr.arpa, 231.in-addr.arpa, 232.in-addr.arpa, 233.in-addr.arpa, 234.in-addr.arpa, 235.in-addr.arpa, 236.in-addr.arpa, 237.in-addr.arpa, 238.in-addr.arpa, 239.in-addr.arpa": "NXDOMAIN"
+
+  # Grouped IPv4 Reserved/Class E (240-254) - RFC 3330
+  "240.in-addr.arpa, 241.in-addr.arpa, 242.in-addr.arpa, 243.in-addr.arpa, 244.in-addr.arpa, 245.in-addr.arpa, 246.in-addr.arpa, 247.in-addr.arpa, 248.in-addr.arpa, 249.in-addr.arpa, 250.in-addr.arpa, 251.in-addr.arpa, 252.in-addr.arpa, 253.in-addr.arpa, 254.in-addr.arpa": "NXDOMAIN"
+  
+  "255.in-addr.arpa": "NXDOMAIN" # RFC 919 | IPv4 Limited Broadcast address reverse mapping (255.0.0.0/8)
+
+  # =================================================================================================
+  # IPv6 REVERSE MAPPING (ip6.arpa)
+  # Reverse DNS zones for IPv6 addresses and Link-Local blocks.
+  # =================================================================================================
+  "c.f.ip6.arpa, d.f.ip6.arpa":                                     "NXDOMAIN" # RFC 4193 | IPv6 Unique Local Address (ULA) reverse mapping
+  "8.e.f.ip6.arpa, 9.e.f.ip6.arpa, a.e.f.ip6.arpa, b.e.f.ip6.arpa": "NXDOMAIN" # RFC 6762 | IPv6 Link-Local (fe80::/10) reverse mapping, mDNS restricted
+
+  # =================================================================================================
+  # INFRASTRUCTURE, PROTOCOL & SERVICE DISCOVERY
+  # Reserved namespaces used for DNS routing, protocol discovery, and server identification.
+  # =================================================================================================
+  "bind, server":                                 "DROP"      # RFC 4892 | Identifying a server instance
+  "as112.arpa":                                   "NXDOMAIN"  # RFC 7535 | Sinking DNS traffic for reverse IP lookups
+  "in-addr-servers.arpa, ip6-servers.arpa":       "NXDOMAIN"  # RFC 5855 | Nameservers for the reverse domains
+  "eap-noob.arpa, eap.arpa":                      "NXDOMAIN"  # Out-Of-Band authentication and EAP framework
+  "resolver.arpa, service.arpa":                  "NXDOMAIN"  # RFC 9462/9665 | Discovery of Designated Resolvers (DDR) / SRP
+  "uri.arpa, urn.arpa":                           "NXDOMAIN"  # RFC 3405 | Resolving URIs/URNs via DDDS
+  "6tisch.arpa, ipv4only.arpa, iris.arpa, wpad":  "NXDOMAIN"  # Miscellanous Infrastructure / Discovery
+
+  # =================================================================================================
+  # ALTERNATIVE NAMESPACES, WEB3 & DARKNETS
+  # Pseudo-TLDs intended for resolution outside the standard global DNS hierarchy.
+  # =================================================================================================
+  "alt, exit, i2p, onion":                                           "NXDOMAIN" # Alt networks, Tor, and I2P routing
+  "ape, basenji, bitcoin, crypto, dao, eth, nft, onchain, polygon, sol, wallet, x": "NXDOMAIN" # Web3 and Crypto Onchain Namespaces
+
+  # =================================================================================================
+  # OBSOLETE HISTORICAL PSEUDO-TLDS & DELETED TLDs
+  # Legacy network namespaces and early internet domains that are no longer in active use.
+  # =================================================================================================
+  "bitnet, csnet, decnet, fidonet, mailnet, nato, uucp": "NXDOMAIN"
+
+  # =================================================================================================
+  # OBSOLETE & ANOMALOUS COUNTRY CODE TLDs (ccTLDs)
+  # Retired domains for dissolved nations, plus anomalous legacy ccTLDs (like .su) often sinkholed.
+  # =================================================================================================
+  "an, cs, dd, su, tp, um, yu, zr": "NXDOMAIN"
+
+  # =================================================================================================
+  # EXCEPTIONALLY RESERVED COUNTRY CODES (Not Delegated)
+  # ISO 3166-1 codes that are active/reserved but strictly prohibited from global DNS delegation.
+  # =================================================================================================
+  "cp, dg, ea, ez, fx, ic, ta, un": "NXDOMAIN"
+
+# You can also supply an external file with a list of Domains for a specific action.
+# The file should contain one domain/suffix per line. Empty lines and inline comments (#) are ignored.
+# domain_policy_files:
+#   "/etc/sdproxy/adservers.txt": "NXDOMAIN"
+
+# You can also supply an external URL with a list of Domains for a specific action.
+# The remote file is fetched securely at startup and should follow the exact same format.
+# domain_policy_urls:
+#   "https://raw.githubusercontent.com/example/blocklist/main/domains.txt": "NXDOMAIN"
+
+# =============================================================================
+# UPSTREAM GROUPS
+# =============================================================================
+# The "default" group is required — all other groups are optional.
+#
+# TWO YAML FORMS — both are valid:
+#
+#   Traditional (List of Strings):
+#     default:
+#       - "udp://1.1.1.1:53"
+#
+#   Advanced (Mapped with Strategy override per-group):
+#     default:
+#       strategy: "fastest"
+#       servers:
+#         - "udp://1.1.1.1:53"
+#
+# PROTOCOL SCHEMES
+#   udp://host:port    Plain DNS over UDP (RFC 1035). Default port: 53.
+#   tcp://host:port    Plain DNS over TCP (RFC 1035). Default port: 53.
+#   dot://host:port    DNS over TLS — RFC 7858. Default port: 853.
+#   doh://host/path    DNS over HTTPS/2 with HTTP/1.1 fallback — RFC 8484.
+#   doh3://host/path   DNS over HTTP/3 / QUIC.
+#   doq://host:port    DNS over QUIC — RFC 9250. Default port: 853.
+#
+# OUTBOUND HTTP METHOD (DoH / DoH3 only)
+#   Append +get or +post to the URL path (before #) to control the HTTP method.
+#   Default is POST. +get uses RFC 8484 §4.1 GET with base64url-encoded query.
+#   Example: "doh://cloudflare-dns.com/dns-query+get#1.1.1.1,1.0.0.1"
+#
+# PER-URL BOOTSTRAP IPs & ECH (Encrypted Client Hello)
+#   Bootstrap IPs bypass DNS for the upstream hostname (appended after #).
+#   ECH Configs encrypt the TLS SNI. sdproxy natively attempts to fetch ECH 
+#   via DNS HTTPS records at startup. You can manually supply a Base64 ECH 
+#   config by appending ?ech=<base64> to the URL path.
+#   Syntax: "scheme://host/path[+get|+post][?ech=base64]#ip1,ip2"
+#   Example: "doh://cloudflare-dns.com/dns-query?ech=AEX+...#1.1.1.1,1.0.0.1"
+#
+# {client-name} SUBSTITUTION
+#   The literal string {client-name} in a URL is replaced at query time with
+#   the DHCP hostname of the querying device (resolved via identity tables).
+#   Useful for upstream resolvers that support per-client filtering profiles.
+#
+# PRIVACY NOTE
+#   All outgoing queries have EDNS0 options stripped (removes ECS, cookies, etc.).
+#   Encrypted upstreams additionally get RFC 7830/8467 padding applied.
+#   UDP payload size is always normalised to 4096 bytes before forwarding.
+
+upstreams:
+  default:
+    - "udp://1.1.1.1:53"
+    - "doh://cloudflare-dns.com/dns-query#1.1.1.1,1.0.0.1"
+  kids:
+    - "tcp://1.1.1.3:53"
+    - "doh://doh.controld.com/{client-name}#76.76.2.0,76.76.10.0"
+  secure:
+    strategy: "secure"
+    preference: "ordered" # Valid options: "fastest" (default) or "ordered" (primary server wins)
+    mode: "strict"        # Valid options: "loose" (default) or "strict" (deep inspection of end-answers)
+    servers:
+      - "dot://dns.quad9.net:853#9.9.9.9,149.112.112.112"
+      - "doh3://security.cloudflare-dns.com/dns-query+get#1.1.1.2,1.0.0.2"
+  local_network:
+    - "udp://192.168.1.1:53"
+
+# =============================================================================
+# CLIENT-BASED ROUTES (MAC, MAC glob, IP, CIDR, ASN, Name, SNI, Path)
+# =============================================================================
+# Maps a client identifier to a specific upstream group and/or a parental
+# control group. 
+#
+# PRECEDENCE (when multiple keys match the same client):
+#   MAC exact  >  MAC glob  >  IP  >  CIDR  >  ASN  >  Client-Name  >  SNI  >  Path
+#
+# Note: You can group multiple identifiers by separating them with commas.
+#
+# FIELDS:
+#   rcode        — immediate DNS return code response for this client (optional).
+#                  Valid actions: "BLOCK" (null-ip/NXDOMAIN), "DROP" (silently ignore), 
+#                  or any standard DNS RCODE (e.g., "REFUSED", "NXDOMAIN").
+#                  Takes precedence over upstream and group assignments.
+#   upstream     — upstream group for this client. When absent and group: is
+#                  set, the group's upstream is used as the default.
+#                  Effective precedence: route upstream: > group upstream: > "default".
+#   client_name  — overrides the DHCP/hosts-derived name for logs and
+#                  {client-name} URL substitutions (optional).
+#   bypass_local — when true, local A/AAAA/PTR answers from hosts/leases are
+#                  skipped; every query goes upstream. Client naming for logs
+#                  and {client-name} still works. Default: false.
+#   group        — links this device to a parental control profile.
+#   force        — when true, this rule strictly precedes all other matching
+#                  rules, overriding the standard identifier precedence. Default: false.
+#
+# ── KEY FORMATS ──────────────────────────────────────────────────────────────
+#
+# MAC ADDRESS (exact)
+#   Standard colon-separated form: "aa:bb:cc:dd:ee:ff"
+#   Case-insensitive — normalised to lowercase at startup.
+#
+#   PRIVATE / RANDOMIZED MAC ADDRESSES
+#     Modern OSes (iOS, Android, Windows 11) randomize MAC addresses by default
+#     to prevent tracking. This breaks static MAC-based routing and budget profiles.
+#     To reliably track specific devices (e.g. for kids), you must DISABLE
+#     "Private Wi-Fi Address" / "MAC Randomization" in the device's Wi-Fi settings
+#     specifically for your home network.
+#     Alternatively, you can catch ALL randomized MAC addresses globally using a glob.
+#     Randomized (Locally Administered) MACs always have the second character as
+#     "2", "6", "a" or "e". See the 'private/privacy macs' example below.
+#
+# MAC ADDRESS (glob)
+#   Same six-octet colon structure but with '?' and/or '*' wildcards.
+#
+# IP ADDRESS / CIDR SUBNET
+#   IPv4 or IPv6: "192.168.1.50", "2001:db8::/32"
+#
+# AUTONOMOUS SYSTEM NUMBER (ASN)
+#   Dynamically routes clients based on their ASN.
+#   Requires identity.ipinfo_asn to be populated with an IPinfo database.
+#   Case-insensitive format: "AS1136"
+#
+# SNI / HOSTNAME (DoT, DoH, DoQ)
+#   Matches the TLS Server Name Indication the client used to connect to sdproxy.
+#   Must be prefixed with "sni:". Example: "sni:doh.example.com"
+#
+# URL PATH (DoH, DoH3)
+#   Matches the HTTP request path.
+#   Must start with "/" or be prefixed with "path:". Example: "/dns-query-kids"
+#
+# CLIENT NAME
+#   The DHCP/hosts hostname of the device. Catch-all for any other string.
+#   Requires identity: to be configured with at least one hosts or lease file.
+
+routes:
+  # ── Exact MAC & Grouped mixed properties ──────────────────────────────────
+  "cc:dd:ee:ff:00:11, 10.0.0.0/24, AS1136, sni:doh.secure.com":
+    upstream: "secure"
+
+  # ── MAC glob & URL Path  ──────────────────────────────────────────────────
+  "aa:bb:cc:??:??:??, /dns-query-kids":
+    upstream: "kids"
+
+  # ── Client name — matched against DHCP lease / hosts hostname ─────────────
+  "alice-iphone, bob-ipad, charlie-mac":
+    group:    "kids"
+
+  # ── private/privacy macs ──────────────────────────────────────────────────
+  "?2:*:*:*:*:*, ?6:*:*:*:*:*, ?a:*:*:*:*:*, ?e:*:*:*:*:*":
+    group:    "private"
+    bypass_local: true
+
+  # ── Block an entire subnet instantly via RCODE ────────────────────────────
+  "192.168.99.0/24":
+    rcode: "REFUSED"
+
+  # ── Force an IP rule to override a MAC rule ───────────────────────────────
+  "192.168.99.50":
+    upstream: "kids"
+    force: true
+
+# You can also supply external files containing lists of identifiers.
+# One identifier per line. Empty lines and inline comments (#) are ignored.
+# routes_files:
+#   "/etc/sdproxy/kids_devices.txt":
+#     group: "kids"
+#   "/etc/sdproxy/guest_subnets.txt":
+#     upstream: "default"
+#     bypass_local: true
+
+# =============================================================================
+# DOMAIN-BASED ROUTES
+# =============================================================================
+# Suffix matching checked before cache and upstream selection.
+# NOTE: domain_policy is checked BEFORE domain_routes.
+#
+# TWO YAML FORMS — both are valid and can be mixed freely:
+#
+#   Compact (original form — unchanged, fully supported):
+#     "domain": "upstream_group"
+#
+#   Expanded (required when setting bypass_local: true):
+#     "domain":
+#       upstream:     "upstream_group"
+#       bypass_local: true
+#
+# PRECEDENCE: when both a MAC route and a domain route match the same query,
+# the domain route's upstream and bypass_local values win.
+#
+# Note: You can group multiple Domains by separating them with commas.
+
+domain_routes:
+  # Compact form — local identity answers enabled (bypass_local defaults false).
+  "lan, home.arpa, corp.internal": "local_network"
+
+  # Expanded form — always go to upstream, never answer from local hosts/leases.
+  "youtube.com, netflix.com, hulu.com":
+    upstream:     "kids"
+    bypass_local: true
+
+# You can also supply external files containing lists of domains for routing.
+# One domain per line. Empty lines and inline comments (#) are ignored.
+# domain_routes_files:
+#   "/etc/sdproxy/work_domains.txt":
+#     upstream: "secure"
+#     bypass_local: true
+
+# =============================================================================
+# GROUPS
+# =============================================================================
+# Parental control profiles. Devices are linked via routes[mac].group above.
+# The entire groups: section can be omitted — zero overhead when parental control is off.
+#
+# Fields:
+#   upstream        — upstream group for all MACs in this group.
+#   bypass_local    — default bypass_local for all MACs in this group.
+#
+#   schedule        — restrict DNS access to one or more time windows.
+#
+#                     SINGLE STRING (old form — fully backward-compatible):
+#                       schedule: "HH:MM-HH:MM"
+#                     Access is allowed inside this window every day.
+#                     Midnight-spanning ranges work: "22:00-07:00".
+#
+#                     LIST OF ENTRIES (new form — multiple windows):
+#                       schedule:
+#                         - "[<days>] HH:MM-HH:MM"
+#                         - "[<days>] HH:MM-HH:MM"
+#                     Access is open when ANY entry matches (union semantics).
+#
+#                     DAY SPEC SYNTAX (placed before the time range):
+#                       weekdays        — Monday through Friday
+#                       weekend         — Saturday and Sunday
+#                       mon-fri         — inclusive range (wraps week boundary)
+#                       mon,wed,fri     — explicit comma-separated list
+#                       mon / tuesday   — single day (3-letter abbrev or full)
+#
+#   block_ttl       — TTL (seconds) on blocked responses for this group.
+#                     0 = use the global parental.block_ttl (default 20s).
+#
+#   budget_tracking — "group" (default) or "device".
+#
+#   budget          — daily accumulative time limits. Keys:
+#                       "total"       — overall daily screen time, OR the baseline
+#                                       default action for the entire group. If set 
+#                                       to ALLOW, BLOCK, FREE, or LOG, it applies to
+#                                       everything *unless* a specific category overrides it.
+#                       <category>    — any category key under categories:. Explicitly
+#                                       configured categories strictly bypass the "total" default.
+#                     Values (case-insensitive):
+#                       "<duration>"  — Go duration string: "2h", "90m".
+#                       "unlimited"   — no specific limit for this category, but visiting it still drains the "total" budget.
+#                       "BLOCK"       — permanently blocks all queries. No reset.
+#                       "ALLOW"       — bypasses ALL restrictions (schedule, BLOCK, budget exhaustion).
+#                       "FREE"        — bypasses ALL schedule and budget restrictions, preserves explicit BLOCK/ALLOW. Does not drain the budget.
+#                       "LOG"         — acts identically to ALLOW (bypasses budget), but emits an explicit PARENTAL LOG.
+#
+#                     PRECEDENCE & DEFAULTS:
+#                       Explicitly configured categories strictly take precedence over 
+#                       the "total" fallback. For example, if "total" is "BLOCK" 
+#                       but "educational" is "FREE", all allowance will be blocked 
+#                       except educational sites.
+#
+#                       Evaluation Order: 
+#                       1. WebUI Runtime Overrides (Gate Wide Open / Internet Cut)
+#                       2. Explicit Category Action (LOG -> FREE -> ALLOW -> BLOCK)
+#                       3. "total" Default Action (LOG -> FREE -> ALLOW -> BLOCK)
+#                       4. WebUI Runtime Overrides (Suspension/Bypass - FREE / LOG)
+#                       5. Schedule Window
+#                       6. Category Time Budget
+#                       7. "total" Time Budget
+
+groups:
+
+  # ── alice ─────────────────────────────────────────────────────────────────
+  # Different time windows for school days vs weekends.
+  alice:
+    upstream:        "kids"
+    schedule:
+      - "mon-fri 07:00-21:00"
+      - "sat-sun 09:00-22:00"
+    budget_tracking: "group"
+    budget:
+      total:       "2h"
+      bad_ip:      "BLOCK"
+      games:       "1h"
+      streaming:   "1h30m"
+      social:      "BLOCK"
+      educational: "FREE"
+
+  # ── bob ───────────────────────────────────────────────────────────────────
+  bob:
+    upstream:        "kids"
+    schedule:        "08:00-20:00"
+    budget_tracking: "device"
+    budget:
+      total:     "3h"
+      bad_ip:    "BLOCK"
+      games:     "1h30m"
+      streaming: "LOG" # Never block, but actively track streaming habits
+
+  # ── charlie ───────────────────────────────────────────────────────────────
+  # Example of using "total" as a default baseline action:
+  # If you wanted to block EVERYTHING by default and only allow educational,
+  # you would set `total: "BLOCK"` and `educational: "FREE"`.
+  kids:
+    upstream:        "kids"
+    schedule:
+      - "mon-fri 15:30-21:00"
+      - "weekend  09:00-22:00"
+    budget_tracking: "group"
+    rrs:
+      # Explicit CNAME override strictly enforced for clients operating in the kids profile
+      "youtube.com": "restrictedyoutube.com"
+    budget:
+      total:  "3h"
+      bad_ip: "BLOCK"
+      games:  "1h"
+      social: "30m"
+
+  # ── bob ───────────────────────────────────────────────────────────────────
+  # Log private-mac-address clients
+  private:
+    upstream: "secure"
+    budget_tracking: "device"
+    budget:
+      total: "LOG"
+
+# =============================================================================
+# PARENTAL CONTROL
+# =============================================================================
+# Global settings for the parental control subsystem. Ignored when groups: is
+# empty — zero overhead when parental control is off.
+
+parental:
+
+  # FastStart: when true, sdproxy will immediately start answering queries at boot
+  # even if parental category lists have not finished downloading. This may allow
+  # some unfiltered traffic through initially. When false, sdproxy postpones 
+  # answering until lists are ready. Default: false.
+  fast_start: false
+
+  # TTL (seconds) sdproxy substitutes in responses for categorised domains.
+  # Turns DNS into a periodic heartbeat on TTL-compliant clients. Default: 60.
+  forced_ttl: 60
+
+  # TTL (seconds) on blocked responses (0.0.0.0 for A, NXDOMAIN for others).
+  # Can be overridden per group via groups.<n>.block_ttl. Default: 20.
+  block_ttl: 20
+
+  # How often (seconds) the background debit goroutine fires.
+  # Minimum granularity of time accounting. Default: 10.
+  ticker_interval: 10
+
+  # How long after the last DNS query for a category before its timer pauses.
+  # Makes time tracking accumulative. Can be overridden per category.
+  # Default: "2m"
+  default_idle_pause: "2m"
+
+  # Deprecated alias for default_idle_pause — accepted for backward
+  # compatibility. When both are present, default_idle_pause takes precedence.
+  # default_session_window: "5m"
+
+  # Directory where daily usage snapshots are written (one JSON file per
+  # state key per day). Use persistent storage to survive reboots.
+  # Default: /tmp/sdproxy
+  snapshot_dir: "/var/lib/sdproxy"
+
+  # ---------------------------------------------------------------------------
+  # LIST PROCESSING / CONSOLIDATION
+  # ---------------------------------------------------------------------------
+  
+  # Enable post-processing of loaded domain lists. When false, the options
+  # below are skipped entirely. Default: true.
+  # CAUTION: Please stick to the defaults for everything running smooth, if
+  #          not, the bloom-filter my start categorizing/blocking less
+  #          reliably.
+  consolidation: true
+  
+  # Auto-synthesise missing parent domains when enough children share the
+  # same category. Replaces the old negative-threshold hack. Default: false.
+  synthesise_parents: false
+
+  # Strip sub-domain entries whose parent is already in the same category list.
+  # Reduces memory footprint. Default: true.
+  remove_redundant_subdomains: true
+
+  # Strip well-known service prefixes (www, cdn, api, etc.) from loaded
+  # domain list entries. Default: false.
+  strip_service_labels: false
+
+  # Minimum number of direct children in the same category that must exist 
+  # before the parent is synthesised (only applies if synthesise_parents is true).
+  # Default: 10.
+  parent_consolidation_threshold: 10
+
+  # Minimum percentage of children that must agree on the winning category
+  # before a parent domain is synthesised. Default: 90. Range: 1–100.
+  consolidation_homogeneity_pct: 90
+
+  # ---------------------------------------------------------------------------
+  # CATEGORIES
+  # ---------------------------------------------------------------------------
+  # Domain categories for time budgeting. Only categories referenced in a
+  # group budget are loaded — unused ones cost nothing.
+  #
+  # Fields:
+  #   source:     — URL(s) or local file path(s) to load the domain list from.
+  #                 Scalar (single) and sequence (multiple) forms both accepted.
+  #                 http:// and https:// values are fetched over the network;
+  #                 anything else is read from the local filesystem.
+  #                 Fetched at startup; automatically refreshed weekly (Sun 03:00).
+  #                 Local files are re-read from disk on every reload cycle.
+  #                 Supported formats (auto-detected per line — files may mix):
+  #                   DOMAIN  — one bare domain per line: example.com
+  #                   HOSTS   — hosts file format: 0.0.0.0 host1.com host2.com
+  #                   ADBLOCK — uBlock/AdBlock rules: ||example.com^
+  #   idle_pause  — per-category override for default_idle_pause.
+  #                 (replaces deprecated "session_window").
+  #   add         — domains/patterns to include regardless of the source.
+  #   remove      — domains/patterns to exclude even if in the source.
+  #
+  # ADD / REMOVE ENTRY TYPES
+  #   Plain (no '*' or '?'):  apex domain — matches itself and all subdomains.
+  #   Wildcard ('*' or '?'):  glob pattern — matched against the full queried
+  #                           domain only (no suffix walk). Case-insensitive.
+
+  categories:
+
+    games:
+      source:
+        - "https://raw.githubusercontent.com/cbuijs/ut1/master/games/domains"
+        - "https://raw.githubusercontent.com/cbuijs/ut1/master/gambling/domains"
+      idle_pause: "2m"
+      add:
+        - "bet"
+        - "bingo"
+        - "crazygames.com"
+        - "casino"
+        - "epicgames.com"
+        - "fortnite.com"
+        - "fun"
+        - "game"
+        - "games"
+        - "gg"
+        - "itch.io"
+        - "juegos"
+        - "minecraft.net"
+        - "ninja"
+        - "play"
+        - "poker"
+        - "poki.com"
+        - "roblox.com"
+        - "toys"
+        - "win"
+        - "*game.*"
+        - "*games.*"
+      remove:
+        - "about.com"
+        - "chess.com"
+
+    streaming:
+      # Multiple sources combined into one category — sequence form.
+      source:
+        - "https://raw.githubusercontent.com/cbuijs/ut1/master/audio-video/domains"
+        - "https://raw.githubusercontent.com/cbuijs/ut1/master/manga/domains"
+        - "https://raw.githubusercontent.com/cbuijs/ut1/master/radio/domains"
+      idle_pause: "5m"   # streaming apps buffer — use a wider idle window
+      add:
+        - "deezer.com"
+        - "netflix.com"
+        - "spotify.com"
+        - "youtube.com"
+        - "audio"
+        - "cam"
+        - "hbomax.com"
+        - "disneyplus.com"
+        - "live"
+        - "media"
+        - "now"
+        - "netflix.com"
+        - "primevideo.com"
+        - "radio"
+        - "show"
+        - "skyshowtime.com"
+        - "stream"
+        - "tv"
+        - "video"
+        - "watch"
+
+    social:
+      source:
+        - "https://raw.githubusercontent.com/cbuijs/ut1/master/social_networks/domains"
+        - "https://raw.githubusercontent.com/hagezi/dns-blocklists/refs/heads/main/wildcard/social-onlydomains.txt"
+      add:
+        - "snapchat.com"
+        - "tiktok.com"
+        - "x.com"
+
+    bad_ip:
+      source:
+        - "https://raw.githubusercontent.com/cbuijs/hagezi/refs/heads/main/lists/tif-ip/domains.ips"
+      remove:
+        - "127.0.0.0/8"
+        - "10.0.0.0/8"
+        - "172.16.0.0/12"
+        - "192.168.0.0/16"
+      
+
+    # Local file example — useful for custom or offline lists.
+    # Absolute paths are recommended; relative paths resolve from the working
+    # directory of the sdproxy process (usually the config file directory).
+    # The file may freely mix DOMAIN, HOSTS, and ADBLOCK format lines.
+    custom_block:
+      source: "/etc/sdproxy/custom-domains.txt"
+
+    educational:
+      # No source — manually curated only.
+      add:
+        - "khanacademy.org"
+        - "duolingo.com"
+        - "wolframalpha.com"
+        - "wikipedia.org"
+
+# =============================================================================
+# OPERATIONAL WEB UI  (optional)
+# =============================================================================
+# Built-in single-page admin interface. Disabled by default — enable by
+# setting enabled: true and a password. Provides runtime group override
+# controls without requiring a config reload or restart.
+#
+# Access: http://<listen-address>
+# Auth:   single-user password login; one active session at a time (8 h TTL).
+# Note:   plain HTTP only — bind to loopback or protect with a firewall rule.
+#         For remote access use an SSH tunnel rather than exposing the port.
+#
+# Group override modes (selectable per group on the web page):
+#
+#   DEFAULT  — normal operation; schedule and budget apply as configured.
+#              Implicit state at startup and after a restart.
+#
+#   ALLOW    — gate wide open; all DNS queries pass regardless of schedule,
+#              budget, or hard-block rules.
+#
+#   FREE     — suspend schedule and budget enforcement; queries are allowed
+#              freely but the heartbeat TTL keeps client caches short-lived.
+#              No budget is consumed. Explicit category configs are preserved.
+#              Useful for guests, supervised homework.
+#
+#   BLOCK    — cut internet; every DNS query from the group returns a block
+#              regardless of schedule or budget state.
+#
+#   LOG      — act identically to ALLOW (bypassing budget), but actively record 
+#              the category/apex domain matched into the explicit PARENTAL LOG.
+#
+# Override state is in-memory only — resets to DEFAULT on restart.
+
+webui:
+  # Enable the admin web interface and its background tracker components completely.
+  # Default: false.
+  enabled: false
+
+  # Plain HTTP listeners for the admin server.
+  # Default: ["127.0.0.1:8080"] (loopback only). Set to ["0.0.0.0:8080"] 
+  # plus a firewall rule to allow LAN-wide access.
+  listen_http: ["127.0.0.1:8080"]
+
+  # HTTPS listeners for the admin server.
+  # Shares the server's global tls_cert and tls_key.
+  # Note: If you configure a port here that is also used by DoH (e.g. 0.0.0.0:443),
+  #       the Web UI is automatically multiplexed alongside DoH on that port.
+  listen_https: []
+
+  # Force HTTP to HTTPS redirection (301 Moved Permanently)
+  force_https: false
+
+  # Plain-text login password. Required to enable the web UI.
+  password: "changeme"
+
+  # Persistent API Token (Bearer Header or Query string: ?token=my-secret).
+  # Use this to allow robust, automated /api/stats access (e.g. Prometheus)
+  # without needing to emulate a browser cookie login sequence.
+  api_token: ""
+
+  # ---------------------------------------------------------------------------
+  # WEB UI BRUTE-FORCE PROTECTION & ACCESS CONTROL
+  # ---------------------------------------------------------------------------
+  # Restrict Web UI access by IP or Subnet (CIDR).
+  # Unauthorized IPs are instantly rejected with HTTP 403 Forbidden.
+  acl:
+    deny: []
+    allow: [] # e.g. ["127.0.0.1", "192.168.1.0/24"]
+    
+  # Mitigate password guessing/brute-forcing from exposed interfaces.
+  login_ratelimit:
+    enabled: true
+    max_attempts: 5
+    lockout_minutes: 15
+
+  # Show a statistics panel at the top of the main page.
+  # Displays: uptime (with start date + time) · total queries · cache hits +
+  #           hit rate · forwarded · blocked · cache fill.
+  # Panel is polled live from /api/stats; no page reload needed.
+  # Default: false — opt-in to avoid extra GET traffic on very low-end routers.
+  stats_enabled: false
+
+  # How often the stats panel refreshes, in seconds.
+  # Values below 5 are ignored; the built-in default of 30 is used instead.
+  # Default: 30.
+  stats_refresh_sec: 30
+
+  # Number of entries shown in each top-N list (Queried Domains, Blocked
+  # Domains, Top Talkers, Top Categories).
+  # Minimum: 5  |  Maximum: 100  |  Default: 10.
+  # Lists with more than 10 entries become vertically scrollable
+  # (max-height 300 px) so the page does not become unwieldy on large values.
+  stats_top_n: 10
+
+  # Show the 24-hour hourly activity graph section expanded by default.
+  # The graph is always present when stats_enabled: true — this key only
+  # controls whether the <details> element starts open or collapsed.
+  # Collapsed by default to avoid visual weight until you want it.
+  # Default: false.
+  stats_graphs_enabled: false
+
+  # Directory where web UI statistics and logs are persisted.
+  # If left empty, persistence is completely disabled.
+  history_dir: "/var/lib/sdproxy"
+
+  # Number of hours of history to retain across reboots.
+  # Applies to the hourly activity graph, all Top-N trackers, and the query log.
+  # Default: 24.
+  history_retention_hours: 24
+
+  # Frequency to flush the historical stats and logs to disk.
+  # Accepts Go duration strings ("5m", "1h"). Default: "5m".
+  history_save_interval: "5m"
+
