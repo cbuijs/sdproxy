@@ -1,7 +1,7 @@
 /*
 File:    process_cache.go
-Version: 1.14.0
-Updated: 06-May-2026 10:28 CEST
+Version: 1.15.0
+Updated: 07-May-2026 12:56 CEST
 
 Description:
   Background cache revalidation and synthetic message builders.
@@ -9,6 +9,9 @@ Description:
   message synthesis from the direct execution pipeline.
 
 Changes:
+  1.15.0 - [SECURITY/FIX] Upgraded synthetic `SOA` generators to explicitly bind `q.Name` 
+           as the zone apex. Conforms perfectly to RFC 2308, preventing strict OS stub 
+           resolvers from dropping synthetic negative proofs.
   1.14.0 - [SECURITY/FIX] Addressed a background prefetch deadlocking flaw. 
            If `cache_upstream_negative` is disabled, intentional cache declines 
            (e.g., ignoring upstream NXDOMAIN replies) previously failed to execute 
@@ -21,19 +24,6 @@ Changes:
            on the stale memory record to perpetually spam the upstream provider. 
            The prefetch lock now correctly remains sealed on all valid downstream 
            payload receipts natively.
-  1.12.0 - [SECURITY/FIX] Resolved a severe deadlock vulnerability inside the 
-           background revalidation pipeline. If an upstream exchange or cache-set 
-           panicked mid-flight, the `revertGate` callback was bypassed, marooning 
-           the domain and permanently locking its prefetch bounds. A robust `defer` 
-           recovery utilizing a boolean `success` flag now guarantees the gate 
-           unrolls reliably under all failure conditions.
-  1.11.0 - [PERF] Eliminated goroutine heap allocations during severe cache-miss floods. 
-           `TriggerBackgroundRevalidate` now rigorously tests the semaphore pipeline 
-           prior to spawning the background revalidation thread.
-  1.10.0 - [SECURITY/FIX] Addressed a deadlocking flaw where intentional negative caching 
-           bypasses (e.g., ignoring upstream NXDOMAIN replies) failed to execute the 
-           `revertGate()` callback. This permanently marooned the domain from future 
-           background prefetching loops.
 */
 
 package main
@@ -76,8 +66,9 @@ func buildSynthCacheMsg(q dns.Question, action int) *dns.Msg {
 	if action >= 0 {
 		msg.Rcode = action
 		if action == dns.RcodeNameError {
+			// Binds to q.Name to guarantee RFC 2308 compliance natively.
 			msg.Ns = []dns.RR{&dns.SOA{
-				Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
+				Hdr:     dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
 				Ns:      "ns.sdproxy.",
 				Mbox:    "hostmaster.sdproxy.",
 				Serial:  1,

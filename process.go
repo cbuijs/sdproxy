@@ -1,7 +1,7 @@
 /*
 File:    process.go
-Version: 3.63.0
-Updated: 07-May-2026 12:13 CEST
+Version: 3.64.0
+Updated: 07-May-2026 12:56 CEST
 
 Description:
   Per-query DNS processing pipeline for sdproxy.
@@ -14,6 +14,9 @@ Description:
     - process_spoof.go    (Explicit Record Overrides and Aliasing)
 
 Changes:
+  3.64.0 - [SECURITY/FIX] Bound `CheckRules` execution strictly to `originalQNameTrimmed`. 
+           Ensures explicitly configured Custom Rules (ALLOW/BLOCK) correctly intercept 
+           queries before they are recursively redirected by the `RRs:` Spoofing engine.
   3.63.0 - [FIX] Addressed severe telemetry skew within the `Top Upstreams` metrics 
            tracker. Extracted the `IncrUpstream` call sequence natively below the 
            cache validation mechanisms to verify upstream allocations strictly tally 
@@ -129,7 +132,10 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 	}
 
 	// ── 1.8 Custom Rules Engine ───────────────────────────────────────────
-	ruleAction, ruleMatch := CheckRules(qNameTrimmed, clientGroup)
+	// [SECURITY/FIX] Evaluate Custom Rules against the ORIGINAL requested domain natively,
+	// rather than the spoofed alias target. Guarantees that explicit ALLOW/BLOCK
+	// overrides configured by the admin are accurately enforced before RRs alias mappings.
+	ruleAction, ruleMatch := CheckRules(originalQNameTrimmed, clientGroup)
 
 	if ruleAction == "BLOCK" {
 		IncrPolicyBlock()

@@ -1,7 +1,7 @@
 /*
 File:    process_spoof.go
-Version: 1.3.0
-Updated: 07-May-2026 10:23 CEST
+Version: 1.4.0
+Updated: 07-May-2026 12:56 CEST
 
 Description:
   Spoofed Records (RRs) processor for sdproxy.
@@ -11,22 +11,26 @@ Description:
   the standard pipeline.
 
 Changes:
-  1.3.0 - [SECURITY/FIX] Enforced strict transparent CNAME flattening on the fly. 
-          When mapping recursive targets (e.g., SafeSearch), the engine now 
-          natively extracts terminal IP payloads and forcefully binds them to the 
-          original query name, guaranteeing absolute client-side transparency.
-          Fixed a logging obfuscation flaw where the pipeline tracked the alias 
-          target instead of the originally requested domain.
-  1.2.0 - [FEAT/FIX] Integrated `flatten_cname` compliance. If CNAME flattening is 
-          globally enabled, the proxy now entirely hides the spoofed alias target, 
-          seamlessly disguising the recursively resolved IP endpoints natively under 
-          the original query name requested by the client.
-  1.1.0 - [SECURITY/FIX] Resolved a severe DNS specification violation (RFC 8020).
-          Unsupported query types (e.g., HTTPS/Type65, TXT) executed against a 
-          spoofed domain previously returned NXDOMAIN. This falsely signaled to 
-          modern OS stub resolvers that the entire domain did not exist, fatally 
-          aborting A/AAAA fallbacks. The engine now correctly synthesizes NODATA 
-          responses (NOERROR + 0 Answers) to preserve fallback resolution natively.
+  1.4.0  - [SECURITY/FIX] Resolved RFC 2308 negative caching violations during CNAME flattening. 
+           `NXDOMAIN` and `NODATA` payloads missing their CNAME chains now forcefully rewrite 
+           the `SOA` owner to match the original QNAME natively, preventing strict stub resolvers 
+           from rejecting the negative proofs.
+  1.3.0  - [SECURITY/FIX] Enforced strict transparent CNAME flattening on the fly. 
+           When mapping recursive targets (e.g., SafeSearch), the engine now 
+           natively extracts terminal IP payloads and forcefully binds them to the 
+           original query name, guaranteeing absolute client-side transparency.
+           Fixed a logging obfuscation flaw where the pipeline tracked the alias 
+           target instead of the originally requested domain.
+  1.2.0  - [FEAT/FIX] Integrated `flatten_cname` compliance. If CNAME flattening is 
+           globally enabled, the proxy now entirely hides the spoofed alias target, 
+           seamlessly disguising the recursively resolved IP endpoints natively under 
+           the original query name requested by the client.
+  1.1.0  - [SECURITY/FIX] Resolved a severe DNS specification violation (RFC 8020).
+           Unsupported query types (e.g., HTTPS/Type65, TXT) executed against a 
+           spoofed domain previously returned NXDOMAIN. This falsely signaled to 
+           modern OS stub resolvers that the entire domain did not exist, fatally 
+           aborting A/AAAA fallbacks. The engine now correctly synthesizes NODATA 
+           responses (NOERROR + 0 Answers) to preserve fallback resolution natively.
 */
 
 package main
@@ -71,6 +75,16 @@ func (w *spoofResponseWriter) WriteMsg(res *dns.Msg) error {
 		res.Question[0].Name = w.originalQname
 	}
 
+	// [SECURITY/FIX] Rewrite SOA records in the Authority section to match 
+	// the original QNAME. Since we are flattening the CNAME transparently, 
+	// strict stub resolvers will reject NXDOMAIN/NODATA proofs if the SOA 
+	// zone does not match the requested domain.
+	for _, rr := range res.Ns {
+		if soa, ok := rr.(*dns.SOA); ok {
+			soa.Header().Name = w.originalQname
+		}
+	}
+
 	return w.ResponseWriter.WriteMsg(res)
 }
 
@@ -110,9 +124,10 @@ func handleSpoofedRecords(w *dns.ResponseWriter, r *dns.Msg, q *dns.Question, qN
 		resp.Authoritative = true
 		resp.Rcode = dns.RcodeSuccess // NOERROR
 		
-		// Inject fake SOA for negative caching of the unsupported query type
+		// Inject fake SOA for negative caching of the unsupported query type.
+		// Binds to q.Name to guarantee RFC 2308 compliance natively.
 		resp.Ns = []dns.RR{&dns.SOA{
-			Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
+			Hdr:     dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
 			Ns:      "ns.sdproxy.", Mbox: "hostmaster.sdproxy.",
 			Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: syntheticTTL,
 		}}
@@ -203,7 +218,7 @@ func handleSpoofedRecords(w *dns.ResponseWriter, r *dns.Msg, q *dns.Question, qN
 	// dynamically synthesize a proper NODATA (NOERROR + 0 Answers) response natively.
 	if !hasAnswers {
 		resp.Ns = []dns.RR{&dns.SOA{
-			Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
+			Hdr:     dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
 			Ns:      "ns.sdproxy.", Mbox: "hostmaster.sdproxy.",
 			Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: syntheticTTL,
 		}}

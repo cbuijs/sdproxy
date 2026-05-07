@@ -1,7 +1,7 @@
 /*
 File:    policy.go
-Version: 1.12.0
-Updated: 01-May-2026 23:14 CEST
+Version: 1.13.0
+Updated: 07-May-2026 12:56 CEST
 
 Description:
   DNS query policy enforcement and domain-map lookup for sdproxy.
@@ -16,6 +16,9 @@ Description:
     5. TTL capping — CapResponseTTL.
 
 Changes:
+  1.13.0 - [SECURITY/FIX] Hardened `generateBlockMsg` to explicitly inject `q.Name` 
+           into the synthesized `SOA` records for NXDOMAIN block actions. Prevents 
+           stub resolver retry-loops on negative cache proofs.
   1.12.0 - [SECURITY/FIX] Injected EDNS0 OPT record preservation natively into 
            `generateBlockMsg` and `writePolicyAction` to fulfill RFC 6891 requirements 
            and avert retry-loops from strict stub resolvers receiving synthesized blocks.
@@ -26,13 +29,6 @@ Changes:
   1.10.0 - [PERF] Transitioned suffix-walk bound arrays to native `atomic.Int32` 
            implementations to support zero-lock boundary shifts during live 
            Domain Policy background reloads.
-  1.9.0  - [FIX] Updated `getRouteIdx` to return `uint16` instead of `uint8`, 
-           matching the newly expanded routing tables to prevent overflow.
-  1.8.0  - [MAINTENANCE] Cleaned up dead and stale comment references regarding 
-           domain label boundary variables that were mistakenly pointing to globals.go.
-  1.7.0  - [FEAT] Integrated `generateBlockMsg` and `getBlockActionLogStr` to
-           seamlessly bridge the new Global Block Action variables into the DNS 
-           response pipeline securely. Replaced hardcoded NXDOMAIN/NULL-IP blocks.
 */
 
 package main
@@ -109,9 +105,10 @@ func generateBlockMsg(r *dns.Msg, ttl uint32) *dns.Msg {
 	}
 
 	if msg.Rcode == dns.RcodeNameError {
-		// Inject fake SOA into the Authority section for negative caching
+		// Inject fake SOA into the Authority section for negative caching.
+		// Binds to q.Name to guarantee RFC 2308 compliance natively.
 		msg.Ns = []dns.RR{&dns.SOA{
-			Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: ttl},
+			Hdr:     dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: ttl},
 			Ns:      "ns.sdproxy.",
 			Mbox:    "hostmaster.sdproxy.",
 			Serial:  1,
@@ -155,7 +152,7 @@ func writePolicyAction(w dns.ResponseWriter, r *dns.Msg, action int) bool {
 
 		if action == dns.RcodeNameError {
 			msg.Ns = []dns.RR{&dns.SOA{
-				Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
+				Hdr:     dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
 				Ns:      "ns.sdproxy.",
 				Mbox:    "hostmaster.sdproxy.",
 				Serial:  1,

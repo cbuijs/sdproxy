@@ -1,7 +1,7 @@
 /*
 File:    process_security.go
-Version: 1.2.0
-Updated: 03-May-2026 08:19 CEST
+Version: 1.3.0
+Updated: 07-May-2026 12:56 CEST
 
 Description:
   Pre-routing Security & Admission Guards for sdproxy.
@@ -17,6 +17,8 @@ Description:
   Extracted from process.go to improve modularity and execution clarity.
 
 Changes:
+  1.3.0 - [SECURITY/FIX] Bound synthetic `SOA` record generation for DGA and Exfiltration 
+          intercepts to `q.Name` natively to guarantee stub resolver compliance.
   1.2.0 - [PERF] Ingested pre-resolved `clientMAC`, `clientName`, and `clientID` 
           parameters to eliminate redundant map lookups natively.
         - [PERF] Stripped a costly string allocation (`strings.ReplaceAll`) from 
@@ -195,7 +197,7 @@ func enforceSecurityGuards(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNa
 					msg.Rcode = rcode
 					if rcode == dns.RcodeNameError {
 						msg.Ns = []dns.RR{&dns.SOA{
-							Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
+							Hdr:     dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
 							Ns:      "ns.sdproxy.", Mbox: "hostmaster.sdproxy.",
 							Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: syntheticTTL,
 						}}
@@ -267,7 +269,7 @@ func enforceSecurityGuards(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNa
 					msg.Rcode = rcode
 					if rcode == dns.RcodeNameError {
 						msg.Ns = []dns.RR{&dns.SOA{
-							Hdr:     dns.RR_Header{Name: ".", Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
+							Hdr:     dns.RR_Header{Name: q.Name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: syntheticTTL},
 							Ns:      "ns.sdproxy.", Mbox: "hostmaster.sdproxy.",
 							Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: syntheticTTL,
 						}}
