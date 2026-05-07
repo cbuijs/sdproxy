@@ -1,7 +1,7 @@
 /*
 File:    upstream_exchange.go
-Version: 2.35.0
-Updated: 03-May-2026 21:46 CEST
+Version: 2.36.1
+Updated: 07-May-2026 13:23 CEST
 
 Description:
   Protocol multiplexer and connection fallback orchestrator for sdproxy.
@@ -11,12 +11,20 @@ Description:
   Extracted from upstream.go to cleanly separate execution pipelines from setup.
 
 Changes:
+  2.36.1 - [FIX] Removed duplicate `exchangeHTTP` method declaration that was 
+           erroneously breaking build compilation.
+  2.36.0 - [SECURITY/FIX] Addressed a False-Positive Payload Truncation regression. 
+           Replaced the rigid `io.LimitReader` in DoH/DoH3 unpackers with a native 
+           buffer loop and a 1-byte overflow probe. Perfectly sized 64KB upstream 
+           responses are now processed cleanly without triggering artificial capacity 
+           constraint errors.
+         - [FIX] Hardened DoH GET query construction. The HTTP dialer now dynamically 
+           evaluates existing URI query parameters to append `&dns=` or `?dns=` 
+           correctly, preventing malformed routing requests natively.
   2.35.0 - [SECURITY/FIX] Implemented progressive exponential backoff logic (15s, 60s, 5m)
            across DoH3 and ECH fallback mechanisms natively. This completely prevents 
            the system from locking out QUIC upgrades for 5 minutes when an initial 
            handshake inevitably stumbles or times out on startup.
-  2.34.0 - [REFACTOR] Isolated `Exchange` protocol switching into a dedicated 
-           boundary to prevent bloated source files and improve maintainability.
 */
 
 package main

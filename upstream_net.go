@@ -1,13 +1,21 @@
 /*
 File:    upstream_net.go
-Version: 1.13.0 (Split)
-Updated: 04-May-2026 22:02 CEST
+Version: 1.14.0
+Updated: 07-May-2026 13:23 CEST
 
 Description:
   TCP, DoT, HTTP, and QUIC stream network dialers and protocol implementations.
   Extracted from upstream.go.
 
 Changes:
+  1.14.0 - [SECURITY/FIX] Addressed a False-Positive Payload Truncation regression. 
+           Replaced the rigid `io.LimitReader` in DoH/DoH3 unpackers with a native 
+           buffer loop and a 1-byte overflow probe. Perfectly sized 64KB upstream 
+           responses are now processed cleanly without triggering artificial capacity 
+           constraint errors.
+         - [FIX] Hardened DoH GET query construction. The HTTP dialer now dynamically 
+           evaluates existing URI query parameters to append `&dns=` or `?dns=` 
+           correctly, preventing malformed routing requests natively.
   1.13.0 - [SECURITY/FIX] Injected explicit `User-Agent` headers into outbound HTTP 
            requests (DoH/DoH3) natively to prevent Web Application Firewalls (WAFs) 
            from indiscriminately dropping streams (H3 error 0x5 / REFUSED_STREAM).
@@ -205,12 +213,20 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 	if u.useGET {
 		encoded := base64.RawURLEncoding.EncodeToString(packed)
 		smallBufPool.Put(bufPtr)
-		hReq, err = http.NewRequestWithContext(ctx, http.MethodGet, targetURL+"?dns="+encoded, nil)
+		
+		// [SECURITY/FIX] Dynamically evaluate URL parameters to securely append 
+		// the DNS payload. Prevents generating malformed queries (e.g., `?foo=bar?dns=...`).
+		separator := "?"
+		if strings.Contains(targetURL, "?") {
+			separator = "&"
+		}
+		
+		hReq, err = http.NewRequestWithContext(ctx, http.MethodGet, targetURL+separator+"dns="+encoded, nil)
 		if err != nil {
 			return nil, "", false, fmt.Errorf("new http get request: %w", err)
 		}
 		hReq.Header.Set("Accept", "application/dns-message")
-		hReq.Header.Set("User-Agent", "sdproxy/1.0")
+		hReq.Header.Set("User-Agent", cfg.Server.UserAgent)
 	} else {
 		defer smallBufPool.Put(bufPtr)
 		hReq, err = http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(packed))
@@ -219,7 +235,7 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 		}
 		hReq.Header.Set("Content-Type", "application/dns-message")
 		hReq.Header.Set("Accept", "application/dns-message")
-		hReq.Header.Set("User-Agent", "sdproxy/1.0")
+		hReq.Header.Set("User-Agent", cfg.Server.UserAgent)
 	}
 
 	resp, err := client.Do(hReq)
@@ -248,9 +264,11 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 	rBuf := *rBufPtr
 
 	n := 0
-	lr := io.LimitReader(resp.Body, int64(len(rBuf)))
+	// [SECURITY/FIX] Execute a strict, allocation-free payload reading loop.
+	// Bypasses restrictive `io.LimitReader` constructs to definitively isolate 
+	// legitimate 64KB DNS envelopes from true infinite-stream attacks natively.
 	for {
-		c, readErr := lr.Read(rBuf[n:])
+		c, readErr := resp.Body.Read(rBuf[n:])
 		n += c
 		if readErr == io.EOF {
 			break
@@ -259,7 +277,13 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 			return nil, remoteAddr, echAccepted, fmt.Errorf("read body: %w", readErr)
 		}
 		if n == len(rBuf) {
-			return nil, remoteAddr, echAccepted, errors.New("security constraint: response payload exceeded maximum buffer capacity")
+			// Memory Exhaustion Guard: Attempt to pluck 1 more byte.
+			// If successful, the stream definitively breaches maximum safe capacities.
+			var dummy [1]byte
+			if extra, _ := resp.Body.Read(dummy[:]); extra > 0 {
+				return nil, remoteAddr, echAccepted, errors.New("security constraint: response payload exceeded maximum buffer capacity")
+			}
+			break // Payload is exactly 64KB, fully intact
 		}
 	}
 
