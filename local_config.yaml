@@ -1,0 +1,80 @@
+# File:    local.config.yaml
+# Version: 1.4.0
+# Updated: 01-May-2026
+#
+# Description:
+#   Bare minimum configuration to run sdproxy locally on a laptop as a 
+#   stub resolver replacement. 
+#
+# Changes:
+#   1.4.0 - [SECURITY] Implemented volumetric baseline profiling natively to 
+#           intercept data exfiltration/DNS tunneling attacks.
+#
+#   Laptop Use-Case & Benefits:
+#   - Privacy: Forwards all outbound DNS traffic over encrypted DNS (DoH) to 
+#     prevent tracking and interception by the local network or ISP.
+#   - Speed: Aggressive local caching provides faster browsing resolution 
+#     and significantly fewer upstream network calls.
+#   - Efficiency: Stripping redundant DNS sections (minimize_answer) and 
+#     flattening CNAME chains reduces processing overhead for the local OS.
+#   - Security: Native, immediate protection against DNS rebinding attacks 
+#     and malicious/obsolete query types.
+
+server:
+  # Listen strictly on the local loopback interface.
+  listen_udp: ["127.0.0.1:53"]
+  listen_tcp: ["127.0.0.1:53"]
+  
+  # Disable DDR (Discovery of Designated Resolvers) since this is a local stub resolver.
+  ddr:
+    enabled: false
+
+  # Attempt to use Encrypted Client Hello (ECH) for upstream connections if 
+  # available, otherwise seamlessly fallback to plaintext SNI to preserve connectivity.
+  use_upstream_ech: "try"
+  
+  # Retain standard HTTP/2 DoH behavior to ensure stable resolution on locked-down
+  # roaming networks (Hotel/Airport Wi-Fi) that commonly block UDP port 443.
+  upgrade_doh3: false
+
+  # Strip Authority and Additional sections from upstream responses.
+  # A local laptop stub resolver only cares about the actual Answer.
+  minimize_answer: true
+
+  # Collapse CNAME chains into a single final A/AAAA record.
+  # Reduces response size and processing overhead for the local OS.
+  flatten_cname: true
+
+  # Prevents upstream PTR leakage of LAN addresses.
+  strict_ptr: true
+
+  # Block obsolete and experimental query types natively.
+  block_obsolete_qtypes: true
+
+  # Protect the laptop from DNS rebinding attacks (external domains
+  # resolving to local/private IP addresses).
+  rebinding_protection: true
+
+logging:
+  # Enable per-query logging to the console.
+  log_queries: true
+
+cache:
+  # Enable caching for faster local resolution and fewer upstream calls.
+  enabled: true
+  size: 1024
+  min_ttl: 60
+  # Retain standard negative caching to prevent retry floods.
+  cache_upstream_negative: true
+
+upstreams:
+  # Route all traffic to the designated encrypted DoH upstreams using strict consensus.
+  # The appended IPs bypass local bootstrapping natively.
+  default:
+    strategy: "secure"    # Queries all servers simultaneously to establish consensus.
+    preference: "ordered" # The first server in the list (dns4eu) provides the actual payload.
+    mode: "loose"         # Loose consensus across all dialed endpoints on RCODES.
+    servers:
+      - "doh://noads.joindns4.eu/dns-query#86.54.11.13,86.54.11.213"
+      - "doh://dns.quad9.net/dns-query#9.9.9.9,149.112.112.112"
+
