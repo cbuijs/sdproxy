@@ -1,25 +1,24 @@
 /*
 File:    parental_bg.go
-Version: 1.12.0
-Updated: 30-Jun-2026 08:12 CEST
+Version: 1.13.0
+Last Updated: 18-Aug-2026 13:48 CEST
 
 Description:
   Background sync and timer goroutines for the sdproxy parental subsystem.
   Extracted from parental.go to isolate cron-like behavior from the hot-path.
 
 Changes:
+  1.13.0 - [PERF/FIX] Eradicated massive disk I/O stalls organically. `runDebitTicker` 
+           now implements a localized `dirty` flag constraint. Snapshots and OS-level 
+           directory fsyncs are strictly bypassed unless actual time budget 
+           deductions took place. Prevents heavy 10-second IO locks for active clients 
+           querying unmetered or `ALLOW` categorical boundaries.
   1.12.0 - [SECURITY/FIX] Eradicated a persistent zombie goroutine organically. 
            The background debit and weekly list refresh timers now explicitly 
            listen for the global `shutdownCh` multiplexer, ensuring clean teardowns 
            natively. Furthermore, mitigated potential 100% CPU lockups by ensuring 
            the `time.NewTimer` evaluates a strictly positive floor boundary organically.
   1.11.0 - [BUG/FIX] Re-injected the missing `strings` import required for budget evaluation loops natively.
-  1.10.0 - [SECURITY/FIX] Enforced strict positive boundary checks natively 
-           prior to invoking `time.Sleep` within `runMidnightReset` and 
-           `runWeeklyListRefresh`. Eradicates edge-case zero/negative sleep 
-           panics and infinite spinning loops organically during OS time adjustments.
-  1.9.0  - [LOGGING] Managed progress updates, cache refreshes, and midnight 
-           resets cleanly via the new `logParental` toggle.
 */
 
 package main
@@ -97,10 +96,13 @@ func runDebitTicker() {
 				}
 
 				if len(active) > 0 {
+					dirty := false
+					
 					// Atomically deduct the time interval exclusively from categories registering DEDUCTIBLE activity
 					for _, cat := range deductible {
 						if rem, ok := gs.remaining[cat]; ok {
 							gs.remaining[cat] = rem - int64(interval)
+							dirty = true
 						}
 					}
 					
@@ -116,7 +118,11 @@ func runDebitTicker() {
 						}
 					}
 					gs.mu.Unlock()
-					saveSnapshot(sk, gs)
+					
+					// Bypasses heavy IO filesystem writes naturally if budgets were un-touched natively
+					if dirty {
+						saveSnapshot(sk, gs)
+					}
 				} else {
 					gs.mu.Unlock()
 				}

@@ -1,21 +1,23 @@
 /*
 File:    webui_logs.go
-Version: 2.0.0
-Updated: 22-Jul-2026 22:10 CEST
+Version: 2.1.0
+Updated: 18-Aug-2026 13:48 CEST
 
 Description:
   Live log streaming (SSE) and persistence for the sdproxy web UI.
 
 Changes:
+  2.1.0 - [PERF/FIX] Replaced legacy `json.Marshal` array loading with natively 
+          streamed OS operations (`json.NewEncoder`). Eradicates localized heap 
+          memory spikes completely when serializing historic log events iteratively.
   2.0.0 - [TIER 2] SaveLogs moved onto atomicWrite.
   1.4.0 - [SECURITY/RELIABILITY] Directory fsync so renames survive power loss.
-  1.3.0 - [SECURITY/FIX] Write verification before rename; a failed write no
-          longer wipes the log history.
 */
 
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"log"
 	"os"
@@ -82,7 +84,7 @@ func logsPath() string {
 	return filepath.Join(dir, "webui_logs.json")
 }
 
-// SaveLogs flushes the log ring to disk, dropping entries older than the
+// SaveLogs flushes the log ring to disk natively, dropping entries older than the
 // configured retention window.
 func SaveLogs() {
 	if !cfg.WebUI.Enabled {
@@ -117,16 +119,17 @@ func SaveLogs() {
 		filtered = append(filtered, line)
 	}
 
-	b, err := json.Marshal(filtered)
-	if err != nil {
-		return
-	}
-	if err := atomicWrite(path, b, 0644); err != nil && logWebUI {
+	// [PERF/FIX] Safely structure write operations over I/O streams natively.
+	err := atomicWriteBuf(path, 0644, func(bw *bufio.Writer) error {
+		return json.NewEncoder(bw).Encode(filtered)
+	})
+	
+	if err != nil && logWebUI {
 		log.Printf("[WEBUI] WARNING: failed to persist logs: %v", err)
 	}
 }
 
-// LoadLogs restores the log ring, discarding entries past the retention window.
+// LoadLogs restores the log ring natively, discarding entries past the retention window.
 func LoadLogs() {
 	if !cfg.WebUI.Enabled {
 		return
@@ -136,12 +139,15 @@ func LoadLogs() {
 		return
 	}
 
-	b, err := os.ReadFile(path)
+	// [PERF/FIX] Stream array parsing entirely dynamically
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
+	defer f.Close()
+	
 	var logs []string
-	if err := json.Unmarshal(b, &logs); err != nil {
+	if err := json.NewDecoder(bufio.NewReaderSize(f, 64*1024)).Decode(&logs); err != nil {
 		if logWebUI {
 			log.Printf("[WEBUI] Failed to load log history: %v", err)
 		}

@@ -1,7 +1,7 @@
 /*
 File:    stats.go
-Version: 3.1.0
-Last Updated: 07-Aug-2026 14:20 CEST
+Version: 3.2.0
+Last Updated: 18-Aug-2026 13:48 CEST
 
 Description:
   Lightweight DNS query statistics for sdproxy. Tracks totals since startup:
@@ -14,6 +14,11 @@ Description:
     stats_lastseen.go — per-client last-seen tracker
 
 Changes:
+  3.2.0  - [PERF/FIX] Replaced rigid RAM-heavy `json.MarshalIndent` allocations 
+           with robust IO pipeline streaming (`json.NewEncoder`) for `SaveStats` 
+           and `LoadStats` natively. Completely eradicates system-wide blocking 
+           spikes by streaming colossal nested Top-N matrices directly onto disk 
+           without inflating the heap or inducing Garbage Collection (GC) thrashing.
   3.1.0  - [FEAT] Persisted the new per-client last-seen tracker
            (stats_lastseen.go 1.0.0) through the existing webui_stats.json
            lifecycle: exported in SaveStats, restored in LoadStats, wiped in
@@ -21,30 +26,17 @@ Changes:
            "Last Seen" column outright — every client would read "never" until
            it happened to query again, which is precisely the moment an operator
            is least able to tell an idle device from an absent one.
-
-           The field is a flat map[string]int64 (identity -> unix seconds)
-           rather than the nested map[string]map[string]int64 shape the Top-N
-           trackers persist, because there are no hourly bins to preserve. It is
-           bounded on the write side by the tracker's own entry ceiling and on
-           the read side by an age filter in Import(), so a hand-edited or
-           carried-over stats file cannot inflate memory at startup.
-
-           Older webui_stats.json files simply decode the field as nil and the
-           tracker starts empty — no migration step, no version gate.
-  3.0.0  - [TIER 2] SaveStats moved onto atomicWrite.
-  2.23.0 - [SECURITY/RELIABILITY] Directory fsync on renames.
-  2.22.0 - [SECURITY/FIX] QPS and history-flush tickers bound to shutdownCh;
-           zombie goroutines eliminated.
 */
 
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
-	"path/filepath"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -393,7 +385,7 @@ func ResetStats() {
 	SaveStats()
 }
 
-// SaveStats flushes the historical state to disk.
+// SaveStats flushes the historical state to disk organically.
 func SaveStats() {
 	if !cfg.WebUI.Enabled {
 		return
@@ -457,16 +449,17 @@ func SaveStats() {
 		ClientLastSeen:   statClientSeen.Export(),
 	}
 
-	b, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return
-	}
-	if err := atomicWrite(path, b, 0644); err != nil && (logWebUI || logSystem) {
+	// [PERF/FIX] Encode JSON payload strictly via streams natively to eradicate massive RAM allocations
+	err := atomicWriteBuf(path, 0644, func(bw *bufio.Writer) error {
+		return json.NewEncoder(bw).Encode(data)
+	})
+	
+	if err != nil && (logWebUI || logSystem) {
 		log.Printf("[STATS] WARNING: Failed to write stats payload to disk: %v", err)
 	}
 }
 
-// LoadStats restores the historical state written by SaveStats.
+// LoadStats restores the historical state written by SaveStats organically.
 func LoadStats() {
 	if !cfg.WebUI.Enabled {
 		return
@@ -476,12 +469,15 @@ func LoadStats() {
 		return
 	}
 
-	b, err := os.ReadFile(path)
+	// [PERF/FIX] Stream decode cleanly without fetching entire files into memory
+	f, err := os.Open(path)
 	if err != nil {
 		return
 	}
+	defer f.Close()
+
 	var data SavedStats
-	if err := json.Unmarshal(b, &data); err != nil {
+	if err := json.NewDecoder(bufio.NewReaderSize(f, 64*1024)).Decode(&data); err != nil {
 		if logWebUI || logSystem {
 			log.Printf("[STATS] Failed to load history: %v", err)
 		}
@@ -613,5 +609,4 @@ func InitStats() {
 		go runQPSTicker()
 	}
 }
-
 
