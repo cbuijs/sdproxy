@@ -1,0 +1,45 @@
+# File: docker-compose.yml
+# Version: 1.0.0
+# Last Updated: 24-Jun-2026 14:30 CEST
+# Description:
+#   Docker Compose configuration for deploying sdproxy natively with persistent
+#   volumes and host networking/port mappings.
+#
+# Changes:
+#   1.0.0 - Initial docker-compose deployment configuration.
+
+services:
+  sdproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sdproxy
+    restart: unless-stopped
+    # Use network_mode: "host" instead of ports if you require exact client IP tracking
+    # for Rate Limiting and Exfiltration natively, bypassing Docker's NAT masquerade.
+    ports:
+      - "53:53/udp"     # Plain DNS UDP
+      - "53:53/tcp"     # Plain DNS TCP
+      - "853:853/tcp"   # DoT (DNS over TLS)
+      - "853:853/udp"   # DoQ (DNS over QUIC)
+      - "443:443/tcp"   # DoH (DNS over HTTPS)
+      - "443:443/udp"   # DoH3 (HTTP/3)
+      - "8080:8080/tcp" # Web UI
+    volumes:
+      # Mount your customized configuration file as read-only natively
+      - ./config.yaml:/etc/sdproxy/config.yaml:ro
+      
+      # Persist cache, analytical histories, and TLS certificates across container reboots
+      - sdproxy_data:/var/lib/sdproxy
+      - sdproxy_certs:/etc/sdproxy/certs
+
+    # Hard memory ceiling matching the standard router target constraints natively
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  sdproxy_data:
+  sdproxy_certs:
+
