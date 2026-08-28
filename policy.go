@@ -1,7 +1,7 @@
 /*
 File:    policy.go
-Version: 1.11.0
-Last Updated: 24-Aug-2026 13:39 CEST
+Version: 1.12.0
+Last Updated: 28-Aug-2026 16:01 CEST
 
 Description:
   Policy response synthesis and the domain-map suffix walk for sdproxy.
@@ -10,6 +10,10 @@ Description:
   policy lookup used by the routing and filtering stages.
 
 Changes:
+  1.12.0 - [SECURITY/FIX] Resolved a critical negative caching violation (RFC 2308). 
+           `writePolicyAction` now correctly injects `SOA` records into 
+           synthesized `NOERROR` (NODATA) policy responses (e.g., AAAA filtering). 
+           Prevents aggressive client retry-loops during zero-answer resolutions.
   1.11.0 - [PERF/CLEANUP] Simplified `cloneIP` organically using zero-dependency
            slice appending, bypassing standard iterations natively.
   1.10.0 - [SECURITY/FIX] Finished the aliasing repair 1.9.0 claimed to have
@@ -158,7 +162,9 @@ func writePolicyAction(w dns.ResponseWriter, r *dns.Msg, action int) bool {
 		msg.Authoritative = true // Ensures explicit RCODE exits are also respected by strict stubs
 		msg.Rcode = action
 
-		if action == dns.RcodeNameError && len(r.Question) > 0 {
+		// [SECURITY/FIX] Inject SOA records on NOERROR responses lacking answers (NODATA).
+		// Perfectly adheres to RFC 2308 Negative Caching requirements organically.
+		if (action == dns.RcodeNameError || action == dns.RcodeSuccess) && len(r.Question) > 0 {
 			SetNegativeSOA(msg, r.Question[0].Name, syntheticTTL)
 		}
 

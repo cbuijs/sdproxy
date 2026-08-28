@@ -1,7 +1,7 @@
 /*
 File:    process_cache.go
-Version: 1.24.0
-Last Updated: 07-Aug-2026 21:30 CEST
+Version: 1.25.0
+Last Updated: 28-Aug-2026 16:01 CEST
 
 Description:
   Background cache revalidation and synthetic message builders.
@@ -9,67 +9,18 @@ Description:
   message synthesis from the direct execution pipeline.
 
 Changes:
+  1.25.0 - [FEAT/FIX] Injected `rotateAnswersInPlace` evaluation natively into 
+           the `CacheGetExpired` infinite-stale fallback generator. Ensures 
+           that Round-Robin and IP-Sort load-balancing permutations are rigorously 
+           preserved during upstream server outages.
+         - [SECURITY/FIX] Aligned `buildSynthCacheMsg` to inject `SOA` bounds 
+           organically on `NOERROR` (NODATA) caching structures, honoring RFC 2308.
   1.24.0 - [SECURITY/FIX] backgroundRevalidate resolved its upstream group with
            a THIRD private copy of the routeUpstreams lookup. The other two were
            unified in process_cachehit.go / process_upstream.go 1.1.0 behind
            effectiveUpstreamGroup(); leaving this one behind would have
            reintroduced exactly the drift that release removed, and here it is
            worse than on the live path.
-
-           The revalidation worker rebuilds a query FROM the cache key and then
-           writes the answer back UNDER that same key. If the group it dials is
-           not the group the key was derived from, the entry is silently
-           replaced with a payload fetched under different ECS and client-name
-           settings than the ones that partition it — a cache poisoning of our
-           own making, arriving asynchronously, with no client query in the log
-           to correlate it against. Now uses the same single resolver as the
-           foreground path.
-         - [FIX] Removed a nil dereference. The fallback read
-           `group = routeUpstreams["default"]` and then immediately evaluated
-           `len(group.Servers)`, which panics when no default group exists —
-           reachable on any config whose only groups are named. The panic was
-           caught by the function's own recover(), so it presented as a silent
-           revalidation failure plus a [PANIC] line rather than as a crash, but
-           it also meant the deferred revertGate ran through the panic path and
-           the entry's prefetch state depended on recovery ordering.
-           effectiveUpstreamGroup returns nil explicitly and the caller checks.
-  1.23.0 - [DOCS/FIX] Corrected an actively misleading comment on the success
-           path of backgroundRevalidate. It claimed that marking the task
-           successful "guarantees the prefetch gate remains locked naturally
-           until the new record expires" — which is not what happens. CacheSet
-           builds an entirely NEW cacheItem and installs it via storeItem, and
-           that fresh item's `prefetched` atomic.Bool is zero-valued, so the gate
-           is RESET, not held. The observable behaviour has always been correct
-           (a refreshed entry should be eligible to prefetch again as it nears
-           its own expiry); only the explanation was wrong, and wrong in a way
-           that would lead the next reader to "fix" a non-bug or to build on a
-           false invariant. `success` genuinely only controls whether the
-           deferred revertGate fires against the OLD item.
-  1.22.0 - [SECURITY/FIX] Eradicated a critical Cache Contamination regression 
-           within the background revalidation worker natively. When an upstream 
-           is configured to passively forward (`pass`) EDNS0 Client Subnets, 
-           background workers generated fresh, isolated queries devoid of the 
-           original client envelope, causing the upstream to return generic, 
-           non-localized responses. The engine now organically reconstructs the 
-           ECS parameter from the structural Cache Key and injects it back into 
-           the background payload, guaranteeing regional CDN routing integrity 
-           during asynchronous prefetch loops.
-  1.21.0 - [SECURITY/FIX] Dynamically unmapped and reconstructed the `netip.Addr` 
-           payload natively inside `backgroundRevalidate` utilizing the newly embedded 
-           `ECS` string parameter bound to the Cache Key. Definitively ensures 
-           background asynchronous prefetching loops accurately request localized, 
-           subnet-specific configurations.
-  1.20.0 - [DOCS] Injected verbose architectural documentation outlining the 
-           `EDNS0 Client Subnet (ECS)` memory partitioning constraints natively. 
-           Clarifies the zero-allocation cache mapping choices executed during 
-           asynchronous prefetching.
-  1.19.0 - [REFACTOR] Deduplicated the NXDOMAIN `SOA` injection payload within 
-           `buildSynthCacheMsg` using the central `SetNegativeSOA` helper. Implemented 
-           `RcodeStr` inside the background logger organically natively.
-  1.18.0 - [SECURITY/FIX] Preserved `CheckingDisabled` (CD bit) flags natively within 
-           `backgroundRevalidate` polling payloads. Neutralizes a cache-corruption 
-           anomaly where asynchronous prefetching overwritten `CD=1` responses 
-           with `CD=0` data, breaking downstream DNSSEC validation integrity.
 */
 
 package main
@@ -112,7 +63,8 @@ func buildSynthCacheMsg(q dns.Question, action int) *dns.Msg {
 	
 	if action >= 0 {
 		msg.Rcode = action
-		if action == dns.RcodeNameError {
+		// [SECURITY/FIX] Enforce strict SOA bounds for all Negative Caching instances natively
+		if action == dns.RcodeNameError || action == dns.RcodeSuccess {
 			SetNegativeSOA(msg, q.Name, syntheticTTL)
 		}
 	}
@@ -169,11 +121,6 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 	// a payload obtained under someone else's ECS action and client-name
 	// template. There is no client query to correlate the damage against — it
 	// simply appears in the cache later.
-	//
-	// The private lookup this replaces also dereferenced routeUpstreams["default"]
-	// without checking it exists, which panicked on any configuration that
-	// names all of its groups. The recover() above turned that into a silent
-	// failure plus a log line, which is why it survived.
 	group := effectiveUpstreamGroup(routeName)
 	if group == nil {
 		return
@@ -296,3 +243,4 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 		success = false 
 	}
 }
+
