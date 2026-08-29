@@ -1,7 +1,7 @@
 /*
 File:    helpers_io.go
-Version: 1.0.0
-Updated: 22-Jul-2026 21:40 CEST
+Version: 1.1.0
+Last Updated: 29-Aug-2026 17:30 CEST
 
 Description:
   Shared disk-I/O and serialization helpers for sdproxy.
@@ -13,7 +13,7 @@ Description:
 
   Provides:
     syncDirForFile   - fsync the parent directory so a rename survives power loss.
-    atomicWrite      - write bytes via .tmp -> fsync -> rename -> dir-sync.
+    atomicWrite      - write bytes via os.CreateTemp -> fsync -> rename -> dir-sync.
     atomicWriteBuf   - same, streaming through a 64KB buffered writer.
     loadGob/saveGob  - buffered gob decode/encode of a typed payload.
     loadASNBinCache  - typed bridge for the ASN binary cache (gob strings -> netip).
@@ -24,6 +24,12 @@ Description:
   can never replace valid data.
 
 Changes:
+  1.1.0 - [SECURITY/FIX] Eradicated a critical Race Condition natively. 
+          `atomicWrite` and `atomicWriteBuf` previously used deterministic `.tmp` 
+          file names natively, exposing the daemon to severe data corruption 
+          if multiple threads attempted to persist memory arrays simultaneously. 
+          Upgraded to `os.CreateTemp` to securely guarantee collision-free 
+          atomic saves.
   1.0.0 - Initial extraction (Tier 2 dedup). Behaviour change vs the previous
           inline copies: the pre-rename os.Remove(path) has been dropped. POSIX
           rename(2) replaces atomically; the pre-remove opened a crash window in
@@ -52,15 +58,35 @@ func syncDirForFile(filePath string) {
 	}
 }
 
-// atomicWrite writes data to path via a temporary file, then renames it into
-// place and fsyncs the parent directory. Any failure removes the .tmp and leaves
-// the original file intact.
+// atomicWrite writes data to path via a temporary file securely.
+// Utilizes os.CreateTemp to eradicate race conditions during concurrent filesystem operations.
+// Any failure removes the .tmp and leaves the original file intact.
 func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
 		os.Remove(tmp)
 		return err
 	}
@@ -72,19 +98,18 @@ func atomicWrite(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// atomicWriteBuf streams into path through a 64KB buffered writer, then applies
-// the same fsync/rename/dir-sync guarantees as atomicWrite. Use this for large
-// payloads (gob caches, line-oriented list caches) to avoid materialising the
-// whole encoding in memory first.
+// atomicWriteBuf streams into path through a 64KB buffered writer.
+// Applies the same fsync/rename/dir-sync guarantees as atomicWrite.
 func atomicWriteBuf(path string, perm os.FileMode, fn func(*bufio.Writer) error) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 
 	fail := func(e error) error {
 		f.Close()
@@ -103,12 +128,13 @@ func atomicWriteBuf(path string, perm os.FileMode, fn func(*bufio.Writer) error)
 		return fail(err)
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
+		return fail(err)
+	}
+	if err := os.Chmod(tmp, perm); err != nil {
+		return fail(err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
+		return fail(err)
 	}
 	syncDirForFile(path)
 	return nil
@@ -139,7 +165,6 @@ func saveGob[T any](path string, v T) error {
 // string-encoded gob form back into netip.Addr ranges.
 //
 // Returns ok=false on a missing file, a corrupt payload, or a schema change.
-// This replaces six near-identical inline blocks in identity_asn.go.
 func loadASNBinCache(path string) ([]AsnRange, bool) {
 	gobParsed, err := loadGob[[]AsnRangeGob](path)
 	if err != nil {

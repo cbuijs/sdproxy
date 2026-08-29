@@ -1,7 +1,7 @@
 /*
 File:    cache_rw.go
-Version: 1.6.0 (Split)
-Last Updated: 24-Aug-2026 13:39 CEST
+Version: 1.7.0 (Split)
+Last Updated: 29-Aug-2026 17:30 CEST
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
@@ -11,6 +11,10 @@ Description:
   Extracted from cache.go to prioritize hot-path execution clarity.
 
 Changes:
+  1.7.0 - [FEAT/FIX] Injected `rotateAnswersInPlace` evaluation natively into 
+          the `CacheGetExpired` infinite-stale fallback generator. Ensures 
+          that Round-Robin permutations are rigorously preserved during 
+          upstream server outages.
   1.6.0 - [PERF/FIX] Re-engineered `stripOPTRecords` allocation heuristic. 
           The scanner now definitively searches for the presence of OPT 
           records rather than non-OPT records, completely eradicating 
@@ -316,6 +320,13 @@ func CacheGetExpired(key DNSCacheKey, out *dns.Msg) bool {
 			rr.Header().Ttl = 30
 		}
 	}
+	
+	// [FEAT/FIX 1.7.0] Re-apply answer sorting if configured, to ensure Load Balancing 
+	// continues operating effectively on stale fallbacks natively.
+	if cacheRotateAnswers {
+		rotateAnswersInPlace(out, item.rotation.Add(1))
+	}
+
 	return true
 }
 
