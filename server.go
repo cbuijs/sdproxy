@@ -1,7 +1,7 @@
 /*
 File:    server.go
-Version: 1.40.0 (Split)
-Last Updated: 07-Aug-2026 21:30 CEST
+Version: 1.41.0 (Split)
+Last Updated: 29-Aug-2026 10:39 CEST
 
 Description: 
   DNS Request handlers and response writers for TCP, DoT, DoH, and DoQ.
@@ -9,6 +9,11 @@ Description:
   file purely focused on translating transport protocols into ProcessDNS payloads.
 
 Changes:
+  1.41.0  - [SECURITY/FIX] Completely eradicated buffer exhaustion crashes natively 
+            within `dohResponseWriter` and `doqResponseWriter`. Upgraded payload packing 
+            to strictly utilize `largeBufPool` (64KB) instead of `smallBufPool` (4KB). 
+            Definitively prevents `dns.ErrBuf` serialization failures from silently dropping 
+            large DNSSEC, TXT, or HTTPS payloads, guaranteeing full RFC compliance natively.
   1.40.0  - [SECURITY/FIX] handleDoH accepted a POST body of any media type.
             RFC 8484 §4.1 requires application/dns-message on both request and
             response, and the handler already sets it correctly on the way out —
@@ -669,15 +674,15 @@ type dohResponseWriter struct {
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
-	bufPtr := smallBufPool.Get().(*[]byte)
+	bufPtr := largeBufPool.Get().(*[]byte) // [SECURITY/FIX 1.41.0] Must use 64KB pool to survive DNSSEC / large responses
 	packed, err := msg.PackBuffer((*bufPtr)[:0])
 	if err != nil {
-		smallBufPool.Put(bufPtr)
+		largeBufPool.Put(bufPtr)
 		return err
 	}
 	dw.w.Header().Set("Content-Type", dohMediaType)
 	_, err = dw.w.Write(packed)
-	smallBufPool.Put(bufPtr)
+	largeBufPool.Put(bufPtr)
 	return err
 }
 
@@ -701,10 +706,10 @@ type doqResponseWriter struct {
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
-	bufPtr := smallBufPool.Get().(*[]byte)
+	bufPtr := largeBufPool.Get().(*[]byte) // [SECURITY/FIX 1.41.0] Must use 64KB pool to survive DNSSEC / large responses
 	packed, err := msg.PackBuffer((*bufPtr)[:0])
 	if err != nil {
-		smallBufPool.Put(bufPtr)
+		largeBufPool.Put(bufPtr)
 		return err
 	}
 
@@ -747,7 +752,7 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 
 		tPacked, tErr := truncated.PackBuffer((*bufPtr)[:0])
 		if tErr != nil {
-			smallBufPool.Put(bufPtr)
+			largeBufPool.Put(bufPtr)
 			return tErr
 		}
 		packed = tPacked
@@ -764,11 +769,11 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	dw.stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
 
 	if _, err = dw.stream.Write(lenBuf[:]); err != nil {
-		smallBufPool.Put(bufPtr)
+		largeBufPool.Put(bufPtr)
 		return err
 	}
 	_, err = dw.stream.Write(packed)
-	smallBufPool.Put(bufPtr)
+	largeBufPool.Put(bufPtr)
 	return err
 }
 
@@ -784,3 +789,4 @@ func (dw *doqResponseWriter) Close() error                { return dw.stream.Clo
 func (dw *doqResponseWriter) TsigStatus() error           { return nil }
 func (dw *doqResponseWriter) TsigTimersOnly(bool)         {}
 func (dw *doqResponseWriter) Hijack()                     {}
+

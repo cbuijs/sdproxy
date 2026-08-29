@@ -1,7 +1,7 @@
 /*
 File:    process_local.go
-Version: 1.8.0
-Last Updated: 24-Aug-2026 13:31 CEST
+Version: 1.9.0
+Last Updated: 29-Aug-2026 10:39 CEST
 
 Description:
   Intercepts queries for locally known hosts or DHCP leases and "spoofs"
@@ -9,6 +9,12 @@ Description:
   Extracted from process.go to improve modularity.
 
 Changes:
+  1.9.0 - [SECURITY/FIX] Eradicated a critical LAN Privacy Leakage vulnerability natively.
+          When clients queried local hostnames for non-standard types (e.g., HTTPS, TXT), 
+          the identity router previously ignored them, causing internal LAN names 
+          to be forwarded and leaked to public upstream providers. These queries 
+          are now definitively trapped and answered with an authoritative NODATA 
+          (NOERROR + SOA) response natively.
   1.8.0 - [PERF/CLEANUP] Simplified IP allocation mappings utilizing `addr.AsSlice()` 
           natively, eliminating redundant memory buffering constructs.
   1.7.0 - [SECURITY/FIX] Eradicated a critical LAN Privacy Leakage vulnerability natively.
@@ -166,6 +172,39 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 			if logQueries {
 				log.Printf("[DNS] [%s] %s -> %s PTR | ROUTE: %s (%s) | LOCAL | NOERROR",
 					protocol, clientID, originalQName, routeName, routeOriginType)
+			}
+			return true
+		}
+
+	default:
+		// [SECURITY/FIX] LAN Privacy Leakage Protection
+		// If the name exists in our local identity maps, but the query type is not A/AAAA/PTR (e.g., HTTPS, TXT, SRV),
+		// we MUST intercept it and return NODATA. Do not leak internal local hostnames to public upstreams!
+		if addrs, _ := LookupIPsByNameLower(qNameTrimmed); len(addrs) > 0 {
+			resp := msgPool.Get().(*dns.Msg)
+			*resp = dns.Msg{} // Zero fields safely
+			resp.SetReply(r)
+			resp.Authoritative = true
+			resp.Rcode = dns.RcodeSuccess
+
+			SetNegativeSOA(resp, q.Name, syntheticTTL)
+			PreserveEDNS0(r, resp)
+
+			if cacheLocalIdentity {
+				CacheSetSynth(cacheKey, resp)
+			}
+
+			w.WriteMsg(resp)
+			msgPool.Put(resp)
+
+			if logQueries {
+				statusLog := "LOCAL"
+				if spoofedAlias != "" {
+					statusLog = fmt.Sprintf("SPOOFED ALIAS (%s) | %s", spoofedAlias, statusLog)
+				}
+				log.Printf("[DNS] [%s] %s -> %s %s | ROUTE: %s (%s) | %s | NOERROR (NODATA)",
+					protocol, clientID, originalQName, dns.TypeToString[q.Qtype],
+					routeName, routeOriginType, statusLog)
 			}
 			return true
 		}

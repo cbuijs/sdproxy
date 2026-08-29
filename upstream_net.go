@@ -1,13 +1,17 @@
 /*
 File:    upstream_net.go
-Version: 1.31.0
-Last Updated: 07-Aug-2026 18:05 CEST
+Version: 1.32.0
+Last Updated: 29-Aug-2026 10:39 CEST
 
 Description:
   TCP, DoT, HTTP, and QUIC stream network dialers and protocol implementations.
   Extracted from upstream.go to isolate network transport bounds.
 
 Changes:
+  1.32.0 - [SECURITY/FIX] Upgraded payload packing functions across HTTP/QUIC client 
+           exchanges (`exchangeHTTP`, `doqStreamExchange`) to utilize `largeBufPool` 
+           (64KB) uniformly. Definitively eradicates `dns.ErrBuf` packing failures 
+           when sending queries carrying massive EDNS0 pads or extensions natively.
   1.31.0 - [SECURITY/FIX] Guarded the outbound DoQ length prefix against uint16
            wraparound (audit item S-C). exchangeDoQ framed the query with an
            unchecked `uint16(len(packed))`, so a payload over 65.535 bytes would
@@ -262,14 +266,14 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 
 // exchangeHTTP manages execution for HTTP/2 and HTTP/3 transports natively.
 func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL string, client *http.Client) (*dns.Msg, string, bool, error) {
-	bufPtr := smallBufPool.Get().(*[]byte)
+	bufPtr := largeBufPool.Get().(*[]byte) // [SECURITY/FIX 1.32.0] Utilize 64KB buffer organically to prevent dns.ErrBuf errors natively
 	packed, err := req.PackBuffer((*bufPtr)[:0])
 	if err != nil {
-		smallBufPool.Put(bufPtr)
+		largeBufPool.Put(bufPtr)
 		return nil, "", false, fmt.Errorf("pack buffer: %w", err)
 	}
 	// Securely recycle the buffer exclusively after the function completes
-	defer smallBufPool.Put(bufPtr)
+	defer largeBufPool.Put(bufPtr)
 
 	var remoteAddr string
 	trace := &httptrace.ClientTrace{
@@ -600,10 +604,10 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	}
 	stream.SetDeadline(deadline)
 
-	pBufPtr := smallBufPool.Get().(*[]byte)
+	pBufPtr := largeBufPool.Get().(*[]byte) // [SECURITY/FIX 1.32.0] Utilize 64KB buffer organically to guarantee safe packing
 	packed, err := req.PackBuffer((*pBufPtr)[:0])
 	if err != nil {
-		smallBufPool.Put(pBufPtr)
+		largeBufPool.Put(pBufPtr)
 		return nil, fmt.Errorf("pack buffer: %w", err)
 	}
 
@@ -627,25 +631,25 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	// the caller treats this as an ordinary upstream failure and the racing
 	// engine simply moves to the next server, so the client still gets served.
 	if len(packed) > 65535 {
-		smallBufPool.Put(pBufPtr)
+		largeBufPool.Put(pBufPtr)
 		return nil, fmt.Errorf("doq query too large for the RFC 9250 length prefix: %d bytes", len(packed))
 	}
 
 	var lenBuf [2]byte
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(packed)))
 	if _, err := stream.Write(lenBuf[:]); err != nil {
-		smallBufPool.Put(pBufPtr)
+		largeBufPool.Put(pBufPtr)
 		return nil, fmt.Errorf("write length: %w", err)
 	}
 	if _, err := stream.Write(packed); err != nil {
-		smallBufPool.Put(pBufPtr)
+		largeBufPool.Put(pBufPtr)
 		return nil, fmt.Errorf("write payload: %w", err)
 	}
 	if err := stream.Close(); err != nil {
-		smallBufPool.Put(pBufPtr)
+		largeBufPool.Put(pBufPtr)
 		return nil, fmt.Errorf("close write stream: %w", err)
 	}
-	smallBufPool.Put(pBufPtr) 
+	largeBufPool.Put(pBufPtr) 
 
 	if _, err := io.ReadFull(stream, lenBuf[:]); err != nil {
 		return nil, fmt.Errorf("read length: %w", err)
@@ -672,6 +676,4 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	
 	return resp, nil
 }
-
-
 
