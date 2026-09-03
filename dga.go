@@ -1,7 +1,7 @@
 /*
 File:    dga.go
-Version: 1.11.0
-Updated: 04-Jun-2026 12:55 CEST
+Version: 1.12.0
+Last Updated: 03-Sep-2026 12:29 CEST
 
 Description:
   Zero-allocation Local Machine Learning inference engine for Domain Generation 
@@ -9,6 +9,11 @@ Description:
   natively within the DNS pipeline to intercept stochastic botnet and C2 domains.
 
 Changes:
+  1.12.0 - [SECURITY/FIX] Upgraded ML regression weights to comprehensively intercept 
+           modern Dictionary DGAs. Incorporated `trailingDigits` evaluations to 
+           catch domains bridging semantic English words with obfuscated numeric 
+           suffixes natively. Expanded `dgaSafeDomains` whitelist organically 
+           to accommodate Microsoft Office/Windows infrastructure and Developer environments.
   1.11.0 - [PERF] Deployed an O(1) pre-flight byte boundary evaluation inside the 
            Safe Domains whitelist. Completely eradicates thousands of redundant 
            `strings.HasSuffix` overhead checks per second by aborting iterations 
@@ -64,6 +69,10 @@ var dgaSafeDomains = []string{
 	"edgekey.net",
 	"fastly.net",
 
+	// Developer / Tech
+	"github.com",
+	"githubusercontent.com",
+
 	// DNS Providers
 	"adguard-dns.com",
 	"cloudflare-dns.com",
@@ -96,7 +105,12 @@ var dgaSafeDomains = []string{
 	"azure.com",
 	"azureedge.net",
 	"microsoft.com",
+	"office.com",
+	"office365.com",
+	"skype.com",
 	"trafficmanager.net",
+	"windows.com",
+	"windows.net",
 	"windowsupdate.com",
 }
 
@@ -224,6 +238,20 @@ func AnalyzeDGA(fullDomain, domainCore string) float64 {
 		}
 	}
 
+	// [FEATURE] Calculate Trailing Digits natively to catch Dictionary DGAs (e.g. wordword1234)
+	trailingDigits := 0
+	for i := length - 1; i >= 0; i-- {
+		c := domainCore[i]
+		if c == '.' {
+			continue
+		}
+		if c >= '0' && c <= '9' {
+			trailingDigits++
+		} else {
+			break
+		}
+	}
+
 	// Safe arithmetic guard if a domain consisted solely of delimiters
 	if effectiveLength == 0 {
 		return 0.0
@@ -295,6 +323,13 @@ func AnalyzeDGA(fullDomain, domainCore string) float64 {
 	// compared to semantic words which naturally repeat letters frequently.
 	uRatio := unique / fLength
 	z += uRatio * 3.0
+
+	// 7. Trailing Digits: Dictionary DGAs frequently append blocks of digits 
+	// to semantic words (e.g. "corecrypt4439") to guarantee uniqueness. 
+	// Normal semantic domains rarely exceed 3 trailing digits (e.g. office365).
+	if trailingDigits > 3 {
+		z += float64(trailingDigits-3) * 1.5
+	}
 
 	// -----------------------------------------------------------------------
 	// Sigmoid Activation Function
