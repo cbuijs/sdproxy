@@ -1,7 +1,7 @@
 /*
 File:    process_routing.go
-Version: 1.11.0
-Updated: 04-Sep-2026 08:20 CEST
+Version: 1.12.0
+Last Updated: 04-Sep-2026 10:15 CEST
 
 Description:
   Routing Engine for sdproxy.
@@ -11,6 +11,11 @@ Description:
     - Client Profile RCODE intercepts
 
 Changes:
+  1.12.0 - [SECURITY/FIX] Completely overhauled the `ForceAnd` (Intersection Match) engine.
+           Compound route directives previously attempted to cross-reference keys from 
+           pre-compiled individual arrays, failing silently as those specific keys were 
+           bypassed during initialization. Compound rules are now strictly evaluated 
+           dynamically against active runtime client telemetry structures organically.
   1.11.0 - [FEAT] Added support for `port:` identifiers to natively map incoming 
            listener bounds organically during routing evaluations.
            Implemented `force-and` evaluation logic. If `ForceAnd` is true for a 
@@ -56,169 +61,121 @@ func resolveClientRoute(clientMAC, clientIP string, clientAddr netip.Addr, clien
 	var normalOrigin string
 	var normalMatched bool
 	
-	// Helper to track match success natively for the `force-and` directive
-	evaluateMatch := func(keys []string) (bool, ParsedRoute, string) {
-		var matchedRoute ParsedRoute
-		var matchedOrigin string
-		var routeResolved bool
-		
+	// Dynamic Compound evaluation matrix (ForceAnd)
+	for _, mapping := range compoundRouteMappings {
 		allMatched := true
+		var matchedOrigins []string
 		
-		for _, rawKey := range keys {
+		for _, rawKey := range mapping.keys {
 			keyMatched := false
-			var currentRoute ParsedRoute
-			var currentOrigin string
-
 			switch classifyRouteKey(rawKey) {
 			case rkMAC:
-				if clientMAC != "" {
-					if route, ok := macRoutes[clientMAC]; ok {
-						currentRoute, currentOrigin, keyMatched = route, "MAC", true
-					}
+				if clientMAC != "" && strings.EqualFold(clientMAC, rawKey) {
+					keyMatched = true
+					matchedOrigins = append(matchedOrigins, "MAC")
 				}
 			case rkMACGlob:
-				if clientMAC != "" {
-					for _, wg := range macWildRoutes {
-						if matchMACGlob(wg.pattern, clientMAC) {
-							currentRoute, currentOrigin, keyMatched = wg.route, "MAC-GLOB", true
-							break
-						}
-					}
+				if clientMAC != "" && matchMACGlob(normaliseMACGlob(rawKey), clientMAC) {
+					keyMatched = true
+					matchedOrigins = append(matchedOrigins, "MAC-GLOB")
 				}
 			case rkIP:
-				if clientIP != "" {
-					if route, ok := ipRoutes[clientIP]; ok {
-						currentRoute, currentOrigin, keyMatched = route, "IP", true
-					}
+				if clientIP != "" && clientIP == rawKey {
+					keyMatched = true
+					matchedOrigins = append(matchedOrigins, "IP")
 				}
 			case rkCIDR:
 				if clientAddr.IsValid() {
-					for _, cr := range cidrRoutes {
-						if cr.net.Contains(clientAddr) {
-							currentRoute, currentOrigin, keyMatched = cr.route, "CIDR", true
-							break
-						}
+					if prefix, err := ParsePrefixUnmapped(rawKey); err == nil && prefix.Contains(clientAddr) {
+						keyMatched = true
+						matchedOrigins = append(matchedOrigins, "CIDR")
 					}
 				}
 			case rkASN:
 				if clientAddr.IsValid() {
-					if asn, _, _ := LookupASNDetails(clientAddr); asn != "" {
-						if route, ok := asnRoutes[asn]; ok {
-							currentRoute, currentOrigin, keyMatched = route, "ASN", true
-						}
+					if asn, _, _ := LookupASNDetails(clientAddr); asn != "" && strings.EqualFold(asn, rawKey) {
+						keyMatched = true
+						matchedOrigins = append(matchedOrigins, "ASN")
 					}
 				}
 			case rkCountry:
 				if clientAddr.IsValid() {
 					if _, _, country := LookupASNDetails(clientAddr); country != "" {
-						countryUpper := strings.ToUpper(country)
-						if route, ok := countryRoutes[countryUpper]; ok {
-							currentRoute, currentOrigin, keyMatched = route, "COUNTRY", true
+						cc := strings.TrimPrefix(strings.ToUpper(rawKey), "CC:")
+						if strings.EqualFold(country, cc) {
+							keyMatched = true
+							matchedOrigins = append(matchedOrigins, "COUNTRY")
 						}
 					}
 				}
 			case rkClientName:
-				if clientNameLower != "" {
-					if route, ok := clientNameRoutes[strings.ToLower(rawKey)]; ok {
-						currentRoute, currentOrigin, keyMatched = route, "CLIENT-NAME", true
-					}
+				if clientNameLower != "" && clientNameLower == strings.ToLower(rawKey) {
+					keyMatched = true
+					matchedOrigins = append(matchedOrigins, "CLIENT-NAME")
 				}
 			case rkSNI:
-				if sniLower != "" {
-					if route, ok := sniRoutes[strings.ToLower(strings.TrimPrefix(rawKey, "sni:"))]; ok {
-						currentRoute, currentOrigin, keyMatched = route, "SNI", true
-					}
+				if sniLower != "" && sniLower == strings.ToLower(strings.TrimPrefix(rawKey, "sni:")) {
+					keyMatched = true
+					matchedOrigins = append(matchedOrigins, "SNI")
 				}
 			case rkPath:
 				if pathLower != "" {
 					p := strings.ToLower(rawKey)
-					if strings.HasPrefix(p, "path:") {
-						p = strings.TrimPrefix(p, "path:")
-					}
-					p = strings.TrimSuffix(p, "/")
-					if route, ok := pathRoutes[p]; ok {
-						currentRoute, currentOrigin, keyMatched = route, "PATH", true
+					if strings.HasPrefix(p, "path:") { p = strings.TrimPrefix(p, "path:") }
+					if pathLower == strings.TrimSuffix(p, "/") {
+						keyMatched = true
+						matchedOrigins = append(matchedOrigins, "PATH")
 					}
 				}
 			case rkPort:
 				if portStr != "" {
-					if p, ok := parsePort(rawKey); ok {
-						if route, ok := portRoutes[p]; ok && p == portStr {
-							currentRoute, currentOrigin, keyMatched = route, "PORT", true
-						}
+					if p, ok := parsePort(rawKey); ok && p == portStr {
+						keyMatched = true
+						matchedOrigins = append(matchedOrigins, "PORT")
 					}
 				}
 			}
 
 			if !keyMatched {
 				allMatched = false
-				// If force-and is enabled, a single failure aborts the check immediately natively
-				if len(keys) > 1 {
-					// We can only break securely if we KNOW force-and is true for this key chain.
-					// Since `force-and` is bound to the route, we must infer it during evaluation.
-					// We'll verify this at the end of the loop natively.
-				}
-			} else {
-				if !routeResolved {
-					matchedRoute = currentRoute
-					matchedOrigin = currentOrigin
-					routeResolved = true
-				}
-			}
-		}
-		
-		if routeResolved && matchedRoute.ForceAnd {
-			if !allMatched {
-				return false, ParsedRoute{}, ""
+				break
 			}
 		}
 
-		return routeResolved && (allMatched || !matchedRoute.ForceAnd), matchedRoute, matchedOrigin
+		if allMatched {
+			originStr := strings.Join(matchedOrigins, "+")
+			if mapping.route.Force { return mapping.route, true, originStr }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = mapping.route, originStr, true }
+		}
 	}
 	
 	// Fast Path standard evaluations
 	if hasMACRoutes && clientMAC != "" {
 		if route, ok := macRoutes[clientMAC]; ok {
-			if route.ForceAnd {
-				// Evaluate grouped rules dynamically organically
-			} else {
-				if route.Force { return route, true, "MAC" }
-				if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "MAC", true }
-			}
+			if route.Force { return route, true, "MAC" }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "MAC", true }
 		}
 	}
 	if hasMACWildRoutes && clientMAC != "" {
 		for _, wg := range macWildRoutes {
 			if matchMACGlob(wg.pattern, clientMAC) {
-				if wg.route.ForceAnd {
-					// Evaluate grouped rules dynamically organically
-				} else {
-					if wg.route.Force { return wg.route, true, "MAC-GLOB" }
-					if !normalMatched { normalRoute, normalOrigin, normalMatched = wg.route, "MAC-GLOB", true }
-				}
+				if wg.route.Force { return wg.route, true, "MAC-GLOB" }
+				if !normalMatched { normalRoute, normalOrigin, normalMatched = wg.route, "MAC-GLOB", true }
 				break
 			}
 		}
 	}
 	if hasIPRoutes && clientIP != "" {
 		if route, ok := ipRoutes[clientIP]; ok {
-			if route.ForceAnd {
-				// Evaluate grouped rules dynamically organically
-			} else {
-				if route.Force { return route, true, "IP" }
-				if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "IP", true }
-			}
+			if route.Force { return route, true, "IP" }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "IP", true }
 		}
 	}
 	if hasCIDRRoutes && clientAddr.IsValid() {
 		for _, cr := range cidrRoutes {
 			if cr.net.Contains(clientAddr) {
-				if cr.route.ForceAnd {
-					// Evaluate grouped rules dynamically organically
-				} else {
-					if cr.route.Force { return cr.route, true, "CIDR" }
-					if !normalMatched { normalRoute, normalOrigin, normalMatched = cr.route, "CIDR", true }
-				}
+				if cr.route.Force { return cr.route, true, "CIDR" }
+				if !normalMatched { normalRoute, normalOrigin, normalMatched = cr.route, "CIDR", true }
 				break
 			}
 		}
@@ -227,45 +184,29 @@ func resolveClientRoute(clientMAC, clientIP string, clientAddr netip.Addr, clien
 		if asn, _, country := LookupASNDetails(clientAddr); asn != "" || country != "" {
 			if hasASNRoutes && asn != "" {
 				if route, ok := asnRoutes[asn]; ok {
-					if route.ForceAnd {
-						// Evaluate grouped rules dynamically organically
-					} else {
-						if route.Force { return route, true, "ASN" }
-						if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "ASN", true }
-					}
+					if route.Force { return route, true, "ASN" }
+					if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "ASN", true }
 				}
 			}
 			if hasCountryRoutes && country != "" && !normalMatched {
 				countryUpper := strings.ToUpper(country)
 				if route, ok := countryRoutes[countryUpper]; ok {
-					if route.ForceAnd {
-						// Evaluate grouped rules dynamically organically
-					} else {
-						if route.Force { return route, true, "COUNTRY" }
-						if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "COUNTRY", true }
-					}
+					if route.Force { return route, true, "COUNTRY" }
+					if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "COUNTRY", true }
 				}
 			}
 		}
 	}
 	if hasClientNameRoutes && clientNameLower != "" {
 		if route, ok := clientNameRoutes[clientNameLower]; ok {
-			if route.ForceAnd {
-				// Evaluate grouped rules dynamically organically
-			} else {
-				if route.Force { return route, true, "CLIENT-NAME" }
-				if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "CLIENT-NAME", true }
-			}
+			if route.Force { return route, true, "CLIENT-NAME" }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "CLIENT-NAME", true }
 		}
 	}
 	if hasSNIRoutes && sniLower != "" {
 		if route, ok := sniRoutes[sniLower]; ok {
-			if route.ForceAnd {
-				// Evaluate grouped rules dynamically organically
-			} else {
-				if route.Force { return route, true, "SNI" }
-				if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "SNI", true }
-			}
+			if route.Force { return route, true, "SNI" }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "SNI", true }
 		}
 	}
 	if hasPathRoutes && pathLower != "" {
@@ -275,31 +216,14 @@ func resolveClientRoute(clientMAC, clientIP string, clientAddr netip.Addr, clien
 		}
 		p = strings.TrimSuffix(p, "/")
 		if route, ok := pathRoutes[p]; ok {
-			if route.ForceAnd {
-				// Evaluate grouped rules dynamically organically
-			} else {
-				if route.Force { return route, true, "PATH" }
-				if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "PATH", true }
-			}
+			if route.Force { return route, true, "PATH" }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "PATH", true }
 		}
 	}
 	if hasPortRoutes && portStr != "" {
 		if route, ok := portRoutes[portStr]; ok {
-			if route.ForceAnd {
-				// Evaluate grouped rules dynamically organically
-			} else {
-				if route.Force { return route, true, "PORT" }
-				if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "PORT", true }
-			}
-		}
-	}
-
-	// Dynamic Compound evaluation matrix
-	for _, mapping := range compoundRouteMappings {
-		matched, route, origin := evaluateMatch(mapping.keys)
-		if matched {
-			if route.Force { return route, true, origin }
-			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, origin, true }
+			if route.Force { return route, true, "PORT" }
+			if !normalMatched { normalRoute, normalOrigin, normalMatched = route, "PORT", true }
 		}
 	}
 
@@ -432,3 +356,4 @@ func determineRouting(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTri
 
 	return ctx, false
 }
+
