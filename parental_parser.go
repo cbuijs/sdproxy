@@ -1,13 +1,19 @@
 /*
 File:    parental_parser.go
-Version: 1.4.1
-Last Updated: 24-May-2026 21:00 CEST
+Version: 1.4.2
+Last Updated: 04-Sep-2026 10:45 CEST
 
 Description:
   String and byte parsing for Parental Category domain lists.
   Extracted from parental_categories.go to isolate formatting constraints.
 
 Changes:
+  1.4.2 - [SECURITY/FIX] Eradicated a critical Domain List Discard vulnerability. 
+          When `ipVersionSupport` was restricted (e.g., to "ipv6"), HOSTS-formatted 
+          blocklists utilizing IPv4 dummy addresses (e.g., `0.0.0.0 domain.com`) 
+          were entirely discarded, causing massive gaps in domain filtering. 
+          The parser now correctly ignores the dummy IP's version and natively 
+          extracts the associated hostnames regardless.
   1.4.1 - [BUG/FIX] Added missing "os" import needed by parseLocalFile to fix compilation failure.
   1.4.0 - [SECURITY/FIX] Replaced standard `netip.ParsePrefix` with the unified 
           `ParsePrefixUnmapped` helper. Enforces strict unmapping parity with 
@@ -172,12 +178,8 @@ func parseCategoryLine(line string) []string {
 			return []string{d}
 		}
 		
-		if addr, err := netip.ParseAddr(fields[0]); err == nil {
-			addr = addr.Unmap()
-			if ipVersionSupport != "both" {
-				if ipVersionSupport == "ipv4" && !addr.Is4() { return nil }
-				if ipVersionSupport == "ipv6" && !addr.Is6() { return nil }
-			}
+		// [SECURITY/FIX 1.4.2] Discard the dummy IP structurally without rejecting the domains.
+		if _, err := netip.ParseAddr(fields[0]); err == nil {
 			var out []string
 			for _, f := range fields[1:] {
 				f = strings.ToLower(strings.TrimSuffix(f, "."))

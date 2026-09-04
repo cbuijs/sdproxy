@@ -1,11 +1,14 @@
 /*
 File:    version.go
-Version: 1.467.0
-Last Updated: 04-Sep-2026 10:15 CEST
+Version: 1.468.0
+Last Updated: 04-Sep-2026 10:45 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.468.0 - [SECURITY/FIX] Eradicated a critical Domain List Discard vulnerability 
+            in `parental_parser.go`. Prevented IPv4 or IPv6-only IP version limitations 
+            from wrongly dropping domains tied to dummy IP placeholders natively.
   1.467.0 - [PERF] Eradicated massive heap allocations within `extractIPFromPTR` 
             natively. IPv4 reverse zones (`.in-addr.arpa`) are now decoded through 
             an O(1) mathematical state machine directly into a `[4]byte` block. 
@@ -53,12 +56,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.467.0"
+	BuildVersion string = "v1.468.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "04-Sep-2026 10:15 CEST"
+	BuildTime string = "04-Sep-2026 10:45 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "526"
+	BuildNumber string = "527"
 )
 
