@@ -1,7 +1,7 @@
 /*
 File:    process_helpers.go
-Version: 1.15.0
-Last Updated: 24-Aug-2026 13:39 CEST
+Version: 1.16.0
+Last Updated: 04-Sep-2026 10:15 CEST
 
 Description:
   Synchronization pools, string builders, and high-performance global 
@@ -10,6 +10,12 @@ Description:
   away from the primary hot-path logic.
 
 Changes:
+  1.16.0 - [PERF] Eradicated massive heap allocations within `extractIPFromPTR` 
+           natively. IPv4 reverse zones (`.in-addr.arpa`) are now decoded through 
+           an O(1) mathematical state machine directly into a `[4]byte` block. 
+           Bypasses `strings.Split` and string builders entirely, slashing GC latency 
+           during intense reverse-DNS floods. Mirrors the IPv6 optimizations 
+           from 1.13.0 natively.
   1.15.0 - [CLEANUP] Streamlined `parseHexNibble` evaluation mechanics 
            organically utilizing explicit `switch` bounds for cleaner syntax.
   1.14.0 - [SECURITY] Passed `bypassGlobal` dynamically to `buildSFKey` to avert 
@@ -229,11 +235,36 @@ func parseHexNibble(b byte) byte {
 // Expects a lowercase, dot-trimmed qname.
 func extractIPFromPTR(name string) string {
 	if strings.HasSuffix(name, ".in-addr.arpa") {
-		p := strings.TrimSuffix(name, ".in-addr.arpa")
-		parts := strings.Split(p, ".")
-		if len(parts) == 4 {
-			return parts[3] + "." + parts[2] + "." + parts[1] + "." + parts[0]
+		p := name[:len(name)-13]
+		var b [4]byte
+		var octet int
+		var val int
+		var hasVal bool
+
+		// [PERF/FIX] O(1) mathematical state machine parsing natively.
+		// Exclusively parses strings forward into a precise [4]byte structure.
+		// Eradicates all `strings.Split` array allocations and string builder 
+		// concatenations, slashing GC load securely.
+		for i := 0; i < len(p); i++ {
+			c := p[i]
+			if c == '.' {
+				if !hasVal || octet >= 3 { return "" }
+				b[3-octet] = byte(val)
+				octet++
+				val = 0
+				hasVal = false
+			} else if c >= '0' && c <= '9' {
+				val = val*10 + int(c-'0')
+				if val > 255 { return "" }
+				hasVal = true
+			} else {
+				return ""
+			}
 		}
+		if !hasVal || octet != 3 { return "" }
+		b[0] = byte(val)
+		return netip.AddrFrom4(b).String()
+
 	} else if strings.HasSuffix(name, ".ip6.arpa") {
 		p := strings.TrimSuffix(name, ".ip6.arpa")
 		

@@ -1,11 +1,17 @@
 /*
 File:    version.go
-Version: 1.466.0
-Last Updated: 04-Sep-2026 09:50 CEST
+Version: 1.467.0
+Last Updated: 04-Sep-2026 10:15 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.467.0 - [PERF] Eradicated massive heap allocations within `extractIPFromPTR` 
+            natively. IPv4 reverse zones (`.in-addr.arpa`) are now decoded through 
+            an O(1) mathematical state machine directly into a `[4]byte` block. 
+            Bypasses `strings.Split` and string builders entirely, slashing GC latency 
+            during intense reverse-DNS floods. Mirrors the IPv6 optimizations 
+            from 1.13.0 natively.
   1.466.0 - [PERF/FIX] Eradicated a massive, redundant `msg.Copy()` heap allocation natively 
             within the cache-hit resolution path. `CacheGet` intrinsically unpacks 
             payloads directly from wire-format slices, ensuring absolute isolation 
@@ -41,21 +47,18 @@ Changes:
             intercepts non-standard queries (HTTPS, TXT) aimed at local identities natively, 
             returning an authoritative NODATA structure to completely protect local domains 
             from leaking upstream.
-          - [SECURITY/FIX] Switched `dohResponseWriter`, `doqResponseWriter`, and downstream 
-            packing handlers to uniformly harness the `largeBufPool` array (64KB). Definitively 
-            eradicates `dns.ErrBuf` overflows resulting in empty payloads for robust responses 
-            like DNSSEC and expansive TXT records.
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.466.0"
+	BuildVersion string = "v1.467.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "04-Sep-2026 09:50 CEST"
+	BuildTime string = "04-Sep-2026 10:15 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "525"
+	BuildNumber string = "526"
 )
+
