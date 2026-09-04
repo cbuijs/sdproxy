@@ -1,13 +1,25 @@
 /*
 File:    init_core.go
-Version: 1.112.0
-Updated: 24-Jul-2026 11:20 CEST
+Version: 1.113.0
+Updated: 04-Sep-2026 11:20 CEST
 
 Description:
   High-level initialization orchestrator and general IO helpers for sdproxy.
   Dispatches specific tasks to init_routing, init_policy, and init_upstreams.
 
 Changes:
+  1.113.0 - [SECURITY/FIX] initRouteIndex() didn't register upstream group
+            names referenced ONLY via a `port:` route (portRoutes) or a
+            `force-and` compound route (compoundRouteMappings). A group
+            reachable only through either path never got a routeIdx, so
+            getRouteIdx() silently fell back to routeIdxDefault — meaning
+            that group's cache entries were stored/read under the SAME
+            cache partition as the "default" group. Same class of bug as
+            the routeIdx/cache-key drift already fixed in
+            process_cachehit.go/process_query.go 1.1.0, just reintroduced
+            by the newer port:/force-and feature (init_routing.go 1.7.0,
+            same date). Both maps are now walked like every other routing
+            table.
   1.112.0 - [DEAD-CODE/CLEANUP] Removed the orphaned readConfigListURL fetcher.
             The only remote-list consumers (init_policy.go, parental_loader.go)
             carry their own hardened HTTP fetch paths, so this helper had no
@@ -119,6 +131,17 @@ func initDGA() {
 }
 
 // initRouteIndex constructs the numerical lookup map required by the cache architecture.
+//
+// [SECURITY/FIX 1.113.0] Every routing table that can carry an `upstream:`
+// value MUST be walked here — an upstream group missing from routeIdxByName
+// silently collapses onto routeIdxDefault in getRouteIdx(), which means its
+// queries get cached under the SAME DNSCacheKey.RouteIdx partition as the
+// "default" group. portRoutes and compoundRouteMappings (force-and) were
+// added by init_routing.go 1.7.0 without a matching update here, so a group
+// reachable ONLY through a `port:` route or a `force-and` compound route
+// never got its own index — reproducing, in a new place, exactly the
+// routeIdx/cache-key drift class of bug fixed in process_cachehit.go and
+// process_query.go 1.1.0.
 func initRouteIndex() {
 	routeIdxByName = make(map[string]uint16, len(cfg.Upstreams)+4)
 	routeIdxByName["local"] = routeIdxLocal
@@ -173,6 +196,13 @@ func initRouteIndex() {
 	}
 	for _, route := range pathRoutes {
 		assignIdx(route.Upstream)
+	}
+	// [SECURITY/FIX 1.113.0] Previously missing — see function comment.
+	for _, route := range portRoutes {
+		assignIdx(route.Upstream)
+	}
+	for _, cm := range compoundRouteMappings {
+		assignIdx(cm.route.Upstream)
 	}
 
 	routeIdxDefault = routeIdxByName["default"]
