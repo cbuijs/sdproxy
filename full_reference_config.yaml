@@ -1,6 +1,6 @@
 # File:    full_reference_config.yaml
-# Version: 1.114.0
-# Updated: 17-Aug-2026 19:22 CEST
+# Version: 1.115.0
+# Updated: 04-Sep-2026 08:44 CEST
 #
 # Description:
 #   Complete reference configuration for sdproxy. Every supported option is
@@ -8,6 +8,8 @@
 #   strip what you don't need, and adjust to taste. The comments are the manual.
 #
 # Changes:
+#   1.115.0 - [FEAT] Documented the `port:` routing identifier and the `force-and` 
+#             strict matching directive for client-based routes natively.
 #   1.114.0 - [DOCS/FIX] Updated upstream_timeout_ms documentation to correctly
 #             reflect the 15-second strict maximum deadline fallback natively
 #             enforced by the connection engine when left unbound (0).
@@ -909,13 +911,13 @@ upstreams:
       - "udp://192.168.1.1:53"
 
 # =============================================================================
-# CLIENT-BASED ROUTES (MAC, MAC glob, IP, CIDR, ASN, Country, Name, SNI, Path)
+# CLIENT-BASED ROUTES (MAC, MAC glob, IP, CIDR, ASN, Country, Name, SNI, Path, Port)
 # =============================================================================
 # Maps a client identifier to a specific upstream group and/or a parental
 # control group. 
 #
 # PRECEDENCE (when multiple keys match the same client):
-#   MAC exact  >  MAC glob  >  IP  >  CIDR  >  ASN  >  Country  >  Client-Name  >  SNI  >  Path
+#   MAC exact  >  MAC glob  >  IP  >  CIDR  >  ASN  >  Country  >  Client-Name  >  SNI  >  Path  >  Port
 #
 # Note: You can group multiple identifiers by separating them with commas.
 #
@@ -938,6 +940,10 @@ upstreams:
 #   group        — links this device to a parental control profile.
 #   force        — when true, this rule strictly precedes all other matching
 #                  rules, overriding the standard identifier precedence. Default: false.
+#   force-and    — when true, ALL comma-separated identifiers inside the route string 
+#                  MUST be successfully matched before the rule executes. Allows creating 
+#                  highly specific intersection constraints (e.g. Subnet AND Port).
+#                  Default: false (Logical OR).
 #
 # ── KEY FORMATS ──────────────────────────────────────────────────────────────
 #
@@ -962,7 +968,7 @@ upstreams:
 #   IPv4 or IPv6: "192.168.1.50", "2001:db8::/32"
 #
 # AUTONOMOUS SYSTEM NUMBER (ASN)
-#   Dynamically routes clients based on their ASN.
+#   Dynamically routes clients based on their Autonomous System.
 #   Requires identity.ipinfo_asn to be populated with an IPinfo database.
 #   Case-insensitive format: "AS1136"
 #
@@ -979,6 +985,10 @@ upstreams:
 #   Matches the HTTP request path.
 #   Must start with "/" or be prefixed with "path:". Example: "/dns-query-kids"
 #
+# LISTENER PORT
+#   Matches the exact network port the query arrived on locally.
+#   Must be prefixed with "port:". Example: "port:5353"
+#
 # CLIENT NAME
 #   The DHCP/hosts hostname of the device. Catch-all for any other string.
 #   Requires identity: to be configured with at least one hosts or lease file.
@@ -991,6 +1001,11 @@ routes:
   # ── MAC glob & URL Path  ──────────────────────────────────────────────────
   "aa:bb:cc:??:??:??, /dns-query-kids":
     upstream: "kids"
+
+  # ── Force AND Constraint (Intersection Match) ─────────────────────────────
+  "192.168.1.0/24, port:5353":
+    upstream: "local_network"
+    force-and: true # Both the Subnet AND the Port must match for this route to execute
 
   # ── Client name — matched against DHCP lease / hosts hostname ─────────────
   "alice-iphone, bob-ipad, charlie-mac":

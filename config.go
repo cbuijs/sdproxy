@@ -1,7 +1,7 @@
 /*
 File:    config.go
-Version: 1.70.0
-Updated: 08-Jul-2026 09:15 CEST
+Version: 1.71.0
+Updated: 04-Sep-2026 08:20 CEST
 
 Description:
   All YAML-mapped configuration structs for sdproxy. Covers every top-level
@@ -10,6 +10,8 @@ Description:
   and spoofed records (RRs).
 
 Changes:
+  1.71.0 - [FEAT] Added `ForceAnd` boolean to `RouteConfig` and `ParsedRoute` to strictly enforce
+           logical "AND" matching for multiple route identifiers in a single string.
   1.70.0 - [FEAT] Added `max_secure_upstreams` to make the previously hardcoded 
            cap on simultaneously-queried upstreams for the "secure" strategy 
            configurable. Defaults to 5 when unset/invalid.
@@ -74,6 +76,7 @@ type RouteConfig struct {
 	BypassGlobal bool   `yaml:"bypass_global"`
 	Group        string `yaml:"group"`
 	Force        bool   `yaml:"force"`
+	ForceAnd     bool   `yaml:"force-and"`
 }
 
 // ParsedRoute is the resolved runtime form of RouteConfig.
@@ -86,6 +89,7 @@ type ParsedRoute struct {
 	BypassLocal  bool
 	BypassGlobal bool
 	Force        bool
+	ForceAnd     bool
 }
 
 // ---------------------------------------------------------------------------
@@ -655,4 +659,3 @@ func validateConfig() error {
 
 	return nil
 }
-

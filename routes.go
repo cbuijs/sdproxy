@@ -1,11 +1,11 @@
 /*
 File:    routes.go
-Version: 1.4.0
-Updated: 30-Jun-2026 09:46 CEST
+Version: 1.5.0
+Updated: 04-Sep-2026 08:20 CEST
 Description:
   Route-key classification and MAC-glob matching for sdproxy.
 
-  Every entry under routes: is auto-detected as one of nine types at startup:
+  Every entry under routes: is auto-detected as one of ten types at startup:
     MAC (exact)  — "aa:bb:cc:dd:ee:ff"
     MAC (glob)   — "aa:bb:??:??:??:??" / "aa:bb:cc:*:*:*"
     IP           — "192.168.1.50"
@@ -14,12 +14,14 @@ Description:
     Country      — "CC:NL"
     Path         — "/dns-query" or "path:/kids"
     SNI          — "sni:doh.example.com"
+    Port         — "port:53" or "port:853"
     client-name  — any DHCP/hosts hostname, e.g. "alice-iphone"
 
   Query-time precedence: 
-  MAC exact > MAC glob > IP > CIDR > ASN > Country > client-name > SNI > PATH.
+  MAC exact > MAC glob > IP > CIDR > ASN > Country > client-name > SNI > PATH > PORT.
 
 Changes:
+  1.5.0 - [FEAT] Added support for mapping specific listener ports (port:).
   1.4.0 - [FEAT] Added support for mapping ISO 3166-1 alpha-2 Country Codes (CC:).
   1.3.0 - [PERF] Employs zero-allocation fast-glob matching natively instead 
           of `path.Match`. Eradicates heap escapes and parsing overhead on 
@@ -32,6 +34,7 @@ package main
 import (
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 )
 
@@ -47,6 +50,7 @@ const (
 	rkCountry                        // ISO 3166-1 alpha-2 Country Code
 	rkPath                           // HTTP URL Path (DoH/DoH3)
 	rkSNI                            // TLS Server Name Indication (DoT/DoQ/DoH/DoH3)
+	rkPort                           // Listener Port
 	rkClientName                     // DHCP/hosts hostname (catch-all)
 )
 
@@ -58,6 +62,9 @@ func classifyRouteKey(key string) routeKeyType {
 	}
 	if strings.HasPrefix(key, "path:") || strings.HasPrefix(key, "/") {
 		return rkPath
+	}
+	if strings.HasPrefix(key, "port:") {
+		return rkPort
 	}
 	if strings.HasPrefix(strings.ToUpper(key), "AS") && isAllDigits(key[2:]) {
 		return rkASN
@@ -128,3 +135,14 @@ func matchMACGlob(pattern, mac string) bool {
 	return matchGlob(pattern, mac)
 }
 
+// parsePort strictly parses a string port identifier to ensure structural validity.
+func parsePort(portStr string) (string, bool) {
+	clean := strings.TrimPrefix(portStr, "port:")
+	if clean == "" {
+		return "", false
+	}
+	if p, err := strconv.ParseUint(clean, 10, 16); err == nil {
+		return strconv.FormatUint(p, 10), true
+	}
+	return "", false
+}

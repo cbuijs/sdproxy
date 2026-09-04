@@ -1,12 +1,14 @@
 /*
 File:    globals.go
-Version: 1.33.0
-Last Updated: 05-Aug-2026 16:20 CEST
+Version: 1.34.0
+Last Updated: 04-Sep-2026 08:20 CEST
 
 Description:
   All package-level variables and feature-presence flags for sdproxy.
 
 Changes:
+  1.34.0 - [FEAT] Added `portRoutes` mapping arrays globally to enforce 
+           new `port:` listener bounds constraints natively.
   1.33.0 - [REFACTOR] Adopted `untriggerLogTimers` from the deleted 
            process_exchange.go. The map tracks one pending expiry timer per 
            (clientID, category) pair so the "UNTRIGGER WINDOW ENDED" notice 
@@ -21,15 +23,6 @@ Changes:
   1.30.0 - [CLEANUP] Pruned obsolete `hasClientNameUpstream` variable assignment securely.
            Replaces stagnant references generated dynamically natively elsewhere.
   1.29.0 - [FEAT] Introduced `autoEnabledFlattenCNAME` to track when CNAME-flattening is forced by the secure consolidate strategy.
-  1.28.0 - [CLEANUP] Eradicated `hasClientRoutes` dead-code to keep the global 
-           namespace pristine natively.
-  1.27.0 - [FEAT] Added granular logging boolean tracking arrays natively to control 
-           localized subsystem outputs independently.
-  1.26.0 - [FIX] Introduced `catMapInitialized` atomic boolean globally to accurately 
-           signal when category structures are fully loaded or restored from cache, 
-           fixing the startup guard dropping queries continuously on first-run.
-  1.25.0 - [FEAT] Introduced `spoofRecord` structs and mapping variables globally 
-           to natively govern explicit `rrs:` (A/AAAA/CNAME) policy overrides.
 */
 
 package main
@@ -298,4 +291,3 @@ var (
 	smallBufPool = sync.Pool{New: func() any { b := make([]byte, 4096); return &b }}
 	largeBufPool = sync.Pool{New: func() any { b := make([]byte, 65536); return &b }}
 )
-

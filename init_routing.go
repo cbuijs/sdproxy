@@ -1,14 +1,16 @@
 /*
 File:    init_routing.go
-Version: 1.6.0
-Updated: 07-Jul-2026 14:44 CEST
+Version: 1.7.0
+Updated: 04-Sep-2026 08:20 CEST
 
 Description:
   Parses and maps client-based and domain-based routing rules for sdproxy.
-  Translates YAML configurations (MAC, IP, CIDR, ASN, Country, SNI, Path, Name) into 
+  Translates YAML configurations (MAC, IP, CIDR, ASN, Country, SNI, Path, Port, Name) into 
   highly optimized lookup tables used by the routing engine.
 
 Changes:
+  1.7.0 - [FEAT] Added initialization bindings for the newly supported `port:` identifier natively.
+          Added processing logic to handle the `ForceAnd` boolean and compile keys natively.
   1.6.0 - [FEAT] Implemented `BypassGlobal` state translation for client identity routes.
   1.5.0 - [FEAT] Initialized parsing bindings natively for newly supported `CC:` 
           Country Code boundary constraints.
@@ -31,8 +33,17 @@ import (
 	"github.com/miekg/dns"
 )
 
+type compoundRouteMap struct {
+	keys []string
+	route ParsedRoute
+}
+
+var compoundRouteMappings []compoundRouteMap
+var portRoutes map[string]ParsedRoute
+var hasPortRoutes bool
+
 // initClientRoutes parses the `routes:` and `routes_files:` configurations and populates
-// the global mapping tables for MAC, IP, CIDR, ASN, Country, SNI, Path, and Client-Name routing.
+// the global mapping tables for MAC, IP, CIDR, ASN, Country, SNI, Path, Port and Client-Name routing.
 func initClientRoutes() {
 	macRoutes = make(map[string]ParsedRoute)
 	ipRoutes = make(map[string]ParsedRoute)
@@ -41,8 +52,10 @@ func initClientRoutes() {
 	clientNameRoutes = make(map[string]ParsedRoute)
 	sniRoutes = make(map[string]ParsedRoute)
 	pathRoutes = make(map[string]ParsedRoute)
+	portRoutes = make(map[string]ParsedRoute)
 	macWildRoutes = nil
 	cidrRoutes = nil
+	compoundRouteMappings = nil
 
 	processRoute := func(rawKey string, route RouteConfig) {
 		pr := ParsedRoute{
@@ -51,6 +64,7 @@ func initClientRoutes() {
 			BypassLocal:  route.BypassLocal,
 			BypassGlobal: route.BypassGlobal,
 			Force:        route.Force,
+			ForceAnd:     route.ForceAnd,
 		}
 
 		targetStr := route.Upstream
@@ -110,18 +124,38 @@ func initClientRoutes() {
 		if pr.Force {
 			props = append(props, "force=true")
 		}
+		if pr.ForceAnd {
+			props = append(props, "force-and=true")
+		}
 		propStr := ""
 		if len(props) > 0 {
 			propStr = " (" + strings.Join(props, ", ") + ")"
 		}
 
-		// Support grouping multiple identifiers via comma-separated syntax.
-		for _, key := range strings.Split(rawKey, ",") {
+		keys := strings.Split(rawKey, ",")
+		var validKeys []string
+		for _, key := range keys {
 			key = strings.TrimSpace(key)
-			if key == "" {
-				continue
+			if key != "" {
+				validKeys = append(validKeys, key)
 			}
+		}
 
+		if len(validKeys) == 0 {
+			return
+		}
+
+		// Support grouping multiple identifiers via comma-separated syntax.
+		// If ForceAnd is true, we must map them as a single compound constraint natively.
+		if pr.ForceAnd && len(validKeys) > 1 {
+			compoundRouteMappings = append(compoundRouteMappings, compoundRouteMap{keys: validKeys, route: pr})
+			if logRouting {
+				log.Printf("[INIT] Compound Route (AND): %s -> %s%s", strings.Join(validKeys, " + "), targetStr, propStr)
+			}
+			return
+		}
+
+		for _, key := range validKeys {
 			switch classifyRouteKey(key) {
 			case rkMAC:
 				if mac, err := net.ParseMAC(key); err == nil {
@@ -177,6 +211,13 @@ func initClientRoutes() {
 				if logRouting {
 					log.Printf("[INIT] Path Route: %s -> %s%s", p, targetStr, propStr)
 				}
+			case rkPort:
+				if p, ok := parsePort(key); ok {
+					portRoutes[p] = pr
+					if logRouting {
+						log.Printf("[INIT] Port Route: %s -> %s%s", p, targetStr, propStr)
+					}
+				}
 			case rkClientName:
 				clientNameRoutes[strings.ToLower(key)] = pr
 				if logRouting {
@@ -217,6 +258,7 @@ func initClientRoutes() {
 	hasClientNameRoutes = len(clientNameRoutes) > 0
 	hasSNIRoutes = len(sniRoutes) > 0
 	hasPathRoutes = len(pathRoutes) > 0
+	hasPortRoutes = len(portRoutes) > 0
 
 	// [SECURITY/FIX] Sort CIDR Routes natively by prefix length descending (most specific wins)
 	if len(cidrRoutes) > 0 {
@@ -281,4 +323,3 @@ func initDomainRoutes() {
 
 	hasDomainRoutes = len(domainRoutes) > 0
 }
-

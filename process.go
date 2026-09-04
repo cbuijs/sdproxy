@@ -1,7 +1,7 @@
 /*
 File:    process.go
-Version: 3.92.0
-Last Updated: 26-Aug-2026 15:57 CEST
+Version: 3.93.0
+Last Updated: 04-Sep-2026 08:20 CEST
 
 Description:
   Master orchestrator for the sdproxy per-query DNS resolution pipeline.
@@ -25,6 +25,10 @@ Description:
     process_cache.go     background revalidation and synthetic message builders
 
 Changes:
+  3.93.0 - [FEAT] Extended pipeline evaluation signatures to incorporate `port` constraints
+           dynamically extracted from `LocalAddr()` structures natively. Allows executing 
+           strict `port:` mappings natively without interrupting general protocol 
+           resolution arrays organically.
   3.92.0 - [SECURITY/FIX] Resolved a severe Custom Rules Routing Evasion vulnerability.
            Proactively evaluated `ClientName` structural overrides prior to Custom Rules
            execution natively. Guarantees that dynamically mapped IP policies correctly
@@ -45,7 +49,9 @@ package main
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/miekg/dns"
@@ -168,6 +174,18 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 	clientMAC := LookupMAC(clientIP)
 	clientName := LookupNameByMACOrIP(clientMAC, clientIP)
 
+	var localPort string
+	if w.LocalAddr() != nil {
+		if _, p, err := net.SplitHostPort(w.LocalAddr().String()); err == nil {
+			localPort = p
+		} else {
+			// Extract port cleanly if structural delimiters are absent natively
+			if p, err := strconv.ParseUint(w.LocalAddr().String(), 10, 16); err == nil {
+				localPort = strconv.FormatUint(p, 10)
+			}
+		}
+	}
+
 	// [PERF/OPTIMIZATION] Pre-compute globally normalized lowercase identities safely natively.
 	// Drastically neutralizes heap-allocation overhead across the entire pipeline boundary,
 	// eradicating millions of redundant strings.ToLower invocations during multi-level DPI filtering.
@@ -208,7 +226,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 	sk, clientGroup := ResolveStateKeyAndGroup(clientMAC, clientIP, clientAddr, clientName, clientNameLower, sni, sniLower, path, pathLower)
 
 	// Pre-resolve Client Identity parameters organically to orchestrate global bypass bounds natively.
-	clientRoute, clientRouteMatched, routeOriginType := resolveClientRoute(clientMAC, clientIP, clientAddr, clientNameLower, sniLower, pathLower)
+	clientRoute, clientRouteMatched, routeOriginType := resolveClientRoute(clientMAC, clientIP, clientAddr, clientNameLower, sniLower, pathLower, localPort)
 	bypassGlobal := clientRouteMatched && clientRoute.BypassGlobal
 
 	// [SECURITY/FIX 3.92.0] If the client route explicitly overrides the Client Name, we must
@@ -275,7 +293,7 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 	// ── 2. Routing Engine ─────────────────────────────────────────────────
 	// [SECURITY/FIX] Execute deterministic routing using both the evaluated target
 	// AND the originally requested domain to preserve reporting integrity post-spoofing.
-	routeCtx, intercepted := determineRouting(w, r, q, qNameTrimmed, originalQName, originalQNameTrimmed, clientIP, clientAddr, clientMAC, clientName, clientNameLower, clientID, protocol, sni, sniLower, path, pathLower, bypassPolicies, bypassGlobal, clientRoute, clientRouteMatched, routeOriginType)
+	routeCtx, intercepted := determineRouting(w, r, q, qNameTrimmed, originalQName, originalQNameTrimmed, clientIP, clientAddr, clientMAC, clientName, clientNameLower, clientID, protocol, sni, sniLower, path, pathLower, localPort, bypassPolicies, bypassGlobal, clientRoute, clientRouteMatched, routeOriginType)
 	if intercepted {
 		return
 	}
@@ -495,4 +513,3 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 	// ── 8. Upstream exchange ──────────────────────────────────────────────
 	qc.serveFromUpstream()
 }
-
