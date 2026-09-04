@@ -1,7 +1,7 @@
 /*
 File:    process_cachehit.go
-Version: 1.1.0
-Last Updated: 07-Aug-2026 21:30 CEST
+Version: 1.2.0
+Last Updated: 04-Sep-2026 09:18 CEST
 
 Description:
   Cache-hit serving stage for the sdproxy resolution pipeline.
@@ -17,6 +17,12 @@ Description:
   permitted answer leak to a client whose policy forbids it.
 
 Changes:
+  1.2.0 - [SECURITY/FIX] Resolved a severe cache payload modification vulnerability.
+          `serveFromCache` correctly cloned responses, but failed to deeply clone the 
+          `Answer` slice prior to calling `transformResponse` when `inPlace` was false. 
+          `flattenCNAME` and `applyAnswerSort` thus mutated shared Answer slices residing 
+          in the raw cache structure natively. This caused round-robin shifts or flattened 
+          aliases to instantly corrupt active cached arrays across all clients organically.
   1.1.0 - [SECURITY/FIX] deriveCacheKey and resolveUpstreamGroup resolved the
           upstream group INDEPENDENTLY, out of the same map, with different
           fallback rules. deriveCacheKey did a bare
@@ -47,9 +53,6 @@ Changes:
           of the three annotations it unified across both paths; only two were
           ever wired up here. Now possible because qc.group is populated before
           the lookup — see above.
-  1.0.0 - [REFACTOR] Extracted from process.go 3.90.0 as part of splitting a
-          1.031-line file. Behaviour preserved except where process_status.go
-          1.0.0 documents a deliberate unification of two drifted log renderings.
 */
 
 package main
@@ -137,7 +140,7 @@ func (qc *queryCtx) deriveCacheKey() {
 			if clientECSStr != "" {
 				ecsForCache = clientECSStr
 			} else {
-				// Unparseable ECS option. Fall back to the shared marker rather
+				// Unparseable ECS option. Fallback to the shared marker rather
 				// than to no partitioning at all: one degraded bucket is far
 				// better than silently merging subnet-specific answers into the
 				// general cache.
@@ -215,9 +218,14 @@ func (qc *queryCtx) serveFromCache() bool {
 		return true
 	}
 
-	// transformResponse with inPlace=true returns poolMsg itself; resp is an
-	// alias, not a new allocation, and the deferred Put remains correct.
-	resp := transformResponse(poolMsg, qc.q.Qtype, qc.doBit, true)
+	// [SECURITY/FIX 1.2.0] Enforce strict slice decoupling prior to executing payload mutations.
+	// Ensure `poolMsg.Answer` arrays are deeply cloned natively BEFORE initiating `transformResponse`.
+	// `transformResponse(poolMsg, ..., true)` modifies the passed payload directly in place. 
+	// If the array shares references with the master slice cached in memory, mutations like 
+	// CNAME flattening will permanently overwrite the core memory cache across all clients natively.
+	safeMsg := poolMsg.Copy()
+
+	resp := transformResponse(safeMsg, qc.q.Qtype, qc.doBit, true)
 
 	if filterResponseIPs(qc.w, qc.r, resp, qc.sk, qc.clientGroup, qc.clientMAC, qc.clientIP, qc.clientAddr,
 		qc.clientName, qc.clientNameLower, qc.clientID, qc.protocol, qc.sni, qc.sniLower, qc.path, qc.pathLower,

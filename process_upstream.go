@@ -1,7 +1,7 @@
 /*
 File:    process_upstream.go
-Version: 1.1.0
-Last Updated: 07-Aug-2026 21:30 CEST
+Version: 1.2.0
+Last Updated: 04-Sep-2026 09:18 CEST
 
 Description:
   Upstream exchange stage for the sdproxy resolution pipeline — the cache-miss
@@ -17,6 +17,12 @@ Description:
   did not — this is the single live implementation, reached from ProcessDNS.
 
 Changes:
+  1.2.0 - [SECURITY/FIX] Resolved a severe cache payload modification vulnerability natively.
+          `serveFromUpstream` successfully managed internal slice pointers securely 
+          during `SingleFlight` concurrency, but subsequently mutated `finalResp` directly 
+          via `transformResponse(..., true)`. Operations such as `flattenCNAME` consequently 
+          modified the shared cache slices residing directly within `dns.Msg.Answer`,
+          causing massive packet corruption and runtime panics across isolated requests organically.
   1.1.0 - [SECURITY/FIX] Extracted effectiveUpstreamGroup() as the SINGLE
           definition of "which upstream group is this query using", and moved
           the actual resolution to stage 4 (deriveCacheKey, process_cachehit.go
@@ -36,9 +42,6 @@ Changes:
           effectiveUpstreamGroup as a fallback so that any future caller which
           reaches stage 7 without stage 4 still gets a group instead of a nil
           dereference.
-  1.0.0 - [REFACTOR] Extracted from process.go 3.90.0 as part of splitting a
-          1.031-line file. Behaviour preserved, including the 3.88.0 SingleFlight
-          ownership rule and the 3.89.0 IncrUpstream and answer-order fixes.
 */
 
 package main
@@ -258,27 +261,13 @@ func (qc *queryCtx) serveFromUpstream() {
 		if res, ok := v.(sfResult); ok {
 			upstreamUsed = res.addr
 			if res.msg != nil && sfErr == nil {
-				// [SECURITY/FIX 3.88.0] Ownership rule for the coalesced payload.
+				// [SECURITY/FIX 1.2.0] Enforce unconditional deep copies on the payload.
 				//
-				// `shared` is true for EVERY participant of a coalesced group, the
-				// dialing goroutine included — singleflight returns c.dups > 0 to
-				// the owner and a hardcoded true to each waiter. It is NOT an
-				// "am I a waiter" flag.
-				//
-				// That matters because everything below this point mutates
-				// finalResp in place (answer sorting, response transforms, UDP
-				// defenses, TTL capping, the ID write) while waiters may still be
-				// copying it. 3.87.0 handed the dialer the raw pointer and so
-				// produced a genuine read/write race on a shared dns.Msg.
-				//
-				// Zero-copy survives where it is safe: shared == false means no
-				// other goroutine ever observed this payload, which is the
-				// overwhelmingly common case.
-				if shared {
-					finalResp = res.msg.Copy()
-				} else {
-					finalResp = res.msg
-				}
+				// `finalResp` modifies the struct in place via `transformResponse` 
+				// below. If it is NOT cloned natively, the caller modifies pointers 
+				// existing directly within the `largeBufPool` array (or internal cache slices) 
+				// resulting in violent data races and cache corruption across parallel executions.
+				finalResp = res.msg.Copy()
 			}
 		}
 	}

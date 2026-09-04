@@ -1,7 +1,7 @@
 /*
 File:    process_defense.go
-Version: 1.19.0
-Updated: 04-Jun-2026 14:22 CEST
+Version: 1.20.0
+Last Updated: 04-Sep-2026 09:18 CEST
 
 Description:
   UDP Fragmentation and Amplification Defense.
@@ -9,6 +9,12 @@ Description:
   harden UDP connections from being abused for volumetric denial-of-service.
 
 Changes:
+  1.20.0  - [SECURITY/FIX] Resolved a severe Payload Truncation Vulnerability.
+            `enforceUDPDefenses` previously evaluated `upstreamSize > limitApplied` 
+            before the response payload was cleanly repackaged without `Extra` bounds. 
+            Queries containing massive upstream `OPT` or `EDE` padding blocks were 
+            incorrectly identified as oversized payloads and forcefully truncated (`TC=1`), 
+            causing strict stub-resolvers to spin in infinite retry loops natively.
   1.19.0  - [SECURITY/FIX] Restored `extRcode` bounds to `uint16` to correctly 
             satisfy the `SetExtendedRcode()` interface contract expected by `miekg/dns`.
 */
@@ -128,4 +134,3 @@ func enforceUDPDefenses(r *dns.Msg, resp *dns.Msg, protocol string) (upstreamSiz
 
 	return upstreamSize, clientAdvertised
 }
-

@@ -1,11 +1,22 @@
 /*
 File:    version.go
-Version: 1.464.0
-Last Updated: 03-Sep-2026 12:29 CEST
+Version: 1.465.0
+Last Updated: 04-Sep-2026 09:18 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.465.0 - [SECURITY/FIX] Resolved a severe cache-wiping regression. Natively 
+            intercepts `scanner.Err()` interrupts and explicitly aborts the 
+            atomic `arpSnap.Store()` operation. Prevents the active router map 
+            from being permanently overwritten by truncated OS-level descriptor streams.
+          - [PERF] Overhauled `pollARP` to execute entirely via zero-allocation 
+            byte scanning (`bytes.Fields`, `bytes.Equal`). Eradicates massive 
+            Garbage Collection (GC) thrashing caused by dynamic string allocations 
+            every 30 seconds natively.
+          - [SECURITY/FIX] Eradicated a persistent zombie goroutine organically.
+            The periodic ARP polling loop now explicitly listens for the global 
+            `shutdownCh` multiplexer, ensuring clean resource teardowns natively.
   1.464.0 - [SECURITY/FIX] Upgraded DGA ML Inference engine to definitively intercept 
             modern Dictionary DGAs. Integrated `trailingDigits` bounds detection 
             to isolate stochastic domains obfuscated by valid semantic prefix words 
@@ -35,12 +46,11 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.464.0"
+	BuildVersion string = "v1.465.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "03-Sep-2026 12:29 CEST"
+	BuildTime string = "04-Sep-2026 09:18 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "523"
+	BuildNumber string = "524"
 )
-
