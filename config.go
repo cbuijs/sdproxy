@@ -1,7 +1,7 @@
 /*
 File:    config.go
-Version: 1.72.0
-Last Updated: 04-Sep-2026 12:32 CEST
+Version: 1.73.0
+Last Updated: 04-Sep-2026 16:48 CEST
 
 Description:
   All YAML-mapped configuration structs for sdproxy. Covers every top-level
@@ -10,6 +10,8 @@ Description:
   and spoofed records (RRs).
 
 Changes:
+  1.73.0 - [FIX] Demoted cache_local_identity TTL validation from FATAL to WARN 
+           to prevent runtime crashes on intentional configs. Referenced digest.txt.
   1.72.0 - [SECURITY/FIX] Reject invalid cache numeric settings and invalid persistence
            intervals instead of silently accepting values that can wrap or disable persistence.
   1.71.0 - [FEAT] Added `ForceAnd` boolean to `RouteConfig` and `ParsedRoute` to strictly enforce
@@ -575,10 +577,7 @@ func validateConfig() error {
 		}
 		pi := cfg.Identity.PollInterval
 		if pi > 0 && st > pi {
-			return fmt.Errorf(
-				"cache_local_identity: synthetic_ttl (%ds) > identity.poll_interval (%ds) — "+
-					"stale local addresses may be served; lower synthetic_ttl or raise poll_interval",
-				st, pi)
+			log.Printf("[WARN] cache_local_identity: synthetic_ttl (%ds) > identity.poll_interval (%ds) — stale local addresses may be served; lower synthetic_ttl or raise poll_interval (Reference: digest.txt)\n", st, pi)
 		}
 	}
 
@@ -686,3 +685,4 @@ func validateConfig() error {
 
 	return nil
 }
+

@@ -1,11 +1,14 @@
 /*
 File:    version.go
-Version: 1.469.0
-Last Updated: 04-Sep-2026 11:20 CEST
+Version: 1.470.0
+Last Updated: 04-Sep-2026 16:48 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.470.0 - [FIX] Demoted cache_local_identity validation from fatal error to
+            warning to prevent daemon crashes on intentional configurations.
+            Referenced digest.txt.
   1.469.0 - [SECURITY/FIX] initRouteIndex() didn't walk `portRoutes` or
             `compoundRouteMappings` (the `port:` and `force-and` routing
             tables added same-day in init_routing.go 1.7.0). An upstream
@@ -61,12 +64,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.469.0"
+	BuildVersion string = "v1.470.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "04-Sep-2026 11:20 CEST"
+	BuildTime string = "04-Sep-2026 16:48 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "528"
+	BuildNumber string = "529"
 )
 
