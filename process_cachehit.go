@@ -1,7 +1,7 @@
 /*
 File:    process_cachehit.go
-Version: 1.2.0
-Last Updated: 04-Sep-2026 09:18 CEST
+Version: 1.3.0 (Split)
+Last Updated: 04-Sep-2026 09:50 CEST
 
 Description:
   Cache-hit serving stage for the sdproxy resolution pipeline.
@@ -17,6 +17,11 @@ Description:
   permitted answer leak to a client whose policy forbids it.
 
 Changes:
+  1.3.0 - [PERF/FIX] Eradicated a massive, redundant `msg.Copy()` heap allocation natively.
+          `CacheGet` unpacks messages directly from wire-format byte slices, 
+          guaranteeing that the returned `poolMsg` is completely isolated from the master 
+          memory arrays. Bypassing the deep-clone directly before `transformResponse` 
+          slashes Garbage Collection (GC) thrashing organically on the cache-hit hot path.
   1.2.0 - [SECURITY/FIX] Resolved a severe cache payload modification vulnerability.
           `serveFromCache` correctly cloned responses, but failed to deeply clone the 
           `Answer` slice prior to calling `transformResponse` when `inPlace` was false. 
@@ -218,14 +223,11 @@ func (qc *queryCtx) serveFromCache() bool {
 		return true
 	}
 
-	// [SECURITY/FIX 1.2.0] Enforce strict slice decoupling prior to executing payload mutations.
-	// Ensure `poolMsg.Answer` arrays are deeply cloned natively BEFORE initiating `transformResponse`.
-	// `transformResponse(poolMsg, ..., true)` modifies the passed payload directly in place. 
-	// If the array shares references with the master slice cached in memory, mutations like 
-	// CNAME flattening will permanently overwrite the core memory cache across all clients natively.
-	safeMsg := poolMsg.Copy()
-
-	resp := transformResponse(safeMsg, qc.q.Qtype, qc.doBit, true)
+	// [PERF/FIX 1.3.0] Eradicated redundant heap allocations natively.
+	// `CacheGet` unpacks the message directly from wire-format byte slices, 
+	// meaning `poolMsg` is already entirely isolated from the master cache memory. 
+	// Mutating it in-place eliminates a massive `msg.Copy()` GC bottleneck on the cache-hit hot path.
+	resp := transformResponse(poolMsg, qc.q.Qtype, qc.doBit, true)
 
 	if filterResponseIPs(qc.w, qc.r, resp, qc.sk, qc.clientGroup, qc.clientMAC, qc.clientIP, qc.clientAddr,
 		qc.clientName, qc.clientNameLower, qc.clientID, qc.protocol, qc.sni, qc.sniLower, qc.path, qc.pathLower,

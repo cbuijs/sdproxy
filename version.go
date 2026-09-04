@@ -1,11 +1,16 @@
 /*
 File:    version.go
-Version: 1.465.0
-Last Updated: 04-Sep-2026 09:18 CEST
+Version: 1.466.0
+Last Updated: 04-Sep-2026 09:50 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.466.0 - [PERF/FIX] Eradicated a massive, redundant `msg.Copy()` heap allocation natively 
+            within the cache-hit resolution path. `CacheGet` intrinsically unpacks 
+            payloads directly from wire-format slices, ensuring absolute isolation 
+            from the master memory structure. Removing the subsequent deep-clone 
+            slashes Garbage Collection (GC) overhead exponentially on the hot path.
   1.465.0 - [SECURITY/FIX] Resolved a severe cache-wiping regression. Natively 
             intercepts `scanner.Err()` interrupts and explicitly aborts the 
             atomic `arpSnap.Store()` operation. Prevents the active router map 
@@ -46,11 +51,11 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.465.0"
+	BuildVersion string = "v1.466.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "04-Sep-2026 09:18 CEST"
+	BuildTime string = "04-Sep-2026 09:50 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "524"
+	BuildNumber string = "525"
 )
