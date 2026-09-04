@@ -1,19 +1,21 @@
 /*
 File:    main.go
-Version: 1.243.0
-Last Updated: 17-Aug-2026 19:06 CEST
+Version: 1.244.0
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
   Application entry point and core orchestrator for sdproxy.
   Reads config.yaml, wires all subsystems sequentially, and blocks on signals.
 
 Changes:
+  1.244.0 - [SECURITY/FIX] Abort startup on configuration validation errors.
+           Production mode previously logged validation failures and continued with unsafe config.
   1.243.0 - [SECURITY/FIX] Eradicated a critical Initialization Deadlock natively.
             Moved `InitThrottle()` prior to executing `initUpstreams()` and bootstrap
-            parsing operations. Previously, the adaptive admission throttler initialized 
-            its atomic `upstreamLimit` to `0` until late in the boot cycle. This forced 
-            `AcquireUpstream()` to instantly reject and strangle all DNS-over-HTTPS (DoH), 
-            DoH3, and DDR (Discovery of Designated Resolvers) bootstrap queries, 
+            parsing operations. Previously, the adaptive admission throttler initialized
+            its atomic `upstreamLimit` to `0` until late in the boot cycle. This forced
+            `AcquireUpstream()` to instantly reject and strangle all DNS-over-HTTPS (DoH),
+            DoH3, and DDR (Discovery of Designated Resolvers) bootstrap queries,
             permanently degrading encrypted transport initialization at startup.
   1.242.0 - [SECURITY/FIX] Added the InitRecentBlocks() call that starts the
             Search Domain Leak Prevention reclaimer. Its goroutine was
@@ -25,10 +27,10 @@ Changes:
             InitRecentBlocks() reads that flag to decide whether to start at all.
             InitCache runs far earlier in the boot sequence, before the flag
             exists — which is part of why the launch was mis-homed to begin with.
-  1.241.0 - [FEAT] Initialized `searchDomainLeakPrevention` dynamically from config, 
+  1.241.0 - [FEAT] Initialized `searchDomainLeakPrevention` dynamically from config,
             defaulting to true organically to maintain strict backward compatibility.
-  1.240.0 - [FEAT] Hardened memory structures by securely flushing `SaveCache` 
-            natively upon structured Shutdowns, ensuring state survivability 
+  1.240.0 - [FEAT] Hardened memory structures by securely flushing `SaveCache`
+            natively upon structured Shutdowns, ensuring state survivability
             without relying entirely on the active background persistence polling tick.
 */
 
@@ -72,12 +74,12 @@ func main() {
 		if !strings.HasPrefix(arg, "-") {
 			continue
 		}
-		
+
 		name := arg
 		if idx := strings.Index(arg, "="); idx >= 0 {
 			name = arg[:idx]
 		}
-		
+
 		if strings.HasPrefix(name, "-") && !strings.HasPrefix(name, "--") {
 			if len(name) > 2 {
 				fmt.Fprintf(os.Stderr, "Error: Long parameters must use a double dash (e.g., --%s)\n\n", name[1:])
@@ -85,7 +87,7 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		
+
 		if strings.HasPrefix(name, "--") {
 			if len(name) == 3 {
 				fmt.Fprintf(os.Stderr, "Error: Short parameters must use a single dash (e.g., -%s)\n\n", name[2:])
@@ -148,7 +150,7 @@ func main() {
 		}
 		log.Fatalf("[FATAL] Cannot read config %s: %v", configFile, err)
 	}
-	
+
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		if testConfig {
 			fmt.Fprintf(os.Stderr, "[TEST] FATAL: Cannot parse YAML in %s: %v\n", configFile, err)
@@ -158,7 +160,7 @@ func main() {
 	}
 
 	valErr := validateConfig()
-	
+
 	if testConfig {
 		if valErr != nil {
 			fmt.Fprintf(os.Stderr, "[TEST] FAILED: Configuration constraint error in %s: %v\n", configFile, valErr)
@@ -167,20 +169,59 @@ func main() {
 		fmt.Printf("[TEST] OK: Configuration %s is valid and structurally sound.\n", configFile)
 		os.Exit(0)
 	}
+	if valErr != nil {
+		log.Fatalf("[FATAL] Configuration validation failed: %v", valErr)
+	}
 
 	// Resolve Logging configurations natively
-	if cfg.Logging.LogQueries != nil { logQueries = *cfg.Logging.LogQueries } else { logQueries = true }
+	if cfg.Logging.LogQueries != nil {
+		logQueries = *cfg.Logging.LogQueries
+	} else {
+		logQueries = true
+	}
 	logASNDetails = cfg.Logging.LogASNDetails
 	logStrategy = cfg.Logging.LogStrategy
-	
-	if cfg.Logging.LogParental != nil { logParental = *cfg.Logging.LogParental } else { logParental = false }
-	if cfg.Logging.LogIdentity != nil { logIdentity = *cfg.Logging.LogIdentity } else { logIdentity = false }
-	if cfg.Logging.LogCaching != nil { logCaching = *cfg.Logging.LogCaching } else { logCaching = false }
-	if cfg.Logging.LogDDR != nil { logDDR = *cfg.Logging.LogDDR } else { logDDR = false }
-	if cfg.Logging.LogTLS != nil { logTLS = *cfg.Logging.LogTLS } else { logTLS = false }
-	if cfg.Logging.LogSystem != nil { logSystem = *cfg.Logging.LogSystem } else { logSystem = true }
-	if cfg.Logging.LogWebUI != nil { logWebUI = *cfg.Logging.LogWebUI } else { logWebUI = true }
-	if cfg.Logging.LogRouting != nil { logRouting = *cfg.Logging.LogRouting } else { logRouting = false }
+
+	if cfg.Logging.LogParental != nil {
+		logParental = *cfg.Logging.LogParental
+	} else {
+		logParental = false
+	}
+	if cfg.Logging.LogIdentity != nil {
+		logIdentity = *cfg.Logging.LogIdentity
+	} else {
+		logIdentity = false
+	}
+	if cfg.Logging.LogCaching != nil {
+		logCaching = *cfg.Logging.LogCaching
+	} else {
+		logCaching = false
+	}
+	if cfg.Logging.LogDDR != nil {
+		logDDR = *cfg.Logging.LogDDR
+	} else {
+		logDDR = false
+	}
+	if cfg.Logging.LogTLS != nil {
+		logTLS = *cfg.Logging.LogTLS
+	} else {
+		logTLS = false
+	}
+	if cfg.Logging.LogSystem != nil {
+		logSystem = *cfg.Logging.LogSystem
+	} else {
+		logSystem = true
+	}
+	if cfg.Logging.LogWebUI != nil {
+		logWebUI = *cfg.Logging.LogWebUI
+	} else {
+		logWebUI = true
+	}
+	if cfg.Logging.LogRouting != nil {
+		logRouting = *cfg.Logging.LogRouting
+	} else {
+		logRouting = false
+	}
 
 	if logSystem {
 		log.Printf("[BOOT] Starting sdproxy (Simple DNS Proxy) - %s", BuildVersion)
@@ -194,7 +235,7 @@ func main() {
 	} else {
 		log.SetFlags(log.Ldate | log.Ltime)
 	}
-	
+
 	if cfg.WebUI.Enabled {
 		log.SetOutput(io.MultiWriter(os.Stderr, WebUILogStreamer))
 		if logSystem {
@@ -249,12 +290,9 @@ func main() {
 			ipVersionSupport = "both"
 		}
 	}
-	
+
 	if logSystem {
 		log.Printf("[BOOT] IP version support: %s", ipVersionSupport)
-		if valErr != nil {
-			log.Printf("[WARN] %v", valErr)
-		}
 	}
 
 	// -----------------------------------------------------------------------
@@ -263,7 +301,7 @@ func main() {
 	initBlockAction()
 
 	// [SECURITY/FIX 1.243.0] Execute Adaptive Throttler logic BEFORE any DNS lookups.
-	// Prevents the internal engine from fatally suffocating bootstrap connections 
+	// Prevents the internal engine from fatally suffocating bootstrap connections
 	// because `upstreamLimit` historically instantiated at 0 until the end of boot.
 	if cfg.Server.UDPWorkers <= 0 {
 		cfg.Server.UDPWorkers = 10
@@ -279,7 +317,7 @@ func main() {
 			if rawURL == "" {
 				continue
 			}
-			
+
 			if !strings.Contains(rawURL, "://") {
 				host, port, err := net.SplitHostPort(rawURL)
 				if err != nil {
@@ -292,9 +330,9 @@ func main() {
 			bsWg.Add(1)
 			go func(index int, url string, originalString string) {
 				defer bsWg.Done()
-				
-				// [SECURITY/FIX] Explicitly pass `nil` to prevent bootstrap nodes 
-				// from recursively fetching their own DDR parameters using uninitialized 
+
+				// [SECURITY/FIX] Explicitly pass `nil` to prevent bootstrap nodes
+				// from recursively fetching their own DDR parameters using uninitialized
 				// global lists during the concurrent initialization phase.
 				u, err := ParseUpstream(url, nil)
 				if err != nil {
@@ -392,7 +430,7 @@ func main() {
 	// 3. Dependent Indexes & Hardware Interrogations
 	// -----------------------------------------------------------------------
 	// Natively requires fully populated routing maps from step 2
-	initRouteIndex() 
+	initRouteIndex()
 
 	InitCache(cfg.Cache.Size, cfg.Cache.MinTTL)
 	if cfg.Cache.Enabled {
@@ -425,9 +463,9 @@ func main() {
 			log.Println("[ARP] No MAC routes configured — ARP polling disabled.")
 		}
 	}
-    
-	InitRateLimiter()   
-	InitExfiltration() 
+
+	InitRateLimiter()
+	InitExfiltration()
 
 	var tlsConfig *tls.Config
 	needsTLS := len(cfg.Server.ListenDoT) > 0 || len(cfg.Server.ListenDoH) > 0 || len(cfg.Server.ListenDoQ) > 0 || len(cfg.WebUI.ListenHTTPS) > 0
@@ -439,7 +477,7 @@ func main() {
 		}
 	}
 
-	initDDR() 
+	initDDR()
 
 	if cfg.Server.MemoryLimitMB > 0 {
 		debug.SetMemoryLimit(int64(cfg.Server.MemoryLimitMB) * 1024 * 1024)
@@ -464,7 +502,7 @@ func main() {
 			log.Println("[BOOT] Upstream stagger: 0 (sequential mode)")
 		}
 	}
-	
+
 	upstreamTimeout = time.Duration(cfg.Server.UpstreamTimeoutMs) * time.Millisecond
 	if logSystem {
 		if upstreamTimeout > 0 {
@@ -484,8 +522,8 @@ func main() {
 	}
 
 	dnsACLAllow = parseACL(cfg.Server.ACL.Allow)
-	dnsACLDeny  = parseACL(cfg.Server.ACL.Deny)
-	hasDNSACL   = len(dnsACLAllow) > 0 || len(dnsACLDeny) > 0
+	dnsACLDeny = parseACL(cfg.Server.ACL.Deny)
+	hasDNSACL = len(dnsACLAllow) > 0 || len(dnsACLDeny) > 0
 	if hasDNSACL {
 		if logSystem {
 			log.Printf("[BOOT] DNS ACL enabled: %d allow rules, %d deny rules", len(dnsACLAllow), len(dnsACLDeny))
@@ -493,8 +531,8 @@ func main() {
 	}
 
 	webUIACLAllow = parseACL(cfg.WebUI.ACL.Allow)
-	webUIACLDeny  = parseACL(cfg.WebUI.ACL.Deny)
-	hasWebUIACL   = len(webUIACLAllow) > 0 || len(webUIACLDeny) > 0
+	webUIACLDeny = parseACL(cfg.WebUI.ACL.Deny)
+	hasWebUIACL = len(webUIACLAllow) > 0 || len(webUIACLDeny) > 0
 	if hasWebUIACL {
 		if logSystem {
 			log.Printf("[BOOT] Web UI ACL enabled: %d allow rules, %d deny rules", len(webUIACLAllow), len(webUIACLDeny))
@@ -503,7 +541,7 @@ func main() {
 
 	hasRateLimit = cfg.Server.RateLimit.Enabled
 	hasRebindingProtection = cfg.Server.RebindingProtection
-	
+
 	if cfg.Server.SearchDomainLeakPrevention != nil {
 		searchDomainLeakPrevention = *cfg.Server.SearchDomainLeakPrevention
 	} else {
@@ -542,7 +580,7 @@ func main() {
 	}
 
 	Shutdown()
-	
+
 	SaveStats()
 	SaveLogs()
 	SaveGroupOverrides()
@@ -557,7 +595,7 @@ func parseACL(entries []string) []netip.Prefix {
 		if s == "" {
 			continue
 		}
-		
+
 		if !strings.Contains(s, "/") {
 			if addr, err := netip.ParseAddr(s); err == nil {
 				addr = addr.Unmap()
@@ -568,7 +606,7 @@ func parseACL(entries []string) []netip.Prefix {
 				}
 			}
 		}
-		
+
 		if prefix, err := ParsePrefixUnmapped(s); err == nil {
 			prefixes = append(prefixes, prefix)
 		} else {
@@ -577,4 +615,3 @@ func parseACL(entries []string) []netip.Prefix {
 	}
 	return prefixes
 }
-

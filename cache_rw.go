@@ -1,7 +1,7 @@
 /*
 File:    cache_rw.go
-Version: 1.7.0 (Split)
-Last Updated: 29-Aug-2026 17:30 CEST
+Version: 1.8.0 (Split)
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
@@ -11,16 +11,18 @@ Description:
   Extracted from cache.go to prioritize hot-path execution clarity.
 
 Changes:
-  1.7.0 - [FEAT/FIX] Injected `rotateAnswersInPlace` evaluation natively into 
-          the `CacheGetExpired` infinite-stale fallback generator. Ensures 
-          that Round-Robin permutations are rigorously preserved during 
+  1.8.0 - [FIX] Make negative_ttl an explicit negative-cache TTL override.
+           Previously it only acted as a fallback and could not override an upstream SOA TTL.
+  1.7.0 - [FEAT/FIX] Injected `rotateAnswersInPlace` evaluation natively into
+          the `CacheGetExpired` infinite-stale fallback generator. Ensures
+          that Round-Robin permutations are rigorously preserved during
           upstream server outages.
-  1.6.0 - [PERF/FIX] Re-engineered `stripOPTRecords` allocation heuristic. 
-          The scanner now definitively searches for the presence of OPT 
-          records rather than non-OPT records, completely eradicating 
+  1.6.0 - [PERF/FIX] Re-engineered `stripOPTRecords` allocation heuristic.
+          The scanner now definitively searches for the presence of OPT
+          records rather than non-OPT records, completely eradicating
           redundant array allocations when formatting clean Answer sections.
-  1.5.0 - [PERF] Eradicated heap allocations in `rotateAnswersInPlace` natively. 
-          Utilizes fixed-size stack buffers for A/AAAA index tracking and array 
+  1.5.0 - [PERF] Eradicated heap allocations in `rotateAnswersInPlace` natively.
+          Utilizes fixed-size stack buffers for A/AAAA index tracking and array
           rotation swapping, neutralizing Garbage Collection (GC) thrashing on cache hits.
   1.4.0 - [FIX] CacheGet accounted for a hit it then refused to serve.
 */
@@ -81,7 +83,7 @@ func stripOPTRecords(extra []dns.RR) []dns.RR {
 	if !hasOpt {
 		return extra // Zero allocations if no OPT is found
 	}
-	
+
 	clean := make([]dns.RR, 0, len(extra)-1)
 	for _, rr := range extra {
 		if rr.Header().Rrtype != dns.TypeOPT {
@@ -97,8 +99,8 @@ func stripOPTRecords(extra []dns.RR) []dns.RR {
 // rotateAnswersInPlace rotates the A and AAAA answer groups left by offset
 // positions, preserving each group's original slot positions within msg.Answer.
 //
-// [PERF 1.5.0] Employs fixed-size 16-element stack buffers to track indexes 
-// and temporary values organically. Since 99.9% of DNS queries resolve fewer 
+// [PERF 1.5.0] Employs fixed-size 16-element stack buffers to track indexes
+// and temporary values organically. Since 99.9% of DNS queries resolve fewer
 // than 16 IPs, this completely eradicates heap escapes on the round-robin hot path.
 // If capacity exceeds 16, `append` gracefully falls back to heap slice allocations.
 //
@@ -320,8 +322,8 @@ func CacheGetExpired(key DNSCacheKey, out *dns.Msg) bool {
 			rr.Header().Ttl = 30
 		}
 	}
-	
-	// [FEAT/FIX 1.7.0] Re-apply answer sorting if configured, to ensure Load Balancing 
+
+	// [FEAT/FIX 1.7.0] Re-apply answer sorting if configured, to ensure Load Balancing
 	// continues operating effectively on stale fallbacks natively.
 	if cacheRotateAnswers {
 		rotateAnswersInPlace(out, item.rotation.Add(1))
@@ -479,12 +481,10 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 				break
 			}
 		}
-		if ttl == 0 {
-			if cfg.Cache.NegativeTTL > 0 {
-				ttl = uint32(cfg.Cache.NegativeTTL)
-			} else {
-				ttl = uint32(cfg.Cache.MinTTL)
-			}
+		if cfg.Cache.NegativeTTL > 0 {
+			ttl = uint32(cfg.Cache.NegativeTTL)
+		} else if ttl == 0 {
+			ttl = uint32(cfg.Cache.MinTTL)
 		}
 	}
 
@@ -599,4 +599,3 @@ func CacheUpdateOrder(key DNSCacheKey, msg *dns.Msg) {
 	}
 	largeBufPool.Put(bufp)
 }
-

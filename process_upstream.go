@@ -17,10 +17,11 @@ Description:
   did not — this is the single live implementation, reached from ProcessDNS.
 
 Changes:
+  1.2.0 - [SECURITY/FIX] Added RecursionDesired to the SingleFlight key.
   1.2.0 - [SECURITY/FIX] Resolved a severe cache payload modification vulnerability natively.
-          `serveFromUpstream` successfully managed internal slice pointers securely 
-          during `SingleFlight` concurrency, but subsequently mutated `finalResp` directly 
-          via `transformResponse(..., true)`. Operations such as `flattenCNAME` consequently 
+          `serveFromUpstream` successfully managed internal slice pointers securely
+          during `SingleFlight` concurrency, but subsequently mutated `finalResp` directly
+          via `transformResponse(..., true)`. Operations such as `flattenCNAME` consequently
           modified the shared cache slices residing directly within `dns.Msg.Answer`,
           causing massive packet corruption and runtime panics across isolated requests organically.
   1.1.0 - [SECURITY/FIX] Extracted effectiveUpstreamGroup() as the SINGLE
@@ -207,7 +208,7 @@ func (qc *queryCtx) serveFromUpstream() {
 	// cache partition disagreed about whether two per-profile queries were
 	// interchangeable.
 	sfKey := buildSFKey(qc.qNameTrimmed, qc.q.Qtype, qc.q.Qclass, qc.route.routeIdx,
-		qc.doBit, qc.r.CheckingDisabled, qc.bypassGlobal, sfClientName, qc.cacheKey.ECS)
+		qc.doBit, qc.r.CheckingDisabled, qc.bypassGlobal, qc.r.RecursionDesired, sfClientName, qc.cacheKey.ECS)
 
 	// didUpstream is written inside the closure, which x/sync/singleflight runs
 	// in THIS goroutine for the owner and never runs at all for waiters. There
@@ -263,9 +264,9 @@ func (qc *queryCtx) serveFromUpstream() {
 			if res.msg != nil && sfErr == nil {
 				// [SECURITY/FIX 1.2.0] Enforce unconditional deep copies on the payload.
 				//
-				// `finalResp` modifies the struct in place via `transformResponse` 
-				// below. If it is NOT cloned natively, the caller modifies pointers 
-				// existing directly within the `largeBufPool` array (or internal cache slices) 
+				// `finalResp` modifies the struct in place via `transformResponse`
+				// below. If it is NOT cloned natively, the caller modifies pointers
+				// existing directly within the `largeBufPool` array (or internal cache slices)
 				// resulting in violent data races and cache corruption across parallel executions.
 				finalResp = res.msg.Copy()
 			}

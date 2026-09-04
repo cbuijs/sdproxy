@@ -1,7 +1,7 @@
 /*
 File:    cache_persistence.go
-Version: 2.0.0 (Split)
-Updated: 22-Jul-2026 22:10 CEST
+Version: 2.1.0 (Split)
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
   Disk persistence for the sdproxy cache engine. Serializes and restores the
@@ -10,6 +10,8 @@ Description:
   Extracted from cache.go to decouple disk I/O from the DNS hot path.
 
 Changes:
+  2.1.0 - [SECURITY/FIX] Versioned persisted records. Existing cache files are
+           discarded on load after cache-key semantics changed to include RD.
   2.0.0 - [TIER 2] Load/save moved onto the shared buffered-gob and atomic-write
           helpers; the manual flush/sync/close/rename ladder is gone.
   1.6.0 - [SECURITY/RELIABILITY] Directory fsync so renames survive power loss.
@@ -28,7 +30,10 @@ import (
 )
 
 // cacheDiskRecord is the serialized form of one cache entry.
+const cacheDiskVersion uint8 = 1
+
 type cacheDiskRecord struct {
+	Version  uint8
 	Key      DNSCacheKey
 	Packed   []byte
 	Expire   int64
@@ -60,6 +65,9 @@ func LoadCache() {
 	loaded := 0
 
 	for _, r := range records {
+		if r.Version != cacheDiskVersion {
+			continue
+		}
 		// Drop anything already outside its stale window.
 		if !serveStaleInfinite && now >= r.Stale {
 			continue
@@ -124,6 +132,7 @@ func SaveCache() {
 				packedCopy := make([]byte, len(*p))
 				copy(packedCopy, *p)
 				records = append(records, cacheDiskRecord{
+					Version:  cacheDiskVersion,
 					Key:      k,
 					Packed:   packedCopy,
 					Expire:   v.expireNano,
@@ -156,4 +165,3 @@ func SaveCache() {
 		log.Printf("[CACHE] Successfully persisted %d entries to disk", len(records))
 	}
 }
-

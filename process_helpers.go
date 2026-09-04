@@ -1,33 +1,35 @@
 /*
 File:    process_helpers.go
-Version: 1.16.0
-Last Updated: 04-Sep-2026 10:15 CEST
+Version: 1.17.0
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
-  Synchronization pools, string builders, and high-performance global 
+  Synchronization pools, string builders, and high-performance global
   utilities for the sdproxy DNS processing pipeline.
-  Extracted from process.go to isolate memory pools and string manipulation 
+  Extracted from process.go to isolate memory pools and string manipulation
   away from the primary hot-path logic.
 
 Changes:
-  1.16.0 - [PERF] Eradicated massive heap allocations within `extractIPFromPTR` 
-           natively. IPv4 reverse zones (`.in-addr.arpa`) are now decoded through 
-           an O(1) mathematical state machine directly into a `[4]byte` block. 
-           Bypasses `strings.Split` and string builders entirely, slashing GC latency 
-           during intense reverse-DNS floods. Mirrors the IPv6 optimizations 
+  1.17.0 - [SECURITY/FIX] Added RecursionDesired to the SingleFlight key so
+           recursive and non-recursive exchanges cannot coalesce.
+  1.16.0 - [PERF] Eradicated massive heap allocations within `extractIPFromPTR`
+           natively. IPv4 reverse zones (`.in-addr.arpa`) are now decoded through
+           an O(1) mathematical state machine directly into a `[4]byte` block.
+           Bypasses `strings.Split` and string builders entirely, slashing GC latency
+           during intense reverse-DNS floods. Mirrors the IPv6 optimizations
            from 1.13.0 natively.
-  1.15.0 - [CLEANUP] Streamlined `parseHexNibble` evaluation mechanics 
+  1.15.0 - [CLEANUP] Streamlined `parseHexNibble` evaluation mechanics
            organically utilizing explicit `switch` bounds for cleaner syntax.
-  1.14.0 - [SECURITY] Passed `bypassGlobal` dynamically to `buildSFKey` to avert 
+  1.14.0 - [SECURITY] Passed `bypassGlobal` dynamically to `buildSFKey` to avert
            SingleFlight hash collisions between standard and bypassed payloads natively.
-  1.13.0 - [PERF] Obliterated massive heap allocations within `extractIPFromPTR` 
-           natively. IPv6 reverse zones (`.ip6.arpa`) are now decoded through O(1) 
-           mathematical array indices directly into a `[16]byte` block. Bypasses 
-           `strings.Split` and string builders entirely, slashing GC latency 
+  1.13.0 - [PERF] Obliterated massive heap allocations within `extractIPFromPTR`
+           natively. IPv6 reverse zones (`.ip6.arpa`) are now decoded through O(1)
+           mathematical array indices directly into a `[16]byte` block. Bypasses
+           `strings.Split` and string builders entirely, slashing GC latency
            during intense reverse-DNS floods.
-  1.12.0 - [SECURITY/FIX] Dynamically injected `Qclass` parameters into the 
-           SingleFlight caching signature (`buildSFKey`) natively. Neutralizes 
-           theoretical cross-class hash collisions within the execution pool 
+  1.12.0 - [SECURITY/FIX] Dynamically injected `Qclass` parameters into the
+           SingleFlight caching signature (`buildSFKey`) natively. Neutralizes
+           theoretical cross-class hash collisions within the execution pool
            and maintains strict mathematical parity.
 */
 
@@ -46,7 +48,7 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// ErrSilentDrop is a sentinel error used by upstream execution pools to cleanly 
+// ErrSilentDrop is a sentinel error used by upstream execution pools to cleanly
 // terminate consensus loops without writing a response to the client.
 var ErrSilentDrop = errors.New("silent_drop")
 
@@ -67,16 +69,17 @@ type sfResult struct {
 	addr string
 }
 
-// coalescedTotal tracks how many redundant upstream queries were successfully 
+// coalescedTotal tracks how many redundant upstream queries were successfully
 // suppressed by the singleflight group natively.
 var coalescedTotal atomic.Int64
 
 // revalSem bounds the maximum number of background cache-revalidation routines
 // that can execute simultaneously to prevent goroutine explosion.
 const revalSemCap = 32
+
 var revalSem = make(chan struct{}, revalSemCap)
 
-// msgPool provides highly-recyclable dns.Msg structures to heavily reduce 
+// msgPool provides highly-recyclable dns.Msg structures to heavily reduce
 // Garbage Collection (GC) pressure during intense query floods.
 var msgPool = sync.Pool{New: func() any { return new(dns.Msg) }}
 
@@ -123,12 +126,12 @@ func buildClientID(ip, name string, addr netip.Addr) string {
 	return s
 }
 
-// buildSFKey constructs a highly specific cache key for the SingleFlight 
+// buildSFKey constructs a highly specific cache key for the SingleFlight
 // execution group, ensuring only identical questions intended for the exact
 // same upstream route index, subnets, and DNSSEC constraints are coalesced.
 // [PERF] Uses strings.Builder with exact capacity sizing for zero-allocation
 // string conversion on return.
-func buildSFKey(name string, qtype uint16, qclass uint16, routeIdx uint16, doBit bool, cdBit bool, bypassGlobal bool, clientName string, ecs string) string {
+func buildSFKey(name string, qtype uint16, qclass uint16, routeIdx uint16, doBit bool, cdBit bool, bypassGlobal bool, recursionDesired bool, clientName string, ecs string) string {
 	var sb strings.Builder
 
 	// [SECURITY/PERF] Pre-allocate exact buffer size to prevent dynamic heap escapes.
@@ -145,7 +148,7 @@ func buildSFKey(name string, qtype uint16, qclass uint16, routeIdx uint16, doBit
 	sb.WriteByte(byte(qclass))
 	sb.WriteByte(byte(routeIdx >> 8))
 	sb.WriteByte(byte(routeIdx))
-	
+
 	// Pack cryptographic constraints into a single byte payload to prevent execution drift natively.
 	var flags byte
 	if doBit {
@@ -157,10 +160,13 @@ func buildSFKey(name string, qtype uint16, qclass uint16, routeIdx uint16, doBit
 	if bypassGlobal {
 		flags |= 4
 	}
+	if recursionDesired {
+		flags |= 8
+	}
 	sb.WriteByte(flags)
 
 	// [SECURITY/FIX] Unconditionally append null-byte delimiters regardless of empty strings.
-	// Prevents severe hash collisions where parallel clients containing alternating string arrays 
+	// Prevents severe hash collisions where parallel clients containing alternating string arrays
 	// generated perfectly identical concatenated boundaries, hijacking routing and caching states.
 	sb.WriteByte(0)
 	sb.WriteString(clientName)
@@ -170,32 +176,32 @@ func buildSFKey(name string, qtype uint16, qclass uint16, routeIdx uint16, doBit
 	return sb.String()
 }
 
-// cleanUpstreamHost extracts a clean "Hostname (IP)" or just "IP" from the 
+// cleanUpstreamHost extracts a clean "Hostname (IP)" or just "IP" from the
 // upstream connection log, stripping redundant schemas or HTTP path data
 // while preserving the ECH status indicator if successfully negotiated.
 func cleanUpstreamHost(s string) string {
 	if s == "" {
 		return ""
 	}
-	
+
 	echMarker := ""
 	if strings.Contains(s, "+ECH://") {
 		echMarker = "[ECH] "
 	}
-	
+
 	// Remove scheme "proto://" natively
 	if idx := strings.Index(s, "://"); idx >= 0 {
 		s = s[idx+3:]
 	}
-	
+
 	parts := strings.SplitN(s, " (", 2)
 	hostPart := parts[0]
-	
+
 	// Remove path or query strings (e.g., HTTP paths) natively
 	if slashIdx := strings.IndexByte(hostPart, '/'); slashIdx >= 0 {
 		hostPart = hostPart[:slashIdx]
 	}
-	
+
 	if len(parts) > 1 {
 		ipPart := parts[1]
 		ipPart = strings.TrimSuffix(ipPart, ")")
@@ -205,7 +211,7 @@ func cleanUpstreamHost(s string) string {
 		}
 		return echMarker + hostPart + " (" + ipPart + ")"
 	}
-	
+
 	// Strip port if it's just a raw host/IP natively
 	if host, _, err := net.SplitHostPort(hostPart); err == nil {
 		hostPart = host
@@ -243,48 +249,54 @@ func extractIPFromPTR(name string) string {
 
 		// [PERF/FIX] O(1) mathematical state machine parsing natively.
 		// Exclusively parses strings forward into a precise [4]byte structure.
-		// Eradicates all `strings.Split` array allocations and string builder 
+		// Eradicates all `strings.Split` array allocations and string builder
 		// concatenations, slashing GC load securely.
 		for i := 0; i < len(p); i++ {
 			c := p[i]
 			if c == '.' {
-				if !hasVal || octet >= 3 { return "" }
+				if !hasVal || octet >= 3 {
+					return ""
+				}
 				b[3-octet] = byte(val)
 				octet++
 				val = 0
 				hasVal = false
 			} else if c >= '0' && c <= '9' {
 				val = val*10 + int(c-'0')
-				if val > 255 { return "" }
+				if val > 255 {
+					return ""
+				}
 				hasVal = true
 			} else {
 				return ""
 			}
 		}
-		if !hasVal || octet != 3 { return "" }
+		if !hasVal || octet != 3 {
+			return ""
+		}
 		b[0] = byte(val)
 		return netip.AddrFrom4(b).String()
 
 	} else if strings.HasSuffix(name, ".ip6.arpa") {
 		p := strings.TrimSuffix(name, ".ip6.arpa")
-		
+
 		// [PERF/FIX] IPv6 Reverse zones strictly follow a deterministic 63-byte structure (32 hex chars + 31 dots).
-		// Natively unpacking the nibbles directly from the string descriptor completely eradicates 
+		// Natively unpacking the nibbles directly from the string descriptor completely eradicates
 		// massive array allocation and `strings.Split` heap escapes during reverse-DNS floods.
 		if len(p) != 63 {
 			return ""
 		}
-		
+
 		var b [16]byte
 		for i := 0; i < 16; i++ {
-			// Map physical index coordinates directly. 
+			// Map physical index coordinates directly.
 			// Nibbles are ordered inverse, spaced by dots natively.
-			hiIdx := 62 - (i * 4) 
+			hiIdx := 62 - (i * 4)
 			loIdx := 60 - (i * 4)
-			
+
 			hi := parseHexNibble(p[hiIdx])
 			lo := parseHexNibble(p[loIdx])
-			
+
 			if hi > 15 || lo > 15 {
 				return ""
 			}
@@ -296,18 +308,18 @@ func extractIPFromPTR(name string) string {
 }
 
 // SetNegativeSOA natively synthesizes an SOA record for negative caching proofs (RFC 2308).
-// Binds strictly to the requested QNAME to prevent stub resolvers from aggressively 
+// Binds strictly to the requested QNAME to prevent stub resolvers from aggressively
 // retrying missing or intercepted records natively.
 func SetNegativeSOA(msg *dns.Msg, name string, ttl uint32) {
 	msg.Ns = []dns.RR{&dns.SOA{
-		Hdr:     dns.RR_Header{Name: name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: ttl},
-		Ns:      "ns.sdproxy.", Mbox: "hostmaster.sdproxy.",
-		Serial:  1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: ttl,
+		Hdr: dns.RR_Header{Name: name, Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: ttl},
+		Ns:  "ns.sdproxy.", Mbox: "hostmaster.sdproxy.",
+		Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: ttl,
 	}}
 }
 
 // PreserveEDNS0 extracts and deeply clones the client's EDNS0 payload natively.
-// Crucial for satisfying RFC 6891 requirements; strict resolvers often reject 
+// Crucial for satisfying RFC 6891 requirements; strict resolvers often reject
 // synthesized block responses if their initial OPT limits are ignored.
 func PreserveEDNS0(req *dns.Msg, resp *dns.Msg) {
 	if opt := req.IsEdns0(); opt != nil {
@@ -325,14 +337,14 @@ func RcodeStr(rcode int) string {
 }
 
 // ParsePrefixUnmapped parses a CIDR string and structurally unmaps IPv4-in-IPv6 boundaries natively.
-// Eliminates a severe evasion vector where malicious clients attempt to bypass IPv4 ACLs 
+// Eliminates a severe evasion vector where malicious clients attempt to bypass IPv4 ACLs
 // and Domain blocks by shrouding payloads in IPv6 translation mechanics.
 func ParsePrefixUnmapped(s string) (netip.Prefix, error) {
 	prefix, err := netip.ParsePrefix(s)
 	if err != nil {
 		return prefix, err
 	}
-	
+
 	// Rigorously enforce protocol abstraction stripping natively
 	if prefix.Addr().Is4In6() {
 		bits := prefix.Bits() - 96
@@ -343,4 +355,3 @@ func ParsePrefixUnmapped(s string) (netip.Prefix, error) {
 	}
 	return prefix, nil
 }
-

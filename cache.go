@@ -1,26 +1,28 @@
 /*
 File:    cache.go
-Version: 2.53.0 (Split)
-Last Updated: 26-Aug-2026 16:30 CEST
+Version: 2.54.0 (Split)
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
   High-performance, sharded, non-blocking DNS cache core for sdproxy.
   Manages memory allocation, cryptographic sharding (HashDoS protection),
   and asynchronous garbage collection (Sweeper).
-  
+
   Hot-path Read/Write operations have been moved to cache_rw.go.
   Disk persistence has been moved to cache_persistence.go.
   UI introspection has been moved to cache_ui.go.
 
 Changes:
-  2.53.0 - [PERF] Eliminated significant Garbage Collection (GC) thrashing 
-           within the `runSweeper` background routine. Hoisted the `toDelete` 
-           array allocation completely out of the iteration loop, leveraging 
-           `[:0]` capacity-reuse natively to eradicate 32 redundant slice 
-           allocations per sweeping cycle organically across the lifetime 
+  2.54.0 - [SECURITY/FIX] Added RecursionDesired to cache partitioning and shard hashing.
+           Recursive and non-recursive client queries must never share cached responses.
+  2.53.0 - [PERF] Eliminated significant Garbage Collection (GC) thrashing
+           within the `runSweeper` background routine. Hoisted the `toDelete`
+           array allocation completely out of the iteration loop, leveraging
+           `[:0]` capacity-reuse natively to eradicate 32 redundant slice
+           allocations per sweeping cycle organically across the lifetime
            of the process.
-  2.52.0 - [CLEANUP] Simplified `storeItem` mutex orchestration organically 
-           via `defer` declarations. Eliminated redundant condition bounds 
+  2.52.0 - [CLEANUP] Simplified `storeItem` mutex orchestration organically
+           via `defer` declarations. Eliminated redundant condition bounds
            during oldest-victim sample evictions natively.
   2.51.0 - [PERF/FIX] Eliminated the cache-hot-path repack caused by
            `answer_sort: round-robin`.
@@ -44,22 +46,23 @@ import (
 // struct-comparable without a string route name on every lookup.
 // DoBit and CdBit ensure cryptographically signed/unsigned, and validated/unvalidated
 // requests are isolated securely, preventing cross-contamination.
-// BypassGlobal explicitly partitions the cache payload natively when the routing 
+// BypassGlobal explicitly partitions the cache payload natively when the routing
 // group bypasses globally defined Spoofed Records (rrs) and Domain Policies natively.
-// ClientName explicitly partitions the cache payload natively when the routing 
+// ClientName explicitly partitions the cache payload natively when the routing
 // group relies on tailored upstream endpoints (e.g., NextDNS/ControlD).
-// ECS explicitly partitions the cache payload natively when the routing group 
+// ECS explicitly partitions the cache payload natively when the routing group
 // injects localized EDNS0 Client Subnet architectures, neutralizing cross-contamination.
 type DNSCacheKey struct {
-	Name         string
-	ClientName   string 
-	ECS          string 
-	Qtype        uint16
-	Qclass       uint16
-	RouteIdx     uint16
-	DoBit        bool
-	CdBit        bool
-	BypassGlobal bool
+	Name             string
+	ClientName       string
+	ECS              string
+	Qtype            uint16
+	Qclass           uint16
+	RouteIdx         uint16
+	DoBit            bool
+	CdBit            bool
+	BypassGlobal     bool
+	RecursionDesired bool
 }
 
 // cacheItem is a single cached DNS response in wire format.
@@ -120,7 +123,7 @@ var cacheUpstreamNeg bool
 // cacheRotateAnswers is true when answer_sort is "round-robin".
 var cacheRotateAnswers bool
 
-// serveStaleInfinite controls whether expired cache entries are retained 
+// serveStaleInfinite controls whether expired cache entries are retained
 // indefinitely and served as an absolute last resort during upstream outages.
 var serveStaleInfinite bool
 
@@ -160,10 +163,10 @@ func InitCache(maxSize int, _ int) {
 
 	// Set hot-path feature flags once so CacheGet/CacheSet branches are pure
 	// bool loads — no config struct field accesses on the critical path.
-	hasPrefetch        = cfg.Cache.PrefetchBefore > 0 && cfg.Cache.PrefetchMinHits > 0
-	staleEnabled       = cfg.Cache.StaleTTL > 0
-	cacheUpstreamNeg   = cfg.Cache.CacheUpstreamNegative
-	cacheSynthFlag     = cfg.Cache.CacheSynthetic
+	hasPrefetch = cfg.Cache.PrefetchBefore > 0 && cfg.Cache.PrefetchMinHits > 0
+	staleEnabled = cfg.Cache.StaleTTL > 0
+	cacheUpstreamNeg = cfg.Cache.CacheUpstreamNegative
+	cacheSynthFlag = cfg.Cache.CacheSynthetic
 	cacheLocalIdentity = cfg.Cache.CacheLocalIdentity
 	serveStaleInfinite = cfg.Cache.ServeStaleInfinite
 	cacheRotateAnswers = cfg.Cache.AnswerSort == "round-robin"
@@ -172,7 +175,7 @@ func InitCache(maxSize int, _ int) {
 	if cfg.Cache.SweepIntervalS > 0 {
 		sweepInterval = time.Duration(cfg.Cache.SweepIntervalS) * time.Second
 	}
-	
+
 	if logCaching {
 		log.Printf("[CACHE] Initialised: size=%d shards=%d sweep=%s stale=%ds "+
 			"prefetch=%ds/%dhits synth=%v localid=%v upneg=%v sort=%s inf_stale=%v persist=%v",
@@ -185,7 +188,7 @@ func InitCache(maxSize int, _ int) {
 
 	if cfg.Cache.Persist {
 		LoadCache()
-		
+
 		if cfg.Cache.PersistSaveInterval != "" && cfg.Cache.PersistSaveInterval != "0" && cfg.Cache.PersistSaveInterval != "0s" {
 			if interval, err := time.ParseDuration(cfg.Cache.PersistSaveInterval); err == nil && interval > 0 {
 				go func() {
@@ -212,18 +215,18 @@ func InitCache(maxSize int, _ int) {
 // runSweeper periodically reclaims cache entries whose stale window has passed.
 func runSweeper(interval time.Duration) {
 	if serveStaleInfinite {
-		// Disable garbage collection of expired records so they remain 
+		// Disable garbage collection of expired records so they remain
 		// available indefinitely for upstream outage fallbacks.
-		return 
+		return
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// [PERF/FIX] Allocate the eviction array ONCE outside the sweeping loop.
-	// By leveraging capacity-reuse (toDelete[:0]) natively, we completely eradicate 
-	// 32 redundant slice heap-allocations per sweep cycle, drastically reducing 
-	// Garbage Collection (GC) thrashing and locking contention organically over 
+	// By leveraging capacity-reuse (toDelete[:0]) natively, we completely eradicate
+	// 32 redundant slice heap-allocations per sweep cycle, drastically reducing
+	// Garbage Collection (GC) thrashing and locking contention organically over
 	// the lifetime of the process.
 	toDelete := make([]DNSCacheKey, 0, max(cacheMaxPerShard/4, 16))
 
@@ -231,10 +234,10 @@ func runSweeper(interval time.Duration) {
 		select {
 		case <-ticker.C:
 			now := time.Now().UnixNano()
-			
+
 			for i := range shards {
 				shard := shards[i]
-				
+
 				// Re-slice to zero length to reuse the underlying capacity organically
 				toDelete = toDelete[:0]
 
@@ -272,19 +275,19 @@ func runSweeper(interval time.Duration) {
 func getShard(key DNSCacheKey) *cacheShard {
 	// Hash the domain name utilizing the cryptographically seeded maphash
 	h := maphash.String(cacheHashSeed, key.Name)
-	
-	// Incorporate dynamic ClientName boundaries to guarantee total cache isolation 
+
+	// Incorporate dynamic ClientName boundaries to guarantee total cache isolation
 	// when upstream protocols specify individualized targeting natively.
 	if key.ClientName != "" {
 		h ^= maphash.String(cacheHashSeed, key.ClientName) * 0x5bd1e9955bd1e995
 	}
-	
-	// Incorporate ECS boundaries dynamically to prevent subset-target contamination 
+
+	// Incorporate ECS boundaries dynamically to prevent subset-target contamination
 	// natively across independent origin IP mappings.
 	if key.ECS != "" {
 		h ^= maphash.String(cacheHashSeed, key.ECS) * 0x9e3779b97f4a7c15
 	}
-	
+
 	// Pack the remaining structured, trusted deterministic fields.
 	mix := uint64(key.Qtype)<<32 | uint64(key.Qclass)<<16 | uint64(key.RouteIdx)
 	if key.DoBit {
@@ -296,16 +299,19 @@ func getShard(key DNSCacheKey) *cacheShard {
 	if key.BypassGlobal {
 		mix |= 1 << 50
 	}
-	
+	if key.RecursionDesired {
+		mix |= 1 << 51
+	}
+
 	// Fold the scalar fields into the primary hash
 	h ^= mix
-	
+
 	// Avalanche the upper bits downwards to guarantee absolute uniformity across the lowest 5 bits
 	h ^= h >> 32
 	h ^= h >> 16
 	h ^= h >> 8
 	h ^= h >> 4
-	
+
 	return shards[h&(shardCount-1)]
 }
 
@@ -320,7 +326,7 @@ const evictionSampleSize = 8
 // storeItem acquires the shard write-lock, evicts the oldest of a small random
 // sample when the shard is at capacity, then stores item under key.
 //
-// [CLEANUP 2.52.0] Refactored to utilize localized `defer` operations, eliminating 
+// [CLEANUP 2.52.0] Refactored to utilize localized `defer` operations, eliminating
 // redundant condition constraints natively during active eviction matrices.
 func storeItem(key DNSCacheKey, item *cacheItem) {
 	shard := getShard(key)
@@ -348,4 +354,3 @@ func storeItem(key DNSCacheKey, item *cacheItem) {
 
 	shard.items[key] = item
 }
-

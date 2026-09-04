@@ -1,7 +1,7 @@
 /*
 File:    config.go
-Version: 1.71.0
-Updated: 04-Sep-2026 08:20 CEST
+Version: 1.72.0
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
   All YAML-mapped configuration structs for sdproxy. Covers every top-level
@@ -10,23 +10,25 @@ Description:
   and spoofed records (RRs).
 
 Changes:
+  1.72.0 - [SECURITY/FIX] Reject invalid cache numeric settings and invalid persistence
+           intervals instead of silently accepting values that can wrap or disable persistence.
   1.71.0 - [FEAT] Added `ForceAnd` boolean to `RouteConfig` and `ParsedRoute` to strictly enforce
            logical "AND" matching for multiple route identifiers in a single string.
-  1.70.0 - [FEAT] Added `max_secure_upstreams` to make the previously hardcoded 
-           cap on simultaneously-queried upstreams for the "secure" strategy 
+  1.70.0 - [FEAT] Added `max_secure_upstreams` to make the previously hardcoded
+           cap on simultaneously-queried upstreams for the "secure" strategy
            configurable. Defaults to 5 when unset/invalid.
   1.69.0 - [FEAT] Added `BypassGlobal` to `RouteConfig` and `ParsedRoute` to allow
            identified clients to securely skip global RRS and Domain Policies natively.
-  1.68.0 - [FEAT] Added `SearchDomainLeakPrevention` boolean pointer to server 
+  1.68.0 - [FEAT] Added `SearchDomainLeakPrevention` boolean pointer to server
            config struct to toggle tracking recent blocks.
-  1.67.0 - [FEAT] Integrated `Persist`, `PersistFile`, and `PersistSaveInterval` 
-           structs into the `Cache` configuration to enable disk-persistent 
+  1.67.0 - [FEAT] Integrated `Persist`, `PersistFile`, and `PersistSaveInterval`
+           structs into the `Cache` configuration to enable disk-persistent
            memory survivability across router reboots natively.
-  1.66.0 - [FEAT] Integrated auto-enabling of `cfg.Server.FlattenCNAME` during config validation 
+  1.66.0 - [FEAT] Integrated auto-enabling of `cfg.Server.FlattenCNAME` during config validation
            whenever an upstream group is configured to use the `consolidate` secure preference.
-  1.65.0 - [SECURITY/FIX] Overhauled `validateConfig()` to aggressively normalize all 
-           parental control Group names and Upstream Group names to lowercase globally. 
-           This defends against subtle, hard-to-debug configuration mismatches and 
+  1.65.0 - [SECURITY/FIX] Overhauled `validateConfig()` to aggressively normalize all
+           parental control Group names and Upstream Group names to lowercase globally.
+           This defends against subtle, hard-to-debug configuration mismatches and
            routing/policy bypasses on public networks caused by casing variances.
 */
 
@@ -36,6 +38,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -66,7 +69,7 @@ type ECSConfig struct {
 // ---------------------------------------------------------------------------
 
 // RouteConfig maps a MAC/IP/CIDR/ASN key to an upstream group, an optional client
-// name override, the optional bypass_local flag, an optional parental group, 
+// name override, the optional bypass_local flag, an optional parental group,
 // and an explicit DNS return code (rcode) for instant policy enforcement.
 type RouteConfig struct {
 	Rcode        string `yaml:"rcode"`
@@ -230,21 +233,21 @@ func (c *CategoryConfig) UnmarshalYAML(value *yaml.Node) error {
 // ---------------------------------------------------------------------------
 
 type ParentalConfig struct {
-	FastStart bool `yaml:"fast_start"`
-	ForcedTTL int `yaml:"forced_ttl"`
-	BlockTTL int `yaml:"block_ttl"`
-	TickerInterval int `yaml:"ticker_interval"`
-	DefaultIdlePause string `yaml:"default_idle_pause"`
-	DefaultSessionWindow string `yaml:"default_session_window"`
-	TimeOffsetHours int `yaml:"time_offset_hours"` // Adjusts schedule logic cleanly against specific timezones
-	SnapshotDir string `yaml:"snapshot_dir"`
-	Consolidation *bool `yaml:"consolidation"`
-	SynthesiseParents *bool `yaml:"synthesise_parents"`
-	RemoveRedundantSubdomains *bool `yaml:"remove_redundant_subdomains"`
-	StripServiceLabels *bool `yaml:"strip_service_labels"`
-	ParentConsolidationThreshold int `yaml:"parent_consolidation_threshold"`
-	ConsolidationHomogeneityPct int `yaml:"consolidation_homogeneity_pct"`
-	Categories map[string]CategoryConfig `yaml:"categories"`
+	FastStart                    bool                      `yaml:"fast_start"`
+	ForcedTTL                    int                       `yaml:"forced_ttl"`
+	BlockTTL                     int                       `yaml:"block_ttl"`
+	TickerInterval               int                       `yaml:"ticker_interval"`
+	DefaultIdlePause             string                    `yaml:"default_idle_pause"`
+	DefaultSessionWindow         string                    `yaml:"default_session_window"`
+	TimeOffsetHours              int                       `yaml:"time_offset_hours"` // Adjusts schedule logic cleanly against specific timezones
+	SnapshotDir                  string                    `yaml:"snapshot_dir"`
+	Consolidation                *bool                     `yaml:"consolidation"`
+	SynthesiseParents            *bool                     `yaml:"synthesise_parents"`
+	RemoveRedundantSubdomains    *bool                     `yaml:"remove_redundant_subdomains"`
+	StripServiceLabels           *bool                     `yaml:"strip_service_labels"`
+	ParentConsolidationThreshold int                       `yaml:"parent_consolidation_threshold"`
+	ConsolidationHomogeneityPct  int                       `yaml:"consolidation_homogeneity_pct"`
+	Categories                   map[string]CategoryConfig `yaml:"categories"`
 }
 
 // ---------------------------------------------------------------------------
@@ -252,14 +255,14 @@ type ParentalConfig struct {
 // ---------------------------------------------------------------------------
 
 type WebUIConfig struct {
-	Enabled bool `yaml:"enabled"`
-	Listen string `yaml:"listen"`
-	ListenHTTP []string `yaml:"listen_http"`
-	ListenHTTPS []string `yaml:"listen_https"`
-	ForceHTTPS bool `yaml:"force_https"`
-	Password string `yaml:"password"`
-	APIToken string `yaml:"api_token"`
-	ACL ACLConfig `yaml:"acl"`
+	Enabled     bool      `yaml:"enabled"`
+	Listen      string    `yaml:"listen"`
+	ListenHTTP  []string  `yaml:"listen_http"`
+	ListenHTTPS []string  `yaml:"listen_https"`
+	ForceHTTPS  bool      `yaml:"force_https"`
+	Password    string    `yaml:"password"`
+	APIToken    string    `yaml:"api_token"`
+	ACL         ACLConfig `yaml:"acl"`
 
 	LoginRatelimit struct {
 		Enabled        bool `yaml:"enabled"`
@@ -267,13 +270,13 @@ type WebUIConfig struct {
 		LockoutMinutes int  `yaml:"lockout_minutes"`
 	} `yaml:"login_ratelimit"`
 
-	StatsEnabled bool `yaml:"stats_enabled"`
-	StatsRefreshSec int `yaml:"stats_refresh_sec"`
-	StatsTopN int `yaml:"stats_top_n"`
-	StatsGraphsEnabled bool `yaml:"stats_graphs_enabled"`
-	HistoryDir string `yaml:"history_dir"`
-	HistoryRetentionHours int `yaml:"history_retention_hours"`
-	HistorySaveInterval string `yaml:"history_save_interval"`
+	StatsEnabled          bool   `yaml:"stats_enabled"`
+	StatsRefreshSec       int    `yaml:"stats_refresh_sec"`
+	StatsTopN             int    `yaml:"stats_top_n"`
+	StatsGraphsEnabled    bool   `yaml:"stats_graphs_enabled"`
+	HistoryDir            string `yaml:"history_dir"`
+	HistoryRetentionHours int    `yaml:"history_retention_hours"`
+	HistorySaveInterval   string `yaml:"history_save_interval"`
 }
 
 // ---------------------------------------------------------------------------
@@ -282,18 +285,18 @@ type WebUIConfig struct {
 
 type Config struct {
 	Server struct {
-		FastStart  bool     `yaml:"fast_start"`
-		ListenUDP  []string `yaml:"listen_udp"`
-		ListenTCP  []string `yaml:"listen_tcp"`
-		ListenDoT  []string `yaml:"listen_dot"`
-		ListenDoH  []string `yaml:"listen_doh"`
-		ListenDoQ  []string `yaml:"listen_doq"`
-		UDPWorkers int      `yaml:"udp_workers"`
-		TLSCert    string   `yaml:"tls_cert"`
-		TLSKey     string   `yaml:"tls_key"`
-		MemoryLimitMB int `yaml:"memory_limit_mb"`
-		MaxTCPConnections int `yaml:"max_tcp_connections"`
-		ACL ACLConfig `yaml:"acl"`
+		FastStart         bool      `yaml:"fast_start"`
+		ListenUDP         []string  `yaml:"listen_udp"`
+		ListenTCP         []string  `yaml:"listen_tcp"`
+		ListenDoT         []string  `yaml:"listen_dot"`
+		ListenDoH         []string  `yaml:"listen_doh"`
+		ListenDoQ         []string  `yaml:"listen_doq"`
+		UDPWorkers        int       `yaml:"udp_workers"`
+		TLSCert           string    `yaml:"tls_cert"`
+		TLSKey            string    `yaml:"tls_key"`
+		MemoryLimitMB     int       `yaml:"memory_limit_mb"`
+		MaxTCPConnections int       `yaml:"max_tcp_connections"`
+		ACL               ACLConfig `yaml:"acl"`
 
 		RateLimit struct {
 			Enabled          bool     `yaml:"enabled"`
@@ -301,9 +304,9 @@ type Config struct {
 			Burst            float64  `yaml:"burst"`
 			IPv4PrefixLength int      `yaml:"ipv4_prefix_length"`
 			IPv6PrefixLength int      `yaml:"ipv6_prefix_length"`
-			MaxTrackedIPs    int      `yaml:"max_tracked_ips"` 
-			Exempt           []string `yaml:"exempt"`          
-			
+			MaxTrackedIPs    int      `yaml:"max_tracked_ips"`
+			Exempt           []string `yaml:"exempt"`
+
 			PenaltyBox struct {
 				Enabled         bool `yaml:"enabled"`
 				StrikeThreshold int  `yaml:"strike_threshold"`
@@ -328,7 +331,7 @@ type Config struct {
 			IPv6PrefixLength  int      `yaml:"ipv6_prefix_length"`
 			MaxTrackedIPs     int      `yaml:"max_tracked_ips"`
 			Exempt            []string `yaml:"exempt"`
-			
+
 			PenaltyBox struct {
 				Enabled         bool `yaml:"enabled"`
 				StrikeThreshold int  `yaml:"strike_threshold"`
@@ -336,40 +339,40 @@ type Config struct {
 			} `yaml:"penalty_box"`
 		} `yaml:"exfiltration"`
 
-		SupportIPVersion    string    `yaml:"support_ip_version"`
-		BlockAction         string    `yaml:"block_action"`
-		BlockIPs            []string  `yaml:"block_ips"`
-		RebindingProtection bool      `yaml:"rebinding_protection"`
-		SearchDomainLeakPrevention *bool `yaml:"search_domain_leak_prevention"`
-		FilterAAAA          bool      `yaml:"filter_aaaa"`
-		FilterIPs           bool      `yaml:"filter_ips"`
-		StrictPTR           bool      `yaml:"strict_ptr"`
-		FlattenCNAME        bool      `yaml:"flatten_cname"`
-		TargetName          bool      `yaml:"target_name"`
-		MinimizeAnswer      bool      `yaml:"minimize_answer"`
-		BlockObsoleteQtypes bool      `yaml:"block_obsolete_qtypes"`
-		UpstreamSelection   string    `yaml:"upstream_selection"`
-		UpstreamStaggerMs   int       `yaml:"upstream_stagger_ms"`
-		UpstreamTimeoutMs   int       `yaml:"upstream_timeout_ms"`
+		SupportIPVersion           string   `yaml:"support_ip_version"`
+		BlockAction                string   `yaml:"block_action"`
+		BlockIPs                   []string `yaml:"block_ips"`
+		RebindingProtection        bool     `yaml:"rebinding_protection"`
+		SearchDomainLeakPrevention *bool    `yaml:"search_domain_leak_prevention"`
+		FilterAAAA                 bool     `yaml:"filter_aaaa"`
+		FilterIPs                  bool     `yaml:"filter_ips"`
+		StrictPTR                  bool     `yaml:"strict_ptr"`
+		FlattenCNAME               bool     `yaml:"flatten_cname"`
+		TargetName                 bool     `yaml:"target_name"`
+		MinimizeAnswer             bool     `yaml:"minimize_answer"`
+		BlockObsoleteQtypes        bool     `yaml:"block_obsolete_qtypes"`
+		UpstreamSelection          string   `yaml:"upstream_selection"`
+		UpstreamStaggerMs          int      `yaml:"upstream_stagger_ms"`
+		UpstreamTimeoutMs          int      `yaml:"upstream_timeout_ms"`
 		// MaxSecureUpstreams caps how many upstreams within a "secure" strategy
 		// group are queried simultaneously for consensus validation. Was
 		// previously a hardcoded value of 5 inside exchangeSecure(); now
 		// configurable. Defaults to 5 when omitted or <= 0.
-		MaxSecureUpstreams  int       `yaml:"max_secure_upstreams"`
-		SyntheticTTL        int       `yaml:"synthetic_ttl"`
-		BootstrapServers    []string  `yaml:"bootstrap_servers"`
-		UseUpstreamECH      string    `yaml:"use_upstream_ech"`
-		HostnameECH         string    `yaml:"hostname_ech"`
-		UpgradeDoH3         bool      `yaml:"upgrade_doh3"`
-		PolicyCacheDir      string    `yaml:"policy_cache_dir"`
-		PolicyPollInterval  string    `yaml:"policy_poll_interval"`
-		UserAgent           string    `yaml:"user_agent"`
-		ECHConfigList       string    `yaml:"ech_config_list"`
-		ECHKey              string    `yaml:"ech_key"`
-		ECS                 ECSConfig `yaml:"ecs"` // Global EDNS0 Client Subnet parameters
+		MaxSecureUpstreams int       `yaml:"max_secure_upstreams"`
+		SyntheticTTL       int       `yaml:"synthetic_ttl"`
+		BootstrapServers   []string  `yaml:"bootstrap_servers"`
+		UseUpstreamECH     string    `yaml:"use_upstream_ech"`
+		HostnameECH        string    `yaml:"hostname_ech"`
+		UpgradeDoH3        bool      `yaml:"upgrade_doh3"`
+		PolicyCacheDir     string    `yaml:"policy_cache_dir"`
+		PolicyPollInterval string    `yaml:"policy_poll_interval"`
+		UserAgent          string    `yaml:"user_agent"`
+		ECHConfigList      string    `yaml:"ech_config_list"`
+		ECHKey             string    `yaml:"ech_key"`
+		ECS                ECSConfig `yaml:"ecs"` // Global EDNS0 Client Subnet parameters
 
-		QnameMinLabels      int       `yaml:"qname_min_labels"`
-		QnameMaxLabels      int       `yaml:"qname_max_labels"`
+		QnameMinLabels int `yaml:"qname_min_labels"`
+		QnameMaxLabels int `yaml:"qname_max_labels"`
 
 		DDR struct {
 			Enabled        bool     `yaml:"enabled"`
@@ -396,23 +399,23 @@ type Config struct {
 	} `yaml:"logging"`
 
 	Cache struct {
-		Enabled             bool   `yaml:"enabled"`
-		Size                int    `yaml:"size"`
-		Persist             bool   `yaml:"persist"`
-		PersistFile         string `yaml:"persist_file"`
-		PersistSaveInterval string `yaml:"persist_save_interval"`
-		MinTTL              int    `yaml:"min_ttl"`
-		MaxTTL              int    `yaml:"max_ttl"`
-		NegativeTTL         int    `yaml:"negative_ttl"`
-		StaleTTL            int    `yaml:"stale_ttl"`
-		ServeStaleInfinite  bool   `yaml:"serve_stale_infinite"`
-		PrefetchBefore      int    `yaml:"prefetch_before"`
-		PrefetchMinHits     int    `yaml:"prefetch_min_hits"`
-		SweepIntervalS      int    `yaml:"sweep_interval_s"`
-		CacheSynthetic      bool   `yaml:"cache_synthetic"`
-		CacheLocalIdentity  bool   `yaml:"cache_local_identity"`
-		CacheUpstreamNegative bool `yaml:"cache_upstream_negative"`
-		AnswerSort          string `yaml:"answer_sort"`
+		Enabled               bool   `yaml:"enabled"`
+		Size                  int    `yaml:"size"`
+		Persist               bool   `yaml:"persist"`
+		PersistFile           string `yaml:"persist_file"`
+		PersistSaveInterval   string `yaml:"persist_save_interval"`
+		MinTTL                int    `yaml:"min_ttl"`
+		MaxTTL                int    `yaml:"max_ttl"`
+		NegativeTTL           int    `yaml:"negative_ttl"`
+		StaleTTL              int    `yaml:"stale_ttl"`
+		ServeStaleInfinite    bool   `yaml:"serve_stale_infinite"`
+		PrefetchBefore        int    `yaml:"prefetch_before"`
+		PrefetchMinHits       int    `yaml:"prefetch_min_hits"`
+		SweepIntervalS        int    `yaml:"sweep_interval_s"`
+		CacheSynthetic        bool   `yaml:"cache_synthetic"`
+		CacheLocalIdentity    bool   `yaml:"cache_local_identity"`
+		CacheUpstreamNegative bool   `yaml:"cache_upstream_negative"`
+		AnswerSort            string `yaml:"answer_sort"`
 	} `yaml:"cache"`
 
 	Identity struct {
@@ -430,24 +433,24 @@ type Config struct {
 
 	Upstreams map[string]UpstreamGroupConfig `yaml:"upstreams"`
 
-	Routes map[string]RouteConfig `yaml:"routes"`
+	Routes      map[string]RouteConfig `yaml:"routes"`
 	RoutesFiles map[string]RouteConfig `yaml:"routes_files"`
 
-	DomainRoutes map[string]DomainRouteConfig `yaml:"domain_routes"`
+	DomainRoutes      map[string]DomainRouteConfig `yaml:"domain_routes"`
 	DomainRoutesFiles map[string]DomainRouteConfig `yaml:"domain_routes_files"`
 
-	RtypePolicy map[string]string `yaml:"rtype_policy"`
+	RtypePolicy      map[string]string `yaml:"rtype_policy"`
 	RtypePolicyFiles map[string]string `yaml:"rtype_policy_files"`
 
-	DomainPolicy map[string]string `yaml:"domain_policy"`
+	DomainPolicy      map[string]string `yaml:"domain_policy"`
 	DomainPolicyFiles map[string]string `yaml:"domain_policy_files"`
-	DomainPolicyURLs map[string]string `yaml:"domain_policy_urls"`
-	
+	DomainPolicyURLs  map[string]string `yaml:"domain_policy_urls"`
+
 	RRs map[string]interface{} `yaml:"rrs"` // Global A/AAAA/CNAME spoofed records
 
-	Groups map[string]GroupConfig `yaml:"groups"`
-	Parental ParentalConfig `yaml:"parental"`
-	WebUI WebUIConfig `yaml:"webui"`
+	Groups   map[string]GroupConfig `yaml:"groups"`
+	Parental ParentalConfig         `yaml:"parental"`
+	WebUI    WebUIConfig            `yaml:"webui"`
 }
 
 var cfg Config
@@ -479,7 +482,7 @@ func validateConfig() error {
 	default:
 		cfg.Server.HostnameECH = "strict"
 	}
-	
+
 	// Normalize DDR Hostname Source setting
 	vDDRSource := strings.ToLower(cfg.Server.DDR.HostnameSource)
 	switch vDDRSource {
@@ -532,12 +535,36 @@ func validateConfig() error {
 		cfg.Server.QnameMaxLabels = cfg.Server.QnameMinLabels + 1
 	}
 
+	if cfg.Cache.Enabled {
+		if cfg.Cache.Size == 0 {
+			cfg.Cache.Size = 5000
+		}
+		if cfg.Cache.Size < 1 {
+			return fmt.Errorf("cache.size must be >= 1 when cache is enabled")
+		}
+	}
+
+	if cfg.Cache.MinTTL < 0 || cfg.Cache.MaxTTL < 0 || cfg.Cache.NegativeTTL < 0 ||
+		cfg.Cache.StaleTTL < 0 || cfg.Cache.PrefetchBefore < 0 ||
+		cfg.Cache.PrefetchMinHits < 0 || cfg.Cache.SweepIntervalS < 0 {
+		return fmt.Errorf("cache TTL, prefetch, and sweep settings must not be negative")
+	}
+	if cfg.Cache.MaxTTL > 0 && cfg.Cache.MinTTL > cfg.Cache.MaxTTL {
+		return fmt.Errorf("cache.min_ttl (%d) cannot exceed cache.max_ttl (%d)", cfg.Cache.MinTTL, cfg.Cache.MaxTTL)
+	}
+
 	if cfg.Cache.Persist {
 		if cfg.Cache.PersistFile == "" {
 			cfg.Cache.PersistFile = "/var/lib/sdproxy/dns_cache.bin"
 		}
 		if cfg.Cache.PersistSaveInterval == "" {
 			cfg.Cache.PersistSaveInterval = "5m"
+		}
+		if cfg.Cache.PersistSaveInterval != "0" && cfg.Cache.PersistSaveInterval != "0s" {
+			interval, err := time.ParseDuration(cfg.Cache.PersistSaveInterval)
+			if err != nil || interval <= 0 {
+				return fmt.Errorf("cache.persist_save_interval %q must be a positive duration or 0s", cfg.Cache.PersistSaveInterval)
+			}
 		}
 	}
 
@@ -577,7 +604,7 @@ func validateConfig() error {
 	}
 
 	// [SECURITY/FIX] Aggressively normalize all Parental Group names and Upstream Group names to lowercase.
-	// This defends against subtle, hard-to-debug configuration mismatches and 
+	// This defends against subtle, hard-to-debug configuration mismatches and
 	// routing/policy bypasses on public networks caused by casing variances.
 	if len(cfg.Groups) > 0 {
 		normGroups := make(map[string]GroupConfig, len(cfg.Groups))

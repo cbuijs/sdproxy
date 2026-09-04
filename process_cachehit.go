@@ -1,7 +1,7 @@
 /*
 File:    process_cachehit.go
-Version: 1.3.0 (Split)
-Last Updated: 04-Sep-2026 09:50 CEST
+Version: 1.4.0 (Split)
+Last Updated: 04-Sep-2026 12:32 CEST
 
 Description:
   Cache-hit serving stage for the sdproxy resolution pipeline.
@@ -17,16 +17,18 @@ Description:
   permitted answer leak to a client whose policy forbids it.
 
 Changes:
+  1.4.0 - [SECURITY/FIX] Added RecursionDesired to the cache key so recursive and
+           non-recursive queries cannot share cached responses.
   1.3.0 - [PERF/FIX] Eradicated a massive, redundant `msg.Copy()` heap allocation natively.
-          `CacheGet` unpacks messages directly from wire-format byte slices, 
-          guaranteeing that the returned `poolMsg` is completely isolated from the master 
-          memory arrays. Bypassing the deep-clone directly before `transformResponse` 
+          `CacheGet` unpacks messages directly from wire-format byte slices,
+          guaranteeing that the returned `poolMsg` is completely isolated from the master
+          memory arrays. Bypassing the deep-clone directly before `transformResponse`
           slashes Garbage Collection (GC) thrashing organically on the cache-hit hot path.
   1.2.0 - [SECURITY/FIX] Resolved a severe cache payload modification vulnerability.
-          `serveFromCache` correctly cloned responses, but failed to deeply clone the 
-          `Answer` slice prior to calling `transformResponse` when `inPlace` was false. 
-          `flattenCNAME` and `applyAnswerSort` thus mutated shared Answer slices residing 
-          in the raw cache structure natively. This caused round-robin shifts or flattened 
+          `serveFromCache` correctly cloned responses, but failed to deeply clone the
+          `Answer` slice prior to calling `transformResponse` when `inPlace` was false.
+          `flattenCNAME` and `applyAnswerSort` thus mutated shared Answer slices residing
+          in the raw cache structure natively. This caused round-robin shifts or flattened
           aliases to instantly corrupt active cached arrays across all clients organically.
   1.1.0 - [SECURITY/FIX] deriveCacheKey and resolveUpstreamGroup resolved the
           upstream group INDEPENDENTLY, out of the same map, with different
@@ -155,15 +157,16 @@ func (qc *queryCtx) deriveCacheKey() {
 	}
 
 	qc.cacheKey = DNSCacheKey{
-		Name:         qc.qNameTrimmed,
-		ClientName:   clientNameForCache,
-		ECS:          ecsForCache,
-		Qtype:        qc.q.Qtype,
-		Qclass:       qc.q.Qclass,
-		RouteIdx:     qc.route.routeIdx,
-		DoBit:        qc.doBit,
-		CdBit:        qc.r.CheckingDisabled,
-		BypassGlobal: qc.bypassGlobal,
+		Name:             qc.qNameTrimmed,
+		ClientName:       clientNameForCache,
+		ECS:              ecsForCache,
+		Qtype:            qc.q.Qtype,
+		Qclass:           qc.q.Qclass,
+		RouteIdx:         qc.route.routeIdx,
+		DoBit:            qc.doBit,
+		CdBit:            qc.r.CheckingDisabled,
+		BypassGlobal:     qc.bypassGlobal,
+		RecursionDesired: qc.r.RecursionDesired,
 	}
 }
 
@@ -224,8 +227,8 @@ func (qc *queryCtx) serveFromCache() bool {
 	}
 
 	// [PERF/FIX 1.3.0] Eradicated redundant heap allocations natively.
-	// `CacheGet` unpacks the message directly from wire-format byte slices, 
-	// meaning `poolMsg` is already entirely isolated from the master cache memory. 
+	// `CacheGet` unpacks the message directly from wire-format byte slices,
+	// meaning `poolMsg` is already entirely isolated from the master cache memory.
 	// Mutating it in-place eliminates a massive `msg.Copy()` GC bottleneck on the cache-hit hot path.
 	resp := transformResponse(poolMsg, qc.q.Qtype, qc.doBit, true)
 
