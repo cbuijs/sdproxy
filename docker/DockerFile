@@ -1,0 +1,51 @@
+# File: Dockerfile
+# Version: 1.0.0
+# Last Updated: 24-Jun-2026 14:30 CEST
+# Description:
+#   Multi-stage Dockerfile to build and run the sdproxy container natively.
+#
+# Changes:
+#   1.0.0 - Initial containerization configuration.
+
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Copy module files and download dependencies
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the lean static binary natively
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o sdproxy .
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+FROM alpine:latest
+
+# Install runtime certificates and timezone data
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+# Copy the compiled binary and required assets from the builder stage
+COPY --from=builder /app/sdproxy /usr/local/bin/sdproxy
+COPY --from=builder /app/full_reference_config.yaml /etc/sdproxy/config.yaml
+
+# Create necessary directories for persistent storage natively
+RUN mkdir -p /var/lib/sdproxy /etc/sdproxy
+
+# Expose standard DNS, DoH, DoT, DoQ, and WebUI ports
+EXPOSE 53/udp 53/tcp
+EXPOSE 853/tcp 853/udp
+EXPOSE 443/tcp 443/udp
+EXPOSE 8080/tcp
+
+# Run the proxy natively pointing to the configuration directory
+ENTRYPOINT ["/usr/local/bin/sdproxy", "--config", "/etc/sdproxy/config.yaml"]
+
