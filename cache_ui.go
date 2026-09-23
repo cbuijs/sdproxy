@@ -1,12 +1,18 @@
 /*
 File:    cache_ui.go
-Version: 1.0.0 (Split)
-Updated: 06-Jun-2026 15:00 CEST
+Version: 1.1.0 (Split)
+Last Updated: 23-Sep-2026 12:35 CEST
 
 Description:
   Web UI API structures and introspection routines for the sdproxy Cache.
   Extracted from cache.go to isolate JSON string allocations away from 
   high-performance cache interactions.
+
+Changes:
+  1.1.0 - [PERF] Eradicated redundant heap allocations natively within DumpCache. 
+          Removed unnecessary deep-copies of immutable cache byte slices, drastically 
+          neutralizing memory constraints during Web UI cache introspection.
+  1.0.0 - Initial extraction mapping structural introspection arrays.
 */
 
 package main
@@ -80,12 +86,12 @@ func DumpCache() []CacheEntryDump {
 				continue
 			}
 			if p := v.packed.Load(); p != nil {
-				packedCopy := make([]byte, len(*p))
-				copy(packedCopy, *p)
+				// [PERF/FIX] By passing the immutable memory address dynamically, 
+				// we completely eradicate redundant slice copies organically prior to packet Unpacking.
 				snaps = append(snaps, snapshot{
 					Key:    k,
 					Item:   v,
-					Packed: packedCopy,
+					Packed: *p,
 					Hits:   v.hits.Load(),
 				})
 			}

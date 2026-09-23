@@ -1,11 +1,16 @@
 /*
 File:    version.go
-Version: 1.477.0
-Last Updated: 23-Sep-2026 11:31 CEST
+Version: 1.478.0
+Last Updated: 23-Sep-2026 12:35 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.478.0 - [PERF] Eradicated massive redundant heap allocations natively within 
+            `SaveCache` and `DumpCache`. By leveraging the strict immutability of 
+            the underlying packed byte arrays, deep-copies were organically bypassed, 
+            drastically slashing Garbage Collection (GC) pressure and memory spikes 
+            during disk flushes and Web UI introspection.
   1.477.0 - [PERF/FIX] Eradicated severe Mutex lock contention and latency spikes 
             during emergency memory evictions natively. `CheckParental` and 
             `recordRecentBlock` now utilize `TryLock` organically when scanning 
@@ -36,12 +41,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.477.0"
+	BuildVersion string = "v1.478.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "23-Sep-2026 11:31 CEST"
+	BuildTime string = "23-Sep-2026 12:35 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "536"
+	BuildNumber string = "537"
 )
 
