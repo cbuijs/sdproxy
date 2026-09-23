@@ -1,7 +1,7 @@
 /*
 File:    cache_rw.go
-Version: 1.8.0 (Split)
-Last Updated: 04-Sep-2026 12:32 CEST
+Version: 1.9.0 (Split)
+Last Updated: 23-Sep-2026 12:45 CEST
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
@@ -11,6 +11,9 @@ Description:
   Extracted from cache.go to prioritize hot-path execution clarity.
 
 Changes:
+  1.9.0 - [SECURITY/FIX] Hardened `CacheSet` Authority Section (Ns) validations natively. 
+          Prevented Cache Poisoning vectors by explicitly rejecting out-of-bailiwick 
+          `NS`/`SOA` injections targeting Public Suffix boundaries (e.g., `com.`) organically.
   1.8.0 - [FIX] Make negative_ttl an explicit negative-cache TTL override.
            Previously it only acted as a fallback and could not override an upstream SOA TTL.
   1.7.0 - [FEAT/FIX] Injected `rotateAnswersInPlace` evaluation natively into
@@ -449,6 +452,14 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 				}
 			}
 
+			// [SECURITY/FIX] Prevent Cache Poisoning via Public Suffix Injection.
+			// Mitigates vulnerabilities where upstreams inject malicious NS/SOA records 
+			// targeting Top-Level Domains (e.g., `com.`) organically overlapping with the query bounds.
+			cleanAnsName := strings.TrimSuffix(ansName, ".")
+			if isValid && cleanAnsName != key.Name && isPublicSuffix(cleanAnsName) {
+				isValid = false
+			}
+
 			if !isValid {
 				if logCaching {
 					log.Printf("[CACHE] SECURITY: Dropped suspicious upstream response for %q. Authority Record %d (%q) breaks Bailiwick.", qName, i, ansName)
@@ -599,3 +610,4 @@ func CacheUpdateOrder(key DNSCacheKey, msg *dns.Msg) {
 	}
 	largeBufPool.Put(bufp)
 }
+
