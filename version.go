@@ -1,11 +1,15 @@
 /*
 File:    version.go
-Version: 1.475.0
-Last Updated: 20-Sep-2026 16:06 CEST
+Version: 1.476.0
+Last Updated: 23-Sep-2026 11:24 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.476.0 - [SECURITY/FIX] Restored localAddr propagation natively across DoH and DoQ multiplexers.
+            Exclusively allows precise `port:` routing rules to execute dynamically against HTTP/QUIC 
+            payloads, eradicating arbitrary blind-spots where `w.LocalAddr()` previously omitted 
+            bound network port contexts dynamically.
   1.475.0 - [SECURITY/FIX] Passed `localPort` to `enforceSecurityGuards` dynamically
             so that the `clientRoute` extraction occurring later in the pipeline natively
             benefits from fully pre-parsed port boundaries.
@@ -19,26 +23,18 @@ Changes:
             logic utilized standard integer blocks capable of overflowing into out-of-bounds
             memory panics under maliciously malformed payload requests. Definitively replaced
             with hardened bitwise isolations seamlessly.
-          - [SECURITY/FIX] Eradicated a critical CNAME Rebinding evasion vector within 
-            `checkTargetNames`. Attackers previously bypassed Domain Policy interceptions 
-            by nesting deeply chained CNAME aliases containing invalid or malformed FQDN syntax 
-            which caused the evaluation walk to fault natively. The engine now sanitizes 
-            all nested recursive targets comprehensively before evaluation.
-          - [SECURITY/FIX] Resolved an upstream parsing anomaly where `enforceSecurityGuards`
-            failed to correctly apply string manipulation constraints prior to `AnalyzeDGA`
-            when evaluating edge-case sub-domain structures naturally triggering
-            out-of-bounds pointer panic organically.
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.475.0"
+	BuildVersion string = "v1.476.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "20-Sep-2026 16:06 CEST"
+	BuildTime string = "23-Sep-2026 11:24 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "534"
+	BuildNumber string = "535"
 )
+

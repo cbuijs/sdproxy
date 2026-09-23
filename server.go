@@ -1,7 +1,7 @@
 /*
 File:    server.go
-Version: 1.41.0 (Split)
-Last Updated: 29-Aug-2026 10:39 CEST
+Version: 1.42.0 (Split)
+Last Updated: 23-Sep-2026 11:24 CEST
 
 Description: 
   DNS Request handlers and response writers for TCP, DoT, DoH, and DoQ.
@@ -9,6 +9,10 @@ Description:
   file purely focused on translating transport protocols into ProcessDNS payloads.
 
 Changes:
+  1.42.0  - [SECURITY/FIX] Restored `localAddr` propagation natively across DoH and DoQ 
+            multiplexers. Exclusively allows precise `port:` routing rules to execute 
+            dynamically against HTTP/QUIC payloads, eradicating arbitrary blind-spots 
+            where `LocalAddr()` previously omitted bound network port contexts dynamically.
   1.41.0  - [SECURITY/FIX] Completely eradicated buffer exhaustion crashes natively 
             within `dohResponseWriter` and `doqResponseWriter`. Upgraded payload packing 
             to strictly utilize `largeBufPool` (64KB) instead of `smallBufPool` (4KB). 
@@ -355,7 +359,7 @@ func isDoHMediaType(v string) bool {
 
 func handleTCP(w dns.ResponseWriter, r *dns.Msg) {
 	// [SECURITY 1.36.0] Type-agnostic extraction; a failed assertion no longer
-	// degrades the client into an unidentifiable (and formerly unpoliced) origin.
+	// silently degrades the peer into an unidentifiable (and formerly unpoliced) origin.
 	ip := remoteIPFromAddr(w.RemoteAddr())
 	ProcessDNS(w, r, ip, "TCP", "", "")
 }
@@ -541,11 +545,13 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 
 	host := dohRemoteHost(r)
 
-	var localIP net.IP
+	// [SECURITY/FIX 1.42.0] Restored localAddr propagation natively across DoH and DoQ multiplexers.
+	// Exclusively allows precise `port:` routing rules to execute dynamically against HTTP/QUIC 
+	// payloads, eradicating arbitrary blind-spots where `LocalAddr()` previously omitted 
+	// bound network port contexts dynamically.
+	var localAddr net.Addr
 	if la, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr); ok {
-		if localHost, _, err := net.SplitHostPort(la.String()); err == nil {
-			localIP = net.ParseIP(localHost)
-		}
+		localAddr = la
 	}
 
 	proto := "DoH"
@@ -562,7 +568,7 @@ func handleDoH(w http.ResponseWriter, r *http.Request) {
 	}
 	path := r.URL.Path
 
-	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host, localIP: localIP}, msg, host, proto, sni, path)
+	ProcessDNS(&dohResponseWriter{w: w, remoteIP: host, localAddr: localAddr}, msg, host, proto, sni, path)
 }
 
 func handleDoQConnection(conn *quic.Conn) {
@@ -570,10 +576,7 @@ func handleDoQConnection(conn *quic.Conn) {
 	// returned a port-bearing string that could not be parsed downstream.
 	host := remoteIPFromAddr(conn.RemoteAddr())
 
-	var localIP net.IP
-	if localHost, _, err := net.SplitHostPort(conn.LocalAddr().String()); err == nil {
-		localIP = net.ParseIP(localHost)
-	}
+	localAddr := conn.LocalAddr()
 	
 	var sni string
 	cs := conn.ConnectionState()
@@ -650,7 +653,7 @@ func handleDoQConnection(conn *quic.Conn) {
 				PenalizeClient(host, parsedAddr, -1) 
 				return
 			}
-			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host, localIP: localIP}, msg, host, proto, sni, "")
+			ProcessDNS(&doqResponseWriter{stream: s, remoteIP: host, localAddr: localAddr}, msg, host, proto, sni, "")
 		}(stream)
 	}
 }
@@ -668,9 +671,9 @@ func buildAltSvc(addr string) string {
 // --- Response Writer Adapters ---
 
 type dohResponseWriter struct {
-	w        http.ResponseWriter
-	remoteIP string
-	localIP  net.IP
+	w         http.ResponseWriter
+	remoteIP  string
+	localAddr net.Addr
 }
 
 func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -686,12 +689,7 @@ func (dw *dohResponseWriter) WriteMsg(msg *dns.Msg) error {
 	return err
 }
 
-func (dw *dohResponseWriter) LocalAddr() net.Addr {
-	if dw.localIP == nil {
-		return nil
-	}
-	return &net.IPAddr{IP: dw.localIP}
-}
+func (dw *dohResponseWriter) LocalAddr() net.Addr { return dw.localAddr }
 func (dw *dohResponseWriter) RemoteAddr() net.Addr        { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
 func (dw *dohResponseWriter) Write(b []byte) (int, error) { return dw.w.Write(b) }
 func (dw *dohResponseWriter) Close() error                { return nil }
@@ -700,9 +698,9 @@ func (dw *dohResponseWriter) TsigTimersOnly(bool)         {}
 func (dw *dohResponseWriter) Hijack()                     {}
 
 type doqResponseWriter struct {
-	stream   *quic.Stream 
-	remoteIP string
-	localIP  net.IP
+	stream    *quic.Stream 
+	remoteIP  string
+	localAddr net.Addr
 }
 
 func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
@@ -723,7 +721,7 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	// That is not a dropped answer, it is a DESYNCHRONISED STREAM. The peer
 	// reads the announced number of octets, treats the remainder as the start
 	// of the next framed message, and every subsequent exchange on that stream
-	// is parsed from the wrong offset. On a shared QUIC connection this is
+	// is read from the wrong offset. On a shared QUIC connection this is
 	// indistinguishable from an on-path attacker splicing responses, and a
 	// crafted oversized answer is the kind of thing a hostile upstream can
 	// deliberately arrange for us to relay.
@@ -777,12 +775,7 @@ func (dw *doqResponseWriter) WriteMsg(msg *dns.Msg) error {
 	return err
 }
 
-func (dw *doqResponseWriter) LocalAddr() net.Addr {
-	if dw.localIP == nil {
-		return nil
-	}
-	return &net.IPAddr{IP: dw.localIP}
-}
+func (dw *doqResponseWriter) LocalAddr() net.Addr { return dw.localAddr }
 func (dw *doqResponseWriter) RemoteAddr() net.Addr        { return &net.IPAddr{IP: net.ParseIP(dw.remoteIP)} }
 func (dw *doqResponseWriter) Write(b []byte) (int, error) { return dw.stream.Write(b) }
 func (dw *doqResponseWriter) Close() error                { return dw.stream.Close() }
