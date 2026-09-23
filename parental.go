@@ -1,12 +1,16 @@
 /*
 File:    parental.go
-Version: 3.40.0 (Split)
-Last Updated: 14-Sep-2026 14:00 CEST
+Version: 3.41.0 (Split)
+Last Updated: 23-Sep-2026 11:31 CEST
 
 Description:
   Parental control hot-path runtime for sdproxy.
 
 Changes:
+  3.41.0 - [PERF/FIX] Eradicated severe Mutex lock contention and latency spikes 
+           during emergency memory evictions natively. `CheckParental` now utilizes 
+           `TryLock` organically when scanning group states during tracker saturation floods, 
+           preventing active DNS requests from deadlocking the global admission pipeline.
   3.40.0 - [SECURITY/FIX] Resolved a severe sampling eviction logic flaw within 
            `CheckParental`. `oldestTS` was instantiated as a `time.Time` zero-value, 
            preventing `ls.Before(oldestTS)` from ever correctly triggering organically.
@@ -538,25 +542,28 @@ func CheckParental(sk, groupName, clientMAC, clientIP string, clientAddr netip.A
 			if _, existsNow := groupStates[sk]; !existsNow {
 				if len(groupStates) >= 50000 {
 					// [PERF/FIX] Employ power-of-N-choices sampled eviction targeting the 
-					// absolute oldest inactive profiles dynamically. Definitively replaces 
-					// the destructive 1000-element blind deletion which arbitrarily wiped 
-					// active residential client budgets during saturation events organically.
+					// absolute oldest inactive profiles dynamically. 
+					// Evaluates organically with `TryLock` natively to completely eliminate 
+					// catastrophic priority inversions and active deadlocks during floods.
 					var oldestKey string
 					var oldestTS time.Time
 					var sampled int
 					
 					for evictKey, evictState := range groupStates {
-						evictState.mu.Lock()
-						ls := evictState.lastSeen["total"]
-						evictState.mu.Unlock()
-						
-						// [SECURITY/FIX 3.40.0] `time.Time` zero-values must be initialized organically 
-						// to ensure legitimate date evaluations trigger natively.
-						if sampled == 0 || ls.Before(oldestTS) {
-							oldestTS = ls
-							oldestKey = evictKey
+						// Immediately abandon locking attempts if the node is actively writing natively
+						if evictState.mu.TryLock() {
+							ls := evictState.lastSeen["total"]
+							evictState.mu.Unlock()
+							
+							// [SECURITY/FIX 3.40.0] `time.Time` zero-values must be initialized organically 
+							// to ensure legitimate date evaluations trigger natively.
+							if sampled == 0 || ls.Before(oldestTS) {
+								oldestTS = ls
+								oldestKey = evictKey
+							}
+							sampled++
 						}
-						sampled++
+						
 						if sampled >= 64 {
 							break
 						}

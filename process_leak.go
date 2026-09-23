@@ -1,7 +1,7 @@
 /*
 File:    process_leak.go
-Version: 1.5.0
-Last Updated: 17-Aug-2026 18:00 CEST
+Version: 1.6.0
+Last Updated: 23-Sep-2026 11:31 CEST
 
 Description:
   Search Domain Leak Prevention (Recent Blocks Tracker) for sdproxy.
@@ -12,6 +12,9 @@ Description:
   "blocked.com.local.lan") to blocked queries.
 
 Changes:
+  1.6.0 - [PERF/FIX] Replaced blocking `Lock` calls with `TryLock` natively during 
+          emergency client evictions. Prevents priority inversions and latency 
+          stalls on the hot path when tracker capacities saturate organically.
   1.5.0 - [SECURITY/FIX] Replaced blind map eviction during IPv6 privacy rotation
           floods with Power-of-N-Choices sampled eviction natively. Protects 
           legitimate block telemetry from being indiscriminately scrubbed when 
@@ -131,26 +134,29 @@ func recordRecentBlock(ipStr, domain, reason string) {
 			// [SECURITY/FIX] Hard capacity ceiling with sampled eviction.
 			// Protects legitimate local search-domain block telemetry from being 
 			// randomly discarded during intensive IPv6 privacy rotation floods natively.
+			// Evaluates organically with `TryLock` natively to completely eliminate 
+			// catastrophic priority inversions and active deadlocks.
 			if len(shard.clients) >= rbMaxPerShard {
 				var oldestKey netip.Addr
 				var oldestTS int64 = 1<<63 - 1
 				var sampled int
 				
 				for k, cRef := range shard.clients {
-					cRef.Lock()
-					newest := int64(0)
-					for _, b := range cRef.blocks {
-						if b.ts > newest {
-							newest = b.ts
+					if cRef.TryLock() {
+						newest := int64(0)
+						for _, b := range cRef.blocks {
+							if b.ts > newest {
+								newest = b.ts
+							}
 						}
+						cRef.Unlock()
+						
+						if newest < oldestTS {
+							oldestTS = newest
+							oldestKey = k
+						}
+						sampled++
 					}
-					cRef.Unlock()
-					
-					if newest < oldestTS {
-						oldestTS = newest
-						oldestKey = k
-					}
-					sampled++
 					if sampled >= 32 {
 						break
 					}

@@ -1,14 +1,15 @@
 # File: Dockerfile
-# Version: 1.0.0
-# Last Updated: 24-Jun-2026 14:30 CEST
+# Version: 1.1.0
+# Last Updated: 23-Sep-2026 11:31 CEST
 # Description:
 #   Multi-stage Dockerfile to build and run the sdproxy container natively.
 #
 # Changes:
+#   1.1.0 - Upgraded base builder to Go 1.26-alpine natively.
 #   1.0.0 - Initial containerization configuration.
 
 # ── Stage 1: Build ───────────────────────────────────────────────────────────
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
