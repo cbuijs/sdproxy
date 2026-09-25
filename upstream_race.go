@@ -1,13 +1,16 @@
 /*
 File:    upstream_race.go
-Version: 2.53.0
-Last Updated: 14-Sep-2026 13:34 CEST
+Version: 2.53.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Advanced routing and parallel execution strategies for sdproxy upstream groups.
   Abstracts away `stagger`, `round-robin`, `random`, `fastest`, and `secure` strategies.
 
 Changes:
+  2.53.1 - [FIX] Addressed an undeclared `responseContainsNullIP` evaluation fallback
+           natively within `evaluateResult` that was missed during the global 
+           pruning sequence organically. Completely eradicated the legacy reference.
   2.53.0 - [FIX] Inlined `responseContainsNullIP` evaluation natively within `evaluateResult`
            to resolve compilation failures following the global pruning of the
            `transform.go` helper.
@@ -1169,4 +1172,3 @@ func equalRRs(a, b dns.RR) bool {
 		return as[len(ah):] == bs[len(bh):]
 	}
 }
-

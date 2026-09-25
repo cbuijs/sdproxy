@@ -1,7 +1,7 @@
 /*
 File:    init_routing.go
-Version: 1.7.0
-Updated: 04-Sep-2026 08:20 CEST
+Version: 1.7.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Parses and maps client-based and domain-based routing rules for sdproxy.
@@ -9,6 +9,9 @@ Description:
   highly optimized lookup tables used by the routing engine.
 
 Changes:
+  1.7.1 - [FIX] Removed duplicate `compoundRouteMap`, `compoundRouteMappings`, and `portRoutes`
+          definitions that collided with the global declarations in `globals.go`, preventing 
+          compilation failures.
   1.7.0 - [FEAT] Added initialization bindings for the newly supported `port:` identifier natively.
           Added processing logic to handle the `ForceAnd` boolean and compile keys natively.
   1.6.0 - [FEAT] Implemented `BypassGlobal` state translation for client identity routes.
@@ -32,15 +35,6 @@ import (
 
 	"github.com/miekg/dns"
 )
-
-type compoundRouteMap struct {
-	keys []string
-	route ParsedRoute
-}
-
-var compoundRouteMappings []compoundRouteMap
-var portRoutes map[string]ParsedRoute
-var hasPortRoutes bool
 
 // initClientRoutes parses the `routes:` and `routes_files:` configurations and populates
 // the global mapping tables for MAC, IP, CIDR, ASN, Country, SNI, Path, Port and Client-Name routing.

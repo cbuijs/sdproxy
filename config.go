@@ -1,7 +1,7 @@
 /*
 File:    config.go
-Version: 1.74.0
-Last Updated: 20-Sep-2026 16:06 CEST
+Version: 1.74.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   All YAML-mapped configuration structs for sdproxy. Covers every top-level
@@ -10,6 +10,8 @@ Description:
   and spoofed records (RRs).
 
 Changes:
+  1.74.1 - [FIX] Restored proper initialization of `cfg.Groups` to prevent nil 
+           map assignment panics when configuring router profiles organically.
   1.74.0 - [SECURITY/FIX] Adjusted `CategoryConfig` unmarshaling to prevent
            a potential YAML parsing panic. Added missing map initialization
            guard within `validateConfig`.

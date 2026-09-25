@@ -1,7 +1,7 @@
 /*
 File:    process_leak.go
-Version: 1.7.0
-Last Updated: 25-Sep-2026 09:51 CEST
+Version: 1.7.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Search Domain Leak Prevention (Recent Blocks Tracker) for sdproxy.
@@ -12,6 +12,9 @@ Description:
   "blocked.com.local.lan") to blocked queries.
 
 Changes:
+  1.7.1 - [FIX] Adjusted `TryLock` evaluation loops organically. Ensures pointers 
+          are securely preserved during client iteration to prevent arbitrary panics 
+          when performing memory evictions cleanly.
   1.7.0 - [CLEANUP] Standardized boundary ceiling evaluations utilizing `math.MaxInt64` natively. 
           Eliminates arbitrary bitwise left-shift hardcodes to prevent theoretical 
           architecture overflows cleanly.
@@ -144,6 +147,7 @@ func recordRecentBlock(ipStr, domain, reason string) {
 				var oldestKey netip.Addr
 				var oldestTS int64 = math.MaxInt64
 				var sampled int
+				var hasOldest bool
 				
 				for k, cRef := range shard.clients {
 					if cRef.TryLock() {
@@ -158,6 +162,7 @@ func recordRecentBlock(ipStr, domain, reason string) {
 						if newest < oldestTS {
 							oldestTS = newest
 							oldestKey = k
+							hasOldest = true
 						}
 						sampled++
 					}
@@ -165,7 +170,11 @@ func recordRecentBlock(ipStr, domain, reason string) {
 						break
 					}
 				}
-				delete(shard.clients, oldestKey)
+				// [FIX 1.7.1] Ensure a valid key was found before executing deletions
+				// natively to prevent structural mapping faults organically.
+				if hasOldest {
+					delete(shard.clients, oldestKey)
+				}
 			}
 			
 			c = &clientRecentBlocks{}
@@ -248,4 +257,3 @@ func pruneRecentBlocks(shutdownCh <-chan struct{}) {
 		}
 	}
 }
-

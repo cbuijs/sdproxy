@@ -1,7 +1,7 @@
 /*
 File:    process_upstream.go
-Version: 1.4.0
-Last Updated: 14-Sep-2026 13:24 CEST
+Version: 1.4.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Upstream exchange stage for the sdproxy resolution pipeline — the cache-miss
@@ -17,6 +17,9 @@ Description:
   did not — this is the single live implementation, reached from ProcessDNS.
 
 Changes:
+  1.4.1 - [FIX] Addressed an undeclared `responseContainsNullIP` evaluation fallback
+          natively within `serveFromUpstream` that was missed during the global 
+          pruning sequence organically. Completely eradicated the legacy reference.
   1.4.0 - [PERF] Inlined `responseContainsNullIP` evaluation natively within `serveFromUpstream`.
           Eradicates the external function call overhead on the cache-miss hot path organically.
   1.3.0 - [CLEANUP] Synchronized `filterRebinding` call natively with the newly 

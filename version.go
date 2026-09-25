@@ -1,11 +1,17 @@
 /*
 File:    version.go
-Version: 1.483.0
+Version: 1.484.0
 Last Updated: 25-Sep-2026 12:00 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.484.0 - [FIX] Restored proper initialization of `cfg.Groups` to prevent nil 
+            map assignment panics when configuring router profiles organically.
+          - [FIX] Re-added missing map declarations (`compoundRouteMap`, `compoundRouteMappings`)
+            in `globals.go` to solve build failures when processing Compound Routes natively.
+          - [FIX] Pruned dead code related to `responseContainsNullIP` natively across the pipeline, 
+            which was causing undeclared reference errors.
   1.483.0 - [SECURITY/FIX] Hardened Exfiltration micro-burst telemetry natively to enforce strict strike accrual rate-limits. Prevents instantaneous blackhole bans from isolated micro-burst anomalies.
           - [SECURITY/FIX] Re-aligned DoQ 0-RTT anomaly fallback logic to definitively latch `doqNo0RTT` organically. Ensures absolute compliance with RFC 9250 §10.5 DOQ_PROTOCOL_ERROR handling.
           - [COMPLIANCE] Referenced digest.txt verbatim to assure analytical parity across core engine constraints natively.
@@ -49,12 +55,11 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.483.0"
+	BuildVersion string = "v1.484.0"
 
 	// BuildTime records the date and time the binary was compiled.
 	BuildTime string = "25-Sep-2026 12:00 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "542"
+	BuildNumber string = "543"
 )
-

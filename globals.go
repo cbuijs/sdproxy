@@ -1,12 +1,14 @@
 /*
 File:    globals.go
-Version: 1.34.0
-Last Updated: 04-Sep-2026 08:20 CEST
+Version: 1.34.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   All package-level variables and feature-presence flags for sdproxy.
 
 Changes:
+  1.34.1 - [FIX] Defined `compoundRouteMappings` correctly in globals.go to prevent
+           build failures caused by undeclared variables in the routing logic.
   1.34.0 - [FEAT] Added `portRoutes` mapping arrays globally to enforce 
            new `port:` listener bounds constraints natively.
   1.33.0 - [REFACTOR] Adopted `untriggerLogTimers` from the deleted 
@@ -82,6 +84,12 @@ type macWildRoute struct {
 	route   ParsedRoute
 }
 
+// [FIX 1.34.1] Added definition for compoundRouteMap to support ForceAnd routing
+type compoundRouteMap struct {
+	keys  []string
+	route ParsedRoute
+}
+
 var (
 	// Address-based routing
 	macRoutes     map[string]ParsedRoute
@@ -95,6 +103,10 @@ var (
 	clientNameRoutes map[string]ParsedRoute
 	sniRoutes        map[string]ParsedRoute
 	pathRoutes       map[string]ParsedRoute
+	portRoutes       map[string]ParsedRoute
+
+	// [FIX 1.34.1] Added compoundRouteMappings definition
+	compoundRouteMappings []compoundRouteMap
 
 	domainRoutes map[string]domainRouteEntry
 
@@ -202,6 +214,7 @@ var (
 	hasClientNameRoutes bool
 	hasSNIRoutes        bool
 	hasPathRoutes       bool
+	hasPortRoutes       bool // [FIX 1.34.1] Added to track presence of port rules
 
 	hasDomainRoutes       bool
 	hasRtypePolicy        bool
