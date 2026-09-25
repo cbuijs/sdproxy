@@ -1,6 +1,6 @@
 // File: process_local.go
-// Version: 1.11.0
-// Last Updated: 14-Sep-2026 14:00 CEST
+// Version: 1.11.1
+// Last Updated: 25-Sep-2026 14:41 CEST
 //
 // Description:
 //   Intercepts queries for locally known hosts or DHCP leases and "spoofs"
@@ -8,6 +8,10 @@
 //   Extracted from process.go to improve modularity.
 //
 // Changes:
+//   1.11.1 - [SECURITY/FIX] Prevented `handleLocalIdentity` from erroneously hijacking 
+//            unsupported queries (e.g. HTTPS, SRV) with a `NODATA` response when an active 
+//            `spoofedAlias` (CNAME override) is present. Queries targeting a spoofed CNAME 
+//            must fall through the pipeline to allow the target alias to resolve upstream organically.
 //   1.11.0 - [LOGGING/FIX] Included `matchInfo` within `NODATA` responses when localized
 //            hostnames mismatch query targets dynamically natively.
 //   1.10.0 - [PERF] Inlined `responseContainsNullIP` evaluation natively within `handleLocalIdentity`.
@@ -138,6 +142,13 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 				return true
 			}
 			
+			// [SECURITY/FIX 1.11.1] Do not sinkhole unsupported query types against local identities 
+			// if the target domain was explicitly overridden via a global CNAME alias. The alias 
+			// MUST fall through to upstream resolvers.
+			if spoofedAlias != "" {
+				return false
+			}
+
 			// [SECURITY/FIX] LAN Privacy Leakage Protection
 			// The requested localized domain definitely exists within our internal routing 
 			// boundaries (e.g., Hosts file, DHCP), but it lacks the exact IP family being 
@@ -202,6 +213,12 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 		}
 
 	default:
+		// [SECURITY/FIX 1.11.1] Bypass LAN Privacy isolation specifically when a global 
+		// CNAME alias override is actively routing the domain.
+		if spoofedAlias != "" {
+			return false
+		}
+
 		// [SECURITY/FIX] LAN Privacy Leakage Protection
 		// If the name exists in our local identity maps, but the query type is not A/AAAA/PTR (e.g., HTTPS, TXT, SRV),
 		// we MUST intercept it and return NODATA. Do not leak internal local hostnames to public upstreams!
@@ -240,4 +257,3 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 	}
 	return false
 }
-

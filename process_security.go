@@ -1,7 +1,7 @@
 /*
 File:    process_security.go
-Version: 1.22.0
-Last Updated: 25-Sep-2026 12:00 CEST
+Version: 1.22.1
+Last Updated: 25-Sep-2026 14:41 CEST
 
 Description:
   Pre-routing Security & Admission Guards for sdproxy.
@@ -20,6 +20,9 @@ Description:
   Extracted from process.go to improve modularity and execution clarity.
 
 Changes:
+  1.22.1 - [SECURITY/FIX] Stabilized DGA Machine Learning floating-point boundary threshold evaluations.
+           Introduced epsilon comparison (`1e-9`) natively to prevent edge-case 
+           evasion vectors stemming from imprecise probability rounding outputs organically.
   1.22.0 - [SECURITY/FIX] Addressed an issue utilizing `sync.Map` in `webuiClientBlocks` natively
            by executing map iterations explicitly safely avoiding bounded OOM restrictions organically.
   1.21.0 - [FEAT] Added `localPort` parameter to `enforceSecurityGuards` to 
@@ -354,7 +357,10 @@ func enforceSecurityGuards(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNa
 		// alongside the stripped domainCore structure for extreme throughput optimization.
 		score := AnalyzeDGA(qNameTrimmed, domainCore)
 
-		if score >= cfg.Server.DGA.Threshold {
+		// [SECURITY/FIX 1.22.1] Implemented floating-point epsilon comparison bounds (1e-9).
+		// Ensures border-line threshold evaluations properly execute without randomly 
+		// failing due to IEEE 754 precision math rounding anomalies organically.
+		if score >= (cfg.Server.DGA.Threshold - 1e-9) {
 			reason := fmt.Sprintf("DGA Detected (Score: %.1f)", score)
 			actionStr := strings.ToUpper(cfg.Server.DGA.Action)
 

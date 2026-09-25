@@ -1,7 +1,7 @@
 /*
 File:    exfiltration.go
-Version: 1.23.0
-Last Updated: 25-Sep-2026 12:00 CEST
+Version: 1.23.1
+Last Updated: 25-Sep-2026 14:41 CEST
 Description:
   Volumetric baseline profiling for DNS tunneling and covert exfiltration detection.
   Implements a high-performance, sharded, lock-free Exponential Moving Average (EMA) 
@@ -11,6 +11,10 @@ Description:
   clients transmitting anomalous data volumes over port 53.
 
 Changes:
+  1.23.1 - [SECURITY/FIX] Hardened Micro-Burst projection logic. Dynamically scaled 
+           the multiplier constraint relative to the evaluated time window to prevent 
+           mathematical singularities from falsely identifying valid OS-level concurrent 
+           queries resolving within 1ms boundaries as gigabit exfiltration events natively.
   1.23.0 - [SECURITY/FIX] Hardened Micro-Burst Time Starvation vulnerability organically. 
            Introduced `lastStrike` atomic evaluation boundary natively to strictly rate-limit 
            strike accrual. Prevents single micro-bursts from compounding anomalies within 
@@ -382,8 +386,19 @@ func AnalyzeExfiltration(addr netip.Addr, reqSize int) (allowed bool, isBanned b
 				// baseline for this single evaluation.
 				evalBaseline = threshold
 			}
+
+			// [SECURITY/FIX 1.23.1] Dynamically scale the multiplier penalty based on the evaluation window natively.
+			// A 1ms evaluation window projecting 32MB/s is severely less statistically concrete 
+			// than a 950ms window projecting the same speed. Adjusting the stringency protects 
+			// bursty legitimate traffic from invoking instant bans.
+			effectiveMultiplier := multiplier
+			if deltaSecs < 0.25 {
+				effectiveMultiplier *= 2.0 // Demand double the severity for micro-slices
+			} else if deltaSecs < 0.5 {
+				effectiveMultiplier *= 1.5
+			}
 			
-			if currentBPS > threshold && currentBPS > (evalBaseline*multiplier) {
+			if currentBPS > threshold && currentBPS > (evalBaseline*effectiveMultiplier) {
 				anomalous = true
 			}
 		}
@@ -486,4 +501,3 @@ func runExfilSweeper() {
 		}
 	}
 }
-

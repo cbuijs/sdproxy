@@ -2,13 +2,14 @@
 
 /*
 File: arp.go
-Version: 1.19.0
-Last Updated: 14-Sep-2026 12:59 CEST
+Version: 1.19.1
+Last Updated: 25-Sep-2026 14:41 CEST
 Description: Linux-only ARP table reader for IP->MAC resolution.
              Reads /proc/net/arp directly — no subprocess, no iproute2 dependency.
              Full fresh-map rebuild per cycle auto-evicts stale entries.
 
 Changes:
+  1.19.1 - [PERF] Minor FD lifecycle optimization in pollARP error path.
   1.19.0 - [PERF] Extracted `zeroMAC` byte array allocation to the package level. 
            Eradicates dynamic heap allocations inside the hot-path `pollARP` scanning loop natively.
   1.18.0 - [SECURITY/FIX] Eradicated a persistent zombie goroutine organically.
@@ -128,6 +129,7 @@ func pollARP() {
 	// If the kernel buffer starves or truncates the read, we MUST abort the cycle entirely 
 	// rather than flushing the active routing maps with partial, corrupted data.
 	if err := scanner.Err(); err != nil {
+		file.Close() // Explicitly release FD immediately upon stream error
 		if logSystem {
 			log.Printf("[ARP] Warning: error reading /proc/net/arp stream: %v. Aborting map refresh natively.", err)
 		}
@@ -138,4 +140,3 @@ func pollARP() {
 	// then instantly see the new one. No partial state possible.
 	arpSnap.Store(&fresh)
 }
-
