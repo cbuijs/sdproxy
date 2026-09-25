@@ -1,7 +1,7 @@
 /*
 File:    exfiltration.go
-Version: 1.22.0
-Last Updated: 25-Sep-2026 10:54 CEST
+Version: 1.23.0
+Last Updated: 25-Sep-2026 12:00 CEST
 Description:
   Volumetric baseline profiling for DNS tunneling and covert exfiltration detection.
   Implements a high-performance, sharded, lock-free Exponential Moving Average (EMA) 
@@ -11,6 +11,10 @@ Description:
   clients transmitting anomalous data volumes over port 53.
 
 Changes:
+  1.23.0 - [SECURITY/FIX] Hardened Micro-Burst Time Starvation vulnerability organically. 
+           Introduced `lastStrike` atomic evaluation boundary natively to strictly rate-limit 
+           strike accrual. Prevents single micro-bursts from compounding anomalies within 
+           the same 1-second interval and instantly blackholing legitimate endpoints.
   1.22.0 - [SECURITY/FIX] Eradicated a critical Micro-Burst Time Starvation vulnerability.
            Removed premature `recentBytes` and `lastUpdate` resets inside the instantaneous 
            micro-burst anomaly block. Previously, an attacker sustaining rapid micro-bursts 
@@ -58,6 +62,7 @@ type exfilBucket struct {
 	recentBytes int     // Accumulator for bytes transferred in the current evaluation tick
 	lastUpdate  int64   // Unix nanoseconds of the last EMA recalculation
 	lastLog     int64   // Unix nanoseconds to debounce duplicate logs
+	lastStrike  int64   // Unix nanoseconds to rigidly rate-limit strike accruals
 	strikes     int     // Consecutive penalty infractions
 	bannedUntil int64   // Expiration of the Penalty Box sentence
 }
@@ -380,10 +385,6 @@ func AnalyzeExfiltration(addr netip.Addr, reqSize int) (allowed bool, isBanned b
 			
 			if currentBPS > threshold && currentBPS > (evalBaseline*multiplier) {
 				anomalous = true
-				// [SECURITY/FIX 1.22.0] Eradicated Micro-Burst Time Starvation vector.
-				// Do NOT reset `recentBytes` or `lastUpdate` here. Resetting them prematurely 
-				// blinded the 1-second long-term EMA baseline updates if an attacker constantly 
-				// micro-bursts data under the 1-second interval boundary natively.
 			}
 		}
 	}
@@ -392,7 +393,17 @@ func AnalyzeExfiltration(addr netip.Addr, reqSize int) (allowed bool, isBanned b
 	// 5. Strike Enforcement & Blackholing
 	// -----------------------------------------------------------------------
 	if anomalous {
-		b.strikes++
+		// [SECURITY/FIX] Actively rate-limit strike accruals to once per second natively.
+		// Prevents instantaneous Micro-Bursts from racking up multiple consecutive strikes 
+		// within the same millisecond and instantly bypassing strike thresholds to invoke a ban.
+		if now-b.lastStrike >= 1e9 {
+			b.strikes++
+			b.lastStrike = now
+		} else {
+			// Actively deny the packet without compounding strikes in the same interval natively
+			return false, false, currentBPS
+		}
+
 		if cfg.Server.Exfiltration.PenaltyBox.Enabled && b.strikes >= cfg.Server.Exfiltration.PenaltyBox.StrikeThreshold {
 			banMins := cfg.Server.Exfiltration.PenaltyBox.BanDurationMin
 			if banMins <= 0 {

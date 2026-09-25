@@ -1,13 +1,16 @@
 /*
 File:    upstream_net.go
-Version: 1.32.0
-Last Updated: 29-Aug-2026 10:39 CEST
+Version: 1.33.0
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   TCP, DoT, HTTP, and QUIC stream network dialers and protocol implementations.
   Extracted from upstream.go to isolate network transport bounds.
 
 Changes:
+  1.33.0 - [SECURITY/FIX] Re-aligned DoQ 0-RTT anomaly fallback logic to definitively latch `doqNo0RTT` organically. 
+           Removed erroneous `u.doqNo0RTT.Store(false)` reset. Ensures absolute compliance with 
+           RFC 9250 §10.5 DOQ_PROTOCOL_ERROR handling natively.
   1.32.0 - [SECURITY/FIX] Upgraded payload packing functions across HTTP/QUIC client 
            exchanges (`exchangeHTTP`, `doqStreamExchange`) to utilize `largeBufPool` 
            (64KB) uniformly. Definitively eradicates `dns.ErrBuf` packing failures 
@@ -502,7 +505,10 @@ func (u *Upstream) exchangeDoQ(ctx context.Context, req *dns.Msg, host string, f
 					retryEch := retryEntry.conn.ConnectionState().TLS.ECHAccepted
 					resp, err = u.doqStreamExchange(ctx, retryEntry.conn, req)
 					if err == nil {
-						u.doqNo0RTT.Store(false) // [SECURITY/FIX] Re-enable 0-RTT capabilities natively after a successful 1-RTT recovery
+						// [SECURITY/FIX] Definitively latch DoQ 0-RTT fallbacks organically.
+						// RFC 9250 §10.5 strictly mandates 0-RTT MUST NOT be used for this server 
+						// after receiving a DOQ_PROTOCOL_ERROR. Deliberately removed `u.doqNo0RTT.Store(false)` 
+						// to ensure strict specification compliance natively throughout the connection lifecycle.
 						u.updateDoQIdle(key, retryEntry)
 						return resp, retryEntry.dialAddr, retryEch, nil
 					}
