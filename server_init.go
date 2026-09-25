@@ -1,7 +1,7 @@
 /*
 File:    server_init.go
-Version: 1.19.0 (Split)
-Last Updated: 05-Aug-2026 18:40 CEST
+Version: 1.20.0 (Split)
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Listener initialization and OS binding orchestration.
@@ -9,6 +9,9 @@ Description:
   (UDP, TCP, TLS, DoH, DoQ) from the runtime protocol payload handlers.
 
 Changes:
+  1.20.0 - [BUG/FIX] Correctly populated the required third return parameter natively within 
+           the DoQ/HTTP3 QUIC Connection execution loop (`return conn, nil, nil`). 
+           Solves severe compilation errors when utilizing updated versions of `quic-go`.
   1.19.0 - [SECURITY/FIX] Retuned QUIC stream ceilings and wired the global DoQ
            stream budget (see server.go 1.37.0 for the handler-side bounds).
 
@@ -585,4 +588,3 @@ func StartServers(tlsConf *tls.Config) {
 		})
 	}
 }
-

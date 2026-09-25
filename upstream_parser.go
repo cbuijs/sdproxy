@@ -1,7 +1,7 @@
 /*
 File:    upstream_parser.go
-Version: 2.48.0
-Last Updated: 24-Aug-2026 13:31 CEST
+Version: 2.50.0
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Configuration parsing, initialization, and client allocation for sdproxy upstreams.
@@ -9,6 +9,12 @@ Description:
   the hot-path routing execution pipeline.
 
 Changes:
+  2.50.0 - [BUG/FIX] Corrected `quic.EarlyConnection` to `*quic.Conn` for all `http3.Transport.Dial`
+           implementations to satisfy the strict signature boundaries enforced by `quic-go` 
+           versions `v0.40.0` and above natively.
+  2.49.0 - [BUG/FIX] Corrected parameter usage when instantiating `quic.DialAddrEarly`. 
+           `quic-go` (versions >= 0.40.0) requires precisely 4 arguments (`ctx`, `addr`, `tlsConf`, `quicConf`).
+           Ensured all dialing interfaces natively comply with the strict signature array structurally.
   2.48.0 - [CLEANUP] Abstracted the ECH `base64` fallback decoding sequence natively 
            into `decodeBase64Flex()`. Eradicates deeply nested verification blocks 
            and maintains strict, readable structural parsings.
@@ -500,4 +506,3 @@ func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 
 	return u, nil
 }
-

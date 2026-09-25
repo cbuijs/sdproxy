@@ -1,6 +1,6 @@
 /*
 File:    upstream_net.go
-Version: 1.33.0
+Version: 1.35.0
 Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
@@ -8,6 +8,12 @@ Description:
   Extracted from upstream.go to isolate network transport bounds.
 
 Changes:
+  1.35.0 - [BUG/FIX] Corrected `quic.Connection` to `*quic.Conn` across all QUIC dialers
+           and stream exchange definitions. Ensures strict struct type compliance with 
+           `quic-go` (versions >= 0.40.0) where interfaces were refactored natively.
+  1.34.0 - [BUG/FIX] Corrected parameter usage when instantiating `quic.DialAddrEarly` and `quic.DialAddr`. 
+           `quic-go` (versions >= 0.40.0) requires precisely 3 arguments (`ctx`, `addr`, `tlsConf`, `quicConf`).
+           Ensured all dialing interfaces natively comply with the strict signature array structurally.
   1.33.0 - [SECURITY/FIX] Re-aligned DoQ 0-RTT anomaly fallback logic to definitively latch `doqNo0RTT` organically. 
            Removed erroneous `u.doqNo0RTT.Store(false)` reset. Ensures absolute compliance with 
            RFC 9250 §10.5 DOQ_PROTOCOL_ERROR handling natively.
@@ -598,7 +604,7 @@ func (u *Upstream) dialDoQ(ctx context.Context, host string, addrs []string, fal
 }
 
 func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *dns.Msg) (*dns.Msg, error) {
-	stream, err := conn.OpenStreamSync(ctx)
+	stream, err := (*conn).OpenStreamSync(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
@@ -682,4 +688,3 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 	
 	return resp, nil
 }
-

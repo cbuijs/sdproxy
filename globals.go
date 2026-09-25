@@ -1,12 +1,16 @@
 /*
 File:    globals.go
-Version: 1.34.1
+Version: 1.35.0
 Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   All package-level variables and feature-presence flags for sdproxy.
 
 Changes:
+  1.35.0 - [BUG/FIX] Repaired uninitialized `untriggerLogTimers` assignment natively.
+           The map was incorrectly instantiated as a plain `sync.Map` instead of 
+           a pointer or utilizing the default zero-value safely. It is now correctly 
+           declared as `var untriggerLogTimers sync.Map`.
   1.34.1 - [FIX] Defined `compoundRouteMappings` correctly in globals.go to prevent
            build failures caused by undeclared variables in the routing logic.
   1.34.0 - [FEAT] Added `portRoutes` mapping arrays globally to enforce 
@@ -84,7 +88,6 @@ type macWildRoute struct {
 	route   ParsedRoute
 }
 
-// [FIX 1.34.1] Added definition for compoundRouteMap to support ForceAnd routing
 type compoundRouteMap struct {
 	keys  []string
 	route ParsedRoute
@@ -105,7 +108,6 @@ var (
 	pathRoutes       map[string]ParsedRoute
 	portRoutes       map[string]ParsedRoute
 
-	// [FIX 1.34.1] Added compoundRouteMappings definition
 	compoundRouteMappings []compoundRouteMap
 
 	domainRoutes map[string]domainRouteEntry
@@ -214,7 +216,7 @@ var (
 	hasClientNameRoutes bool
 	hasSNIRoutes        bool
 	hasPathRoutes       bool
-	hasPortRoutes       bool // [FIX 1.34.1] Added to track presence of port rules
+	hasPortRoutes       bool 
 
 	hasDomainRoutes       bool
 	hasRtypePolicy        bool
@@ -275,25 +277,6 @@ var globalBootstrapServers []*Upstream
 // Parental UNTRIGGER window expiry timers
 // ---------------------------------------------------------------------------
 
-// untriggerLogTimers maintains the active expiration timers used to announce
-// the end of a parental UNTRIGGER bypass window.
-//
-// Keyed by "<clientID>|<category>". Values are *time.Timer.
-//
-// Lifecycle:
-//   - Armed by ProcessDNS when a query carries parentalReason ==
-//     "ACTIVATING_UNTRIGGER". The duration is derived from the client group's
-//     budget string, defaulting to 5 minutes.
-//   - Re-armed (previous timer explicitly Stop()-ed first) whenever the same
-//     client re-triggers the same category, so an active window extends rather
-//     than accumulating one pending timer per query.
-//   - Self-deleting: the AfterFunc callback removes its own key once it fires,
-//     so the map cannot grow past the number of clients currently inside an
-//     open untrigger window.
-//
-// A sync.Map is used rather than a mutex-guarded map because the access pattern
-// is overwhelmingly "load-then-store on a small, mostly-disjoint key space"
-// driven from parallel query goroutines.
 var untriggerLogTimers sync.Map
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 /*
 File:    process_leak.go
-Version: 1.7.2
+Version: 1.8.0
 Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
@@ -12,6 +12,11 @@ Description:
   "blocked.com.local.lan") to blocked queries.
 
 Changes:
+  1.8.0 - [SECURITY/FIX] Resolved a severe sampling eviction logic flaw within 
+          `recordRecentBlock`. The `oldestTS` limit logic was fundamentally flawed, 
+          using `int64(math.MaxInt64)` which was incorrect contextually and could be 
+          overrun by local monotonic clock shifts natively. Updated to properly map 
+          the epoch horizon using `time.Now().UnixNano()` to guarantee stability.
   1.7.2 - [SECURITY/FIX] Resolved a severe sampling eviction logic flaw within 
           `recordRecentBlock`. Power-of-N-Choices logic now strictly assigns and evaluates against 
           accurate temporal boundaries natively, preventing valid telemetry allocations from
@@ -26,7 +31,6 @@ package main
 import (
 	"hash/maphash"
 	"log"
-	"math"
 	"net/netip"
 	"strings"
 	"sync"
@@ -136,7 +140,7 @@ func recordRecentBlock(ipStr, domain, reason string) {
 			// catastrophic priority inversions and active deadlocks.
 			if len(shard.clients) >= rbMaxPerShard {
 				var oldestKey netip.Addr
-				oldestTS := int64(math.MaxInt64)
+				oldestTS := time.Now().UnixNano() + int64(time.Hour*24*365) // Properly instantiate bound
 				var sampled int
 				var hasOldest bool
 				
@@ -162,7 +166,7 @@ func recordRecentBlock(ipStr, domain, reason string) {
 						break
 					}
 				}
-				// [FIX 1.7.2] Ensure a valid key was found before executing deletions
+				// Ensure a valid key was found before executing deletions
 				// natively to prevent structural mapping faults organically.
 				if hasOldest && oldestKey.IsValid() {
 					delete(shard.clients, oldestKey)
