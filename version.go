@@ -1,11 +1,16 @@
 /*
 File:    version.go
-Version: 1.481.0
-Last Updated: 25-Sep-2026 10:54 CEST
+Version: 1.482.0
+Last Updated: 25-Sep-2026 11:10 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.482.0 - [PERF] Optimized web UI logging retention sweeps. Replaced expensive 
+            `time.Parse` object instantiations with pure lexicographical string 
+            evaluations organically, completely eradicating heap-allocation spikes 
+            during asynchronous filesystem flushes natively. Referencing digest.txt 
+            for further analytical context.
   1.481.0 - [SECURITY/FIX] Hardened Exfiltration volumetric tracker natively to 
             prevent Micro-Burst Time Starvation attacks against the EMA baselines organically.
   1.480.0 - [SECURITY/FIX] Hardened the Web UI authentication gateway natively by unifying
@@ -41,12 +46,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.481.0"
+	BuildVersion string = "v1.482.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "25-Sep-2026 10:54 CEST"
+	BuildTime string = "25-Sep-2026 11:10 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "540"
+	BuildNumber string = "541"
 )
 

@@ -1,12 +1,16 @@
 /*
 File:    webui_logs.go
-Version: 2.1.0
-Updated: 18-Aug-2026 13:48 CEST
+Version: 2.2.0
+Last Updated: 25-Sep-2026 11:10 CEST
 
 Description:
   Live log streaming (SSE) and persistence for the sdproxy web UI.
 
 Changes:
+  2.2.0 - [PERF] Replaced expensive `time.Parse` invocations with O(1) 
+          lexicographical string boundary evaluations natively. Slashing 
+          thousands of Garbage Collection (GC) heap allocations during 
+          disk flushes and startup loading routines.
   2.1.0 - [PERF/FIX] Replaced legacy `json.Marshal` array loading with natively 
           streamed OS operations (`json.NewEncoder`). Eradicates localized heap 
           memory spikes completely when serializing historic log events iteratively.
@@ -106,13 +110,15 @@ func SaveLogs() {
 	}
 	WebUILogStreamer.mu.Unlock()
 
-	minTime := time.Now().Add(-time.Duration(retentionHours()) * time.Hour)
+	// [PERF] O(1) String-based lexicographical timestamp comparison natively.
+	// Bypasses 5000 `time.Parse` invocations organically, neutralizing GC thrashing 
+	// during asynchronous filesystem flushes.
+	minTimeStr := time.Now().Add(-time.Duration(retentionHours()) * time.Hour).Format("2006/01/02 15:04:05")
 	var filtered []string
 	for _, line := range out {
 		// Timestamp prefix is "2006/01/02 15:04:05" — 19 chars.
-		if len(line) > 19 {
-			t, err := time.Parse("2006/01/02 15:04:05", line[:19])
-			if err == nil && t.Before(minTime) {
+		if len(line) > 19 && line[4] == '/' && line[7] == '/' && line[19] == ' ' {
+			if line[:19] < minTimeStr {
 				continue
 			}
 		}
@@ -154,13 +160,13 @@ func LoadLogs() {
 		return
 	}
 
-	minTime := time.Now().Add(-time.Duration(retentionHours()) * time.Hour)
+	// [PERF] O(1) String-based lexicographical timestamp comparison natively.
+	minTimeStr := time.Now().Add(-time.Duration(retentionHours()) * time.Hour).Format("2006/01/02 15:04:05")
 	WebUILogStreamer.mu.Lock()
 
 	for _, line := range logs {
-		if len(line) > 19 {
-			t, err := time.Parse("2006/01/02 15:04:05", line[:19])
-			if err == nil && t.Before(minTime) {
+		if len(line) > 19 && line[4] == '/' && line[7] == '/' && line[19] == ' ' {
+			if line[:19] < minTimeStr {
 				continue
 			}
 		}
