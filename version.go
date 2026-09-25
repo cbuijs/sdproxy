@@ -1,11 +1,13 @@
 /*
 File:    version.go
-Version: 1.488.0
-Last Updated: 25-Sep-2026 14:31 CEST
+Version: 1.489.0
+Last Updated: 25-Sep-2026 15:10 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.489.0 - [SECURITY/FIX] Applied structural truncation bounds to synthetic cache insertions natively in `cache_rw.go`.
+            Definitively protects the memory arrays from storing malformed payload structures organically.
   1.488.0 - [PERF] Eradicated `fmt.Sprintf` heap allocations natively within `RcodeStr` inside `process_helpers.go`.
             Utilizes the zero-allocation `itoa64` numeric formatter to completely neutralize Garbage Collection (GC) 
             thrashing when parsing unknown/custom RCODE telemetry representations.
@@ -31,12 +33,11 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.488.0"
+	BuildVersion string = "v1.489.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "25-Sep-2026 14:31 CEST"
+	BuildTime string = "25-Sep-2026 15:10 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "547"
+	BuildNumber string = "548"
 )
-

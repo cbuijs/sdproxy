@@ -1,7 +1,7 @@
 /*
 File:    cache_rw.go
-Version: 1.9.0 (Split)
-Last Updated: 23-Sep-2026 12:45 CEST
+Version: 1.10.0 (Split)
+Last Updated: 25-Sep-2026 15:10 CEST
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
@@ -11,6 +11,9 @@ Description:
   Extracted from cache.go to prioritize hot-path execution clarity.
 
 Changes:
+  1.10.0 - [SECURITY/FIX] Enforced `TC=1` truncation guard inside `CacheSetSynth`.
+           Definitively protects the memory arrays from caching maliciously 
+           truncated synthetic payloads natively.
   1.9.0 - [SECURITY/FIX] Hardened `CacheSet` Authority Section (Ns) validations natively. 
           Prevented Cache Poisoning vectors by explicitly rejecting out-of-bailiwick 
           `NS`/`SOA` injections targeting Public Suffix boundaries (e.g., `com.`) organically.
@@ -553,6 +556,13 @@ func CacheSetSynth(key DNSCacheKey, msg *dns.Msg) {
 		return
 	}
 
+	// [SECURITY/FIX] Truncation guard for synthetic responses natively.
+	// Definitively protects the memory arrays from caching maliciously
+	// truncated synthetic payloads (TC=1) which trap clients in infinite retries.
+	if msg.Truncated {
+		return
+	}
+
 	now := time.Now().UnixNano()
 	expireNano := now + int64(syntheticTTL)*int64(time.Second)
 
@@ -610,4 +620,3 @@ func CacheUpdateOrder(key DNSCacheKey, msg *dns.Msg) {
 	}
 	largeBufPool.Put(bufp)
 }
-
