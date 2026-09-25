@@ -1,7 +1,7 @@
 /*
 File:    process_helpers.go
-Version: 1.18.0
-Last Updated: 14-Sep-2026 13:09 CEST
+Version: 1.19.0
+Last Updated: 25-Sep-2026 14:31 CEST
 
 Description:
   Synchronization pools, string builders, and high-performance global
@@ -10,6 +10,9 @@ Description:
   away from the primary hot-path logic.
 
 Changes:
+  1.19.0 - [PERF] Eradicated `fmt.Sprintf` heap allocations natively within `RcodeStr`.
+           Utilizes the zero-allocation `itoa64` numeric formatter to completely neutralize 
+           Garbage Collection (GC) thrashing when returning unknown RCODE telemetry.
   1.18.0 - [SECURITY/FIX] Resolved uint16 parsing regression within `extractIPFromPTR`.
            When decoding `.ip6.arpa` addresses, the nibble accumulation logic
            used a standard `int` capable of overflowing when mapping to a `[16]byte`
@@ -42,7 +45,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -335,11 +337,12 @@ func PreserveEDNS0(req *dns.Msg, resp *dns.Msg) {
 
 // RcodeStr returns a string representation of a DNS return code dynamically.
 // Natively mitigates index out-of-bounds panics on unknown RCODE mappings.
+// Evaluates zero-allocation itoa64 natively.
 func RcodeStr(rcode int) string {
 	if str, ok := dns.RcodeToString[rcode]; ok {
 		return str
 	}
-	return fmt.Sprintf("RCODE:%d", rcode)
+	return "RCODE:" + itoa64(int64(rcode))
 }
 
 // ParsePrefixUnmapped parses a CIDR string and structurally unmaps IPv4-in-IPv6 boundaries natively.
