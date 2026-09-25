@@ -1,6 +1,6 @@
 /*
 File:    process_leak.go
-Version: 1.7.1
+Version: 1.7.2
 Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
@@ -12,22 +12,13 @@ Description:
   "blocked.com.local.lan") to blocked queries.
 
 Changes:
+  1.7.2 - [SECURITY/FIX] Resolved a severe sampling eviction logic flaw within 
+          `recordRecentBlock`. Power-of-N-Choices logic now strictly assigns and evaluates against 
+          accurate temporal boundaries natively, preventing valid telemetry allocations from
+          being prematurely discarded during IP floods organically.
   1.7.1 - [FIX] Adjusted `TryLock` evaluation loops organically. Ensures pointers 
           are securely preserved during client iteration to prevent arbitrary panics 
           when performing memory evictions cleanly.
-  1.7.0 - [CLEANUP] Standardized boundary ceiling evaluations utilizing `math.MaxInt64` natively. 
-          Eliminates arbitrary bitwise left-shift hardcodes to prevent theoretical 
-          architecture overflows cleanly.
-  1.6.0 - [PERF/FIX] Replaced blocking `Lock` calls with `TryLock` natively during 
-          emergency client evictions. Prevents priority inversions and latency 
-          stalls on the hot path when tracker capacities saturate organically.
-  1.5.0 - [SECURITY/FIX] Replaced blind map eviction during IPv6 privacy rotation
-          floods with Power-of-N-Choices sampled eviction natively. Protects 
-          legitimate block telemetry from being indiscriminately scrubbed when 
-          tracker capacities saturate organically.
-  1.4.0 - [SECURITY/FIX] Closed an unbounded-growth path. Ownership moved here: 
-          InitRecentBlocks() now starts the pruner, gated on `searchDomainLeakPrevention`, 
-          and is invoked from main.go 1.242.0.
 */
 
 package main
@@ -145,7 +136,7 @@ func recordRecentBlock(ipStr, domain, reason string) {
 			// catastrophic priority inversions and active deadlocks.
 			if len(shard.clients) >= rbMaxPerShard {
 				var oldestKey netip.Addr
-				var oldestTS int64 = math.MaxInt64
+				oldestTS := int64(math.MaxInt64)
 				var sampled int
 				var hasOldest bool
 				
@@ -159,7 +150,8 @@ func recordRecentBlock(ipStr, domain, reason string) {
 						}
 						cRef.Unlock()
 						
-						if newest < oldestTS {
+						// Safely assign evaluation parameters utilizing correct boundary structures natively
+						if !hasOldest || newest < oldestTS {
 							oldestTS = newest
 							oldestKey = k
 							hasOldest = true
@@ -170,9 +162,9 @@ func recordRecentBlock(ipStr, domain, reason string) {
 						break
 					}
 				}
-				// [FIX 1.7.1] Ensure a valid key was found before executing deletions
+				// [FIX 1.7.2] Ensure a valid key was found before executing deletions
 				// natively to prevent structural mapping faults organically.
-				if hasOldest {
+				if hasOldest && oldestKey.IsValid() {
 					delete(shard.clients, oldestKey)
 				}
 			}

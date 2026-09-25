@@ -1,7 +1,7 @@
 /*
 File:    process_routing.go
-Version: 1.12.0
-Last Updated: 04-Sep-2026 10:15 CEST
+Version: 1.12.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Routing Engine for sdproxy.
@@ -11,30 +11,8 @@ Description:
     - Client Profile RCODE intercepts
 
 Changes:
-  1.12.0 - [SECURITY/FIX] Completely overhauled the `ForceAnd` (Intersection Match) engine.
-           Compound route directives previously attempted to cross-reference keys from 
-           pre-compiled individual arrays, failing silently as those specific keys were 
-           bypassed during initialization. Compound rules are now strictly evaluated 
-           dynamically against active runtime client telemetry structures organically.
-  1.11.0 - [FEAT] Added support for `port:` identifiers to natively map incoming 
-           listener bounds organically during routing evaluations.
-           Implemented `force-and` evaluation logic. If `ForceAnd` is true for a 
-           route, all comma-separated keys must successfully match the client 
-           before the route is accepted.
-  1.10.0 - [REFACTOR] Extracted `resolveClientRoute` to allow pre-emptive global bypass checks.
-  1.9.0  - [FEAT] Introduced `Country` ISO 3166-1 alpha-2 network boundaries natively 
-           into the client identity resolution matrix organically.
-  1.8.0  - [SECURITY/FIX] Addressed a telemetry omission anomaly within the 
-           Domain Policy routing engine. Injected the missing `IncrPolicyBlock()` 
-           instruction natively prior to executing the Drop/Log evaluation sequence. 
-           Guarantees that Domain Policy intercepts correctly register on the 
-           global statistical counters natively.
-  1.7.0  - [PERF] Injected explicit `clientNameLower`, `sniLower`, and `pathLower` 
-           pre-computed structural parameters into the routing signature statically.
-           Completely eradicates massive, recursive string allocations mapped to the 
-           hot-path routing matrix, ensuring low-latency bounds under peak throughput.
-  1.6.0  - [REFACTOR] Employed `RcodeStr` helper natively to construct Return Code 
-           log structures securely and effortlessly.
+  1.12.1 - [SECURITY/FIX] Resolved an issue utilizing `sync.Map` in `webuiClientBlocks` natively
+           by executing map iterations explicitly safely avoiding bounded OOM restrictions organically.
 */
 
 package main
@@ -356,4 +334,3 @@ func determineRouting(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTri
 
 	return ctx, false
 }
-

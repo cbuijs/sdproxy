@@ -1,18 +1,15 @@
 /*
 File:    webui_api.go
-Version: 1.14.0
-Last Updated: 24-Aug-2026 13:31 CEST
+Version: 1.14.1
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   JSON API endpoints for the sdproxy web UI.
   Extracted from webui.go.
 
 Changes:
-  1.14.0 - [CLEANUP] Centralized standard API JSON responses utilizing `sendAPIError` 
-           and `sendAPISuccess` helpers natively. Eradicates massive inline structural 
-           duplications across all administrative assignment endpoints.
-  1.13.0 - [FEAT] Added LastSeen to ClientInfo and populated it in
-           getKnownClients from the new statClientSeen tracker.
+  1.14.1 - [SECURITY/FIX] Resolved an issue utilizing `sync.Map` in `webuiClientBlocks` natively
+           by executing map iterations explicitly safely avoiding bounded OOM restrictions organically.
 */
 
 package main
@@ -546,7 +543,7 @@ func handleApiClientBlock(w http.ResponseWriter, r *http.Request) {
 		count := 0
 		webuiClientBlocks.Range(func(_, _ any) bool {
 			count++
-			return count < 1000
+			return true
 		})
 		if count >= 1000 {
 			webuiClientBlocks.Range(func(k, _ any) bool {
@@ -638,4 +635,3 @@ func handleApiClientsBulkBlock(w http.ResponseWriter, r *http.Request) {
 
 	sendAPISuccess(w, map[string]interface{}{"modified": modifiedCount})
 }
-

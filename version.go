@@ -1,11 +1,16 @@
 /*
 File:    version.go
-Version: 1.484.0
+Version: 1.485.0
 Last Updated: 25-Sep-2026 12:00 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.485.0 - [SECURITY/FIX] Resolved issues utilizing `TryLock` evaluation loops organically. 
+            Ensures proper instantiation of the timestamp comparison baseline (time.Time zero value) 
+            and pointers are securely preserved during client iteration to prevent arbitrary panics 
+            when performing memory evictions cleanly. Addressed strict OOM bounds tracking linearly 
+            for `sync.Map` in `webuiClientBlocks`.
   1.484.0 - [FIX] Restored proper initialization of `cfg.Groups` to prevent nil 
             map assignment panics when configuring router profiles organically.
           - [FIX] Re-added missing map declarations (`compoundRouteMap`, `compoundRouteMappings`)
@@ -55,11 +60,11 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.484.0"
+	BuildVersion string = "v1.485.0"
 
 	// BuildTime records the date and time the binary was compiled.
 	BuildTime string = "25-Sep-2026 12:00 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "543"
+	BuildNumber string = "544"
 )

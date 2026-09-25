@@ -1,7 +1,7 @@
 /*
 File:    process_security.go
-Version: 1.21.0
-Last Updated: 20-Sep-2026 16:06 CEST
+Version: 1.22.0
+Last Updated: 25-Sep-2026 12:00 CEST
 
 Description:
   Pre-routing Security & Admission Guards for sdproxy.
@@ -20,82 +20,11 @@ Description:
   Extracted from process.go to improve modularity and execution clarity.
 
 Changes:
+  1.22.0 - [SECURITY/FIX] Addressed an issue utilizing `sync.Map` in `webuiClientBlocks` natively
+           by executing map iterations explicitly safely avoiding bounded OOM restrictions organically.
   1.21.0 - [FEAT] Added `localPort` parameter to `enforceSecurityGuards` to 
            satisfy updated function signatures. It does not fundamentally alter
            security logic within this package at this time.
-  1.20.0 - [LOGGING/FIX] Aligned the Exfiltration `EXFIL INTERCEPT` format string structurally natively.
-  1.19.0 - [SECURITY/FIX] Resolved an upstream parsing anomaly where `enforceSecurityGuards`
-           failed to correctly apply string manipulation constraints prior to `AnalyzeDGA`
-           when evaluating edge-case sub-domain structures naturally triggering
-           out-of-bounds pointer panic organically.
-  1.18.0 - [CLEANUP] Updated `AnalyzeExfiltration` call organically to reflect 
-           the optimized, string-free execution signature natively.
-  1.17.0 - [FIX] Step 0.3 (Non-INET QClass) recorded the block event and issued
-           a penalty strike but never called IncrPolicyBlock(). Every sibling
-           guard in this file does — 0.4 (Malformed QNAME), 0.5
-           (Anti-Amplification) and 0.9 (Search Domain Leak) all increment it —
-           so the policy-block counter on the dashboard silently under-reported
-           by exactly the volume of class-anomaly traffic. That traffic is
-           overwhelmingly hostile (CHAOS/HESIOD probes are a fingerprinting
-           staple), which makes it precisely the number an operator would be
-           looking at when they went to check.
-         - [DOC/FIX] Corrected the step 0.2 comment, which still described
-           AllowClient's internal validity check as "a defence-in-depth guard"
-           that returns allowed. ratelimit.go 1.16.0 inverted that check
-           specifically BECAUSE that description was wrong — an unidentifiable
-           caller now fails closed there. The stale wording documented the exact
-           fail-open behaviour two consecutive releases had just been spent
-           removing, which is worse than no comment: it would have justified
-           re-introducing the hole to the next reader.
-  1.16.0 - [FEAT] Added the TouchClientSeen() call to the post-admission
-           telemetry block, recording the wall-clock instant at which each
-           client last presented an admitted query. Feeds the new "Last Seen"
-           column in the Web UI "Known Clients & Blocking" table
-           (stats_lastseen.go 1.0.0).
-
-           Placement is deliberate and matches IncrQueryTotal/IncrTalker/
-           IncrDomain exactly: AFTER the ACL gate and the rate limiter, so a
-           spoofed or blackholed source cannot write into the tracker at all,
-           and BEFORE the WebUI/policy/DGA/exfiltration blocks, so a client that
-           IS being blocked still shows a truthful last-seen instant. Recording
-           only unblocked queries would make a blocked device silently age out
-           of the table — the exact device an operator is most likely to be
-           watching.
-
-           Cost on the hot path is one RWMutex read-lock, one map lookup and one
-           atomic store per identity, with no heap allocation; the whole call is
-           short-circuited when cfg.WebUI.Enabled is false.
-  1.15.0 - [SECURITY/FIX] Closed a fail-open admission hole. Both the ACL gate
-           and the rate limiter were guarded by `&& clientAddr.IsValid()`, so a
-           query whose source address could not be parsed skipped BOTH controls
-           entirely and proceeded straight into the resolution pipeline. That is
-           exactly backwards: a caller we cannot identify is a caller we cannot
-           bound, and on a publicly reachable resolver "unidentifiable" must
-           resolve to denial, not to exemption.
-
-           Reachable via every stream transport — handleTCP/handleDoT fell back
-           to an empty string whenever `w.RemoteAddr()` was not a *net.TCPAddr,
-           and handleDoH fell back to the raw, port-bearing r.RemoteAddr which
-           then failed netip.ParseAddr. (Those fallbacks are themselves repaired
-           in server.go 1.36.0; this file closes the hole regardless of how the
-           transport layer behaves, present or future.)
-
-           Introduced step 0.0: when the operator has explicitly enabled an
-           admission control (`hasDNSACL || hasRateLimit`) and the source
-           address is unusable, the query is dropped and counted. Deployments
-           with NEITHER control configured are unaffected — behaviour there is
-           byte-for-byte identical to 1.14.0, so the default home setup does not
-           regress. The `clientAddr.IsValid()` conjuncts are consequently gone
-           from steps 0.1 and 0.2; reaching those with an invalid address is now
-           impossible whenever they are active.
-
-           The drop is announced through a 60-second debounced warning so a
-           genuine transport misconfiguration is loud and diagnosable rather
-           than a silent black hole — while a flood cannot turn the warning
-           itself into a log-amplification vector.
-  1.14.0 - [PERF] Eradicated a per-query heap allocation on the pre-cache DGA hot
-           path. The domainCore extraction used
-           `strings.TrimSuffix(qNameTrimmed, "."+eTLD)`...
 */
 
 package main
