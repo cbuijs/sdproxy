@@ -1,7 +1,7 @@
 /*
 File:    exfiltration.go
-Version: 1.20.0
-Last Updated: 14-Sep-2026 12:59 CEST
+Version: 1.21.0
+Last Updated: 25-Sep-2026 09:51 CEST
 Description:
   Volumetric baseline profiling for DNS tunneling and covert exfiltration detection.
   Implements a high-performance, sharded, lock-free Exponential Moving Average (EMA) 
@@ -11,6 +11,9 @@ Description:
   clients transmitting anomalous data volumes over port 53.
 
 Changes:
+  1.21.0 - [CLEANUP] Standardized boundary ceiling evaluations utilizing `math.MaxInt64` natively. 
+           Eliminates arbitrary bitwise left-shift hardcodes to prevent theoretical 
+           architecture overflows cleanly.
   1.20.0 - [DEAD-CODE/CLEANUP] Eliminated unused `clientIP` string parameter natively 
            from `AnalyzeExfiltration` signature. Streamlines pipeline bounds and 
            reduces register pressure during high-throughput hot-path execution.
@@ -31,6 +34,7 @@ package main
 import (
 	"hash/maphash"
 	"log"
+	"math"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -239,7 +243,7 @@ func AnalyzeExfiltration(addr netip.Addr, reqSize int) (allowed bool, isBanned b
 		// from blindly laundering strikes via spoofed IP floods natively.
 		if len(shard.buckets) >= maxPerShard {
 			var oldestKey netip.Addr
-			var oldestTS int64 = 1<<63 - 1
+			var oldestTS int64 = math.MaxInt64
 			var sampled int
 			
 			for k, b := range shard.buckets {

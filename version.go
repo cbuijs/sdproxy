@@ -1,11 +1,19 @@
 /*
 File:    version.go
-Version: 1.479.0
-Last Updated: 23-Sep-2026 12:45 CEST
+Version: 1.480.0
+Last Updated: 25-Sep-2026 09:51 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.480.0 - [SECURITY/FIX] Hardened the Web UI authentication gateway natively by unifying
+            `handleLogin` password verifications under the central constant-time 
+            `secretsEqual` primitive, ensuring identical cryptographic parity with 
+            the session and API token evaluators organically.
+          - [CLEANUP] Standardized boundary ceiling evaluations across the `exfiltration` 
+            and `process_leak` subsystems utilizing `math.MaxInt64` natively. Eliminates 
+            arbitrary bitwise left-shift hardcodes to prevent theoretical architecture 
+            overflows cleanly.
   1.479.0 - [SECURITY/FIX] Hardened DNS Cache engine against Authority Section poisoning natively.
             Mitigates vulnerabilities where upstreams inject malicious NS/SOA records targeting 
             Top-Level Domains (e.g., `com.`) by enforcing strict Public Suffix isolation organically.
@@ -31,12 +39,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.479.0"
+	BuildVersion string = "v1.480.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "23-Sep-2026 12:45 CEST"
+	BuildTime string = "25-Sep-2026 09:51 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "538"
+	BuildNumber string = "539"
 )
 

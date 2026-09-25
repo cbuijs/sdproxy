@@ -1,12 +1,15 @@
 /*
 File:    webui_html.go
-Version: 1.23.0
-Updated: 08-Jul-2026 09:20 CEST
+Version: 1.24.0
+Last Updated: 25-Sep-2026 09:51 CEST
 
 Description:
   HTTP Request Handlers and authentication logic for the sdproxy web UI.
 
 Changes:
+  1.24.0 - [SECURITY/FIX] Leveraged the centralized `secretsEqual` primitive for password verification. 
+           Eradicates the isolated `crypto/subtle` import cleanly and enforces identically matched 
+           constant-time evaluations across Session, API, and Core Login contexts organically.
   1.23.0 - [FEAT] Injected the `clientBlockPanel` natively into the `handleRoot` HTML layout. 
            Positions the dynamic `Known Clients & Blocking` module cleanly between 
            the Parental Overrides section and the general system Statistics Grid.
@@ -19,7 +22,6 @@ Changes:
 package main
 
 import (
-	"crypto/subtle"
 	"fmt"
 	"log"
 	"net"
@@ -230,8 +232,8 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		r.ParseForm()
-		// [SECURITY/FIX] Mitigate Timing Attacks using ConstantTimeCompare natively.
-		if subtle.ConstantTimeCompare([]byte(r.FormValue("password")), []byte(cfg.WebUI.Password)) == 1 {
+		// [SECURITY/FIX] Mitigate Timing Attacks using the centralized constant-time verifier natively.
+		if secretsEqual(r.FormValue("password"), cfg.WebUI.Password) {
 			loginStatesMu.Lock()
 			if logWebUI {
 				if state.attempts > 0 {

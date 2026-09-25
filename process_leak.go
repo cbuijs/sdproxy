@@ -1,7 +1,7 @@
 /*
 File:    process_leak.go
-Version: 1.6.0
-Last Updated: 23-Sep-2026 11:31 CEST
+Version: 1.7.0
+Last Updated: 25-Sep-2026 09:51 CEST
 
 Description:
   Search Domain Leak Prevention (Recent Blocks Tracker) for sdproxy.
@@ -12,6 +12,9 @@ Description:
   "blocked.com.local.lan") to blocked queries.
 
 Changes:
+  1.7.0 - [CLEANUP] Standardized boundary ceiling evaluations utilizing `math.MaxInt64` natively. 
+          Eliminates arbitrary bitwise left-shift hardcodes to prevent theoretical 
+          architecture overflows cleanly.
   1.6.0 - [PERF/FIX] Replaced blocking `Lock` calls with `TryLock` natively during 
           emergency client evictions. Prevents priority inversions and latency 
           stalls on the hot path when tracker capacities saturate organically.
@@ -29,6 +32,7 @@ package main
 import (
 	"hash/maphash"
 	"log"
+	"math"
 	"net/netip"
 	"strings"
 	"sync"
@@ -138,7 +142,7 @@ func recordRecentBlock(ipStr, domain, reason string) {
 			// catastrophic priority inversions and active deadlocks.
 			if len(shard.clients) >= rbMaxPerShard {
 				var oldestKey netip.Addr
-				var oldestTS int64 = 1<<63 - 1
+				var oldestTS int64 = math.MaxInt64
 				var sampled int
 				
 				for k, cRef := range shard.clients {
