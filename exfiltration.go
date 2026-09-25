@@ -1,7 +1,7 @@
 /*
 File:    exfiltration.go
-Version: 1.21.0
-Last Updated: 25-Sep-2026 09:51 CEST
+Version: 1.22.0
+Last Updated: 25-Sep-2026 10:54 CEST
 Description:
   Volumetric baseline profiling for DNS tunneling and covert exfiltration detection.
   Implements a high-performance, sharded, lock-free Exponential Moving Average (EMA) 
@@ -11,6 +11,12 @@ Description:
   clients transmitting anomalous data volumes over port 53.
 
 Changes:
+  1.22.0 - [SECURITY/FIX] Eradicated a critical Micro-Burst Time Starvation vulnerability.
+           Removed premature `recentBytes` and `lastUpdate` resets inside the instantaneous 
+           micro-burst anomaly block. Previously, an attacker sustaining rapid micro-bursts 
+           (e.g., every 50ms) permanently prevented the 1-second long-term Exponential Moving 
+           Average (EMA) baseline from updating, artificially freezing the volumetric tracking 
+           thresholds natively.
   1.21.0 - [CLEANUP] Standardized boundary ceiling evaluations utilizing `math.MaxInt64` natively. 
            Eliminates arbitrary bitwise left-shift hardcodes to prevent theoretical 
            architecture overflows cleanly.
@@ -374,8 +380,10 @@ func AnalyzeExfiltration(addr netip.Addr, reqSize int) (allowed bool, isBanned b
 			
 			if currentBPS > threshold && currentBPS > (evalBaseline*multiplier) {
 				anomalous = true
-				b.recentBytes = 0
-				b.lastUpdate = now
+				// [SECURITY/FIX 1.22.0] Eradicated Micro-Burst Time Starvation vector.
+				// Do NOT reset `recentBytes` or `lastUpdate` here. Resetting them prematurely 
+				// blinded the 1-second long-term EMA baseline updates if an attacker constantly 
+				// micro-bursts data under the 1-second interval boundary natively.
 			}
 		}
 	}
