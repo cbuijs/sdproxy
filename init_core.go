@@ -1,0 +1,306 @@
+/*
+File:    init_core.go
+Version: 1.114.0
+Last Updated: 14-Sep-2026 13:45 CEST
+
+Description:
+  High-level initialization orchestrator and general IO helpers for sdproxy.
+  Dispatches specific tasks to init_routing, init_policy, and init_upstreams.
+
+Changes:
+  1.114.0 - [SECURITY/FIX] Eradicated a critical Cache Persistence Corruption vulnerability natively.
+            Overhauled `initRouteIndex` to proactively sort dynamically harvested Upstream target 
+            identifiers before generating `RouteIdx` integers. Prevents random map iteration states 
+            from permanently desynchronizing saved binary cache partitions across router reboots.
+  1.113.0 - [SECURITY/FIX] initRouteIndex() didn't register upstream group
+            names referenced ONLY via a `port:` route (portRoutes) or a
+            `force-and` compound route (compoundRouteMappings). A group
+            reachable only through either path never got a routeIdx, so
+            getRouteIdx() silently fell back to routeIdxDefault — meaning
+            that group's cache entries were stored/read under the SAME
+            cache partition as the "default" group. Same class of bug as
+            the routeIdx/cache-key drift already fixed in
+            process_cachehit.go/process_query.go 1.1.0, just reintroduced
+            by the newer port:/force-and feature (init_routing.go 1.7.0,
+            same date). Both maps are now walked like every other routing
+            table.
+  1.112.0 - [DEAD-CODE/CLEANUP] Removed the orphaned readConfigListURL fetcher.
+            The only remote-list consumers (init_policy.go, parental_loader.go)
+            carry their own hardened HTTP fetch paths, so this helper had no
+            callers left. Dropped the now-unused fmt / io / net/http imports.
+            maxRemoteListBytes stays — init_policy.go still references it for
+            its own 10MB truncation guard.
+  1.111.0 - [TIER 2] syncDirForFile moved to helpers_io.go; readConfigListURL now
+            shares the 10MB truncation-detection idiom with the policy loader.
+  1.110.0 - [SECURITY/RELIABILITY] syncDirForFile deployed so atomic renames
+            survive power loss on embedded routers.
+  1.109.0 - [FEAT] countryRoutes registered in initRouteIndex.
+*/
+
+package main
+
+import (
+	"bufio"
+	"log"
+	"net"
+	"net/netip"
+	"os"
+	"sort"
+	"strings"
+
+	"github.com/miekg/dns"
+)
+
+// maxRemoteListBytes bounds any remote config list (routes, policies).
+// [SECURITY] CWE-400: without this a hostile or misconfigured host can stream
+// unbounded data into a 64MB router.
+//
+// NOTE: consumed by init_policy.go's remote-list loader (same package). Kept
+// here as the canonical declaration even though init_core.go no longer performs
+// remote fetches itself after readConfigListURL was retired in 1.112.0.
+const maxRemoteListBytes = 10 * 1024 * 1024
+
+// readConfigListFile reads a file line by line, stripping whitespace and inline comments.
+func readConfigListFile(filePath string) ([]string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	buf := make([]byte, 64*1024)
+	scanner.Buffer(buf, 2*1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if idx := strings.IndexByte(line, '#'); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, scanner.Err()
+}
+
+// initBlockAction parses the global 'BLOCK' definition.
+func initBlockAction() {
+	action := strings.ToUpper(strings.TrimSpace(cfg.Server.BlockAction))
+	if action == "" || action == "NULL" {
+		globalBlockAction = BlockActionNull
+	} else if action == "DROP" {
+		globalBlockAction = BlockActionDrop
+	} else if action == "LOG" {
+		globalBlockAction = BlockActionLog
+	} else if action == "IP" {
+		globalBlockAction = BlockActionIP
+		for _, ipStr := range cfg.Server.BlockIPs {
+			if ip := net.ParseIP(strings.TrimSpace(ipStr)); ip != nil {
+				if ip.To4() != nil {
+					globalBlockIPv4 = append(globalBlockIPv4, ip.To4())
+				} else {
+					globalBlockIPv6 = append(globalBlockIPv6, ip.To16())
+				}
+			}
+		}
+		if len(globalBlockIPv4) == 0 && len(globalBlockIPv6) == 0 {
+			globalBlockAction = BlockActionNull
+		}
+	} else if rcode, ok := dns.StringToRcode[action]; ok {
+		globalBlockAction = BlockActionRcode
+		globalBlockRcode = rcode
+	} else {
+		globalBlockAction = BlockActionNull
+	}
+	if logSystem {
+		log.Printf("[INIT] Global Block Action: %s", action)
+	}
+}
+
+// initDGA parses the ML classification definitions for Domain Generation Algorithms.
+func initDGA() {
+	if cfg.Server.DGA.Enabled {
+		hasDGA = true
+		if cfg.Server.DGA.Threshold <= 0 {
+			cfg.Server.DGA.Threshold = 80.0
+		}
+		if cfg.Server.DGA.Action == "" {
+			cfg.Server.DGA.Action = "BLOCK"
+		}
+		if logSystem {
+			log.Printf("[INIT] DGA ML Detection enabled (Threshold: %.1f, Action: %s)", cfg.Server.DGA.Threshold, cfg.Server.DGA.Action)
+		}
+	}
+}
+
+// initRouteIndex constructs the numerical lookup map required by the cache architecture.
+//
+// [SECURITY/FIX 1.114.0] Preemptively sorts dynamically harvested Upstream targets before
+// generating `RouteIdx` integer mappings organically. Standard Go maps randomize iteration
+// states inherently upon every process reboot. Previously, this stochastic extraction
+// caused cached partitions to shift out-of-bounds across restarts natively, permanently
+// corrupting historical binary disk-caches by failing to link subsequent payloads back
+// to their valid origin directories dynamically.
+func initRouteIndex() {
+	routeIdxByName = make(map[string]uint16, len(cfg.Upstreams)+4)
+	routeIdxByName["local"] = routeIdxLocal
+	nextIdx := uint16(1)
+
+	var names []string
+	addName := func(name string) {
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+
+	for groupName := range routeUpstreams {
+		addName(groupName)
+	}
+	for _, dr := range domainRoutes {
+		addName(dr.upstream)
+	}
+	for _, route := range macRoutes {
+		addName(route.Upstream)
+	}
+	for _, route := range macWildRoutes {
+		addName(route.route.Upstream)
+	}
+	for _, route := range ipRoutes {
+		addName(route.Upstream)
+	}
+	for _, cr := range cidrRoutes {
+		addName(cr.route.Upstream)
+	}
+	for _, route := range asnRoutes {
+		addName(route.Upstream)
+	}
+	for _, route := range countryRoutes {
+		addName(route.Upstream)
+	}
+	for _, route := range clientNameRoutes {
+		addName(route.Upstream)
+	}
+	for _, route := range sniRoutes {
+		addName(route.Upstream)
+	}
+	for _, route := range pathRoutes {
+		addName(route.Upstream)
+	}
+	for _, route := range portRoutes {
+		addName(route.Upstream)
+	}
+	for _, cm := range compoundRouteMappings {
+		addName(cm.route.Upstream)
+	}
+
+	// [SECURITY/FIX] Execute deterministic assignment ordering securely.
+	sort.Strings(names)
+
+	for _, name := range names {
+		if _, exists := routeIdxByName[name]; !exists {
+			// [SECURITY] Hard uint16 ceiling. Wrapping back to 0 would conflate an
+			// external upstream group with routeIdxLocal, the internal LAN resolver.
+			if nextIdx == 65535 {
+				log.Fatalf("[FATAL] Maximum number of isolated routing groups (65535) exceeded.")
+			}
+			routeIdxByName[name] = nextIdx
+			nextIdx++
+		}
+	}
+
+	routeIdxDefault = routeIdxByName["default"]
+}
+
+// initRRs parses global and per-group spoofed records.
+func initRRs() {
+	globalRRs = make(map[string]spoofRecord)
+	groupRRs = make(map[string]map[string]spoofRecord)
+
+	parseRRMap := func(source map[string]interface{}, dest map[string]spoofRecord) {
+		for k, v := range source {
+			domain := lowerTrimDot(k)
+			var rec spoofRecord
+			switch val := v.(type) {
+			case string:
+				if ip, err := netip.ParseAddr(strings.TrimSpace(val)); err == nil {
+					rec.IPs = append(rec.IPs, ip.Unmap())
+				} else {
+					rec.CNAME = lowerTrimDot(val)
+				}
+			case []interface{}:
+				for _, item := range val {
+					if str, ok := item.(string); ok {
+						if ip, err := netip.ParseAddr(strings.TrimSpace(str)); err == nil {
+							rec.IPs = append(rec.IPs, ip.Unmap())
+						}
+					}
+				}
+			}
+			dest[domain] = rec
+		}
+	}
+	parseRRMap(cfg.RRs, globalRRs)
+	for grpName, grpCfg := range cfg.Groups {
+		if len(grpCfg.RRs) > 0 {
+			gm := make(map[string]spoofRecord)
+			parseRRMap(grpCfg.RRs, gm)
+			groupRRs[grpName] = gm
+		}
+	}
+	hasRRs = len(globalRRs) > 0 || len(groupRRs) > 0
+}
+
+// initDDR maps RFC 9462 Discovery of Designated Resolvers endpoints.
+func initDDR() {
+	if cfg.Server.ECHConfigList != "" {
+		if b, err := os.ReadFile(cfg.Server.ECHConfigList); err == nil {
+			ddrECHConfig = b
+		}
+	}
+	if cfg.Server.DDR.Enabled {
+		ddrHostnames = make(map[string]bool)
+		source := cfg.Server.DDR.HostnameSource
+		if source == "" {
+			source = "strict"
+		}
+		var raw []string
+		if source == "strict" || source == "both" {
+			raw = append(raw, cfg.Server.DDR.Hostnames...)
+		}
+		if source == "tls" || source == "both" {
+			raw = append(raw, tlsAuthorizedNames...)
+		}
+		for _, h := range raw {
+			clean := strings.ToLower(strings.TrimSuffix(h, "."))
+			if clean != "" && !strings.Contains(clean, "*") && net.ParseIP(clean) == nil {
+				if !ddrHostnames[clean] {
+					ddrHostnames[clean] = true
+					ddrHostnamesList = append(ddrHostnamesList, clean)
+				}
+			}
+		}
+		for _, s := range cfg.Server.DDR.IPv4 {
+			if ip := net.ParseIP(s); ip != nil {
+				ddrIPv4 = append(ddrIPv4, ip)
+			}
+		}
+		for _, s := range cfg.Server.DDR.IPv6 {
+			if ip := net.ParseIP(s); ip != nil {
+				ddrIPv6 = append(ddrIPv6, ip)
+			}
+		}
+		ddrDoHPort, ddrDoTPort, ddrDoQPort = 0, 0, 0
+		for _, addr := range cfg.Server.ListenDoH {
+			ddrDoHPort = extractPort(addr, 443)
+		}
+		for _, addr := range cfg.Server.ListenDoT {
+			ddrDoTPort = extractPort(addr, 853)
+		}
+		for _, addr := range cfg.Server.ListenDoQ {
+			ddrDoQPort = extractPort(addr, 853)
+		}
+	}
+}
+
