@@ -1,7 +1,7 @@
 /*
 File:    process_upstream.go
-Version: 1.6.0
-Last Updated: 15-Oct-2026 18:35 CEST
+Version: 1.7.0
+Last Updated: 17-Oct-2026 20:06 CEST
 
 Description:
   Upstream exchange stage for the sdproxy resolution pipeline — the cache-miss
@@ -10,6 +10,13 @@ Description:
   and the final client write.
 
 Changes:
+  1.7.0 - [SECURITY/FIX] Restored `finalResp.Question[0].Name = qc.q.Name` after
+          SingleFlight coalescing and passed `qc.q.Name` to `CacheGetExpired`.
+          Because `sfKey` normalizes QNAMEs to lowercase, two concurrent queries
+          with differing QNAME casing (0x20 bit encoding) coalesced into one
+          upstream exchange and returned the leader's Question casing to the
+          follower, causing strict stub resolvers to drop the response as a
+          question mismatch.
   1.6.0 - [FIX] Passed `qc.localPort` to `checkTargetNames` and `filterResponseIPs`
           so post-upstream policy checks preserve port-based parental state resolution.
   1.5.0 - [SECURITY/FIX] Addressed an undeclared memory leak within the error 
@@ -127,7 +134,7 @@ func (qc *queryCtx) serveFromUpstream() {
 		if err != nil || msg == nil {
 			if cfg.Cache.ServeStaleInfinite {
 				fallbackMsg := new(dns.Msg)
-				if CacheGetExpired(qc.cacheKey, fallbackMsg) {
+				if CacheGetExpired(qc.cacheKey, qc.q.Name, fallbackMsg) {
 					return sfResult{msg: fallbackMsg, addr: "stale-fallback"}, nil
 				}
 			}
@@ -179,6 +186,12 @@ func (qc *queryCtx) serveFromUpstream() {
 			qc.route.routeName, qc.route.routeOriginType, upstreamLog, sfErr)
 		dns.HandleFailed(qc.w, qc.r)
 		return
+	}
+
+	// [SECURITY/FIX 1.7.0] Preserve the requesting client's exact Question casing (0x20 bit encoding)
+	// when a response is shared across coalesced SingleFlight callers.
+	if len(finalResp.Question) > 0 && qc.q.Name != "" {
+		finalResp.Question[0].Name = qc.q.Name
 	}
 
 	// ── Answer sorting ────────────────────────────────────────────────────
@@ -288,3 +301,4 @@ func (qc *queryCtx) serveFromUpstream() {
 			cleanUpstreamHost(upstreamUsed), qc.route.routeName, status)
 	}
 }
+

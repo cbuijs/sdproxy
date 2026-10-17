@@ -1,7 +1,7 @@
 /*
 File:    process_cachehit.go
-Version: 1.7.0 (Split)
-Last Updated: 15-Oct-2026 18:35 CEST
+Version: 1.8.0 (Split)
+Last Updated: 17-Oct-2026 20:06 CEST
 
 Description:
   Cache-hit serving stage for the sdproxy resolution pipeline.
@@ -17,6 +17,9 @@ Description:
   permitted answer leak to a client whose policy forbids it.
 
 Changes:
+  1.8.0 - [SECURITY/FIX] Passed `qc.q.Name` into `CacheGet` so the unpacked cached
+          message restores the requesting client's exact Question casing (0x20 bit
+          encoding / RFC 1035).
   1.7.0 - [FIX] Passed `qc.localPort` to `checkTargetNames` and `filterResponseIPs`
           so post-cache policy checks preserve port-based parental state resolution.
   1.6.0 - [PERF] Inlined `responseContainsNullIP` evaluation natively within `serveFromCache`.
@@ -33,9 +36,6 @@ Changes:
   1.2.0 - [SECURITY/FIX] Resolved a severe cache payload modification vulnerability.
           `serveFromCache` correctly cloned responses, but failed to deeply clone the
           `Answer` slice prior to calling `transformResponse` when `inPlace` was false.
-          `flattenCNAME` and `applyAnswerSort` thus mutated shared Answer slices residing
-          in the raw cache structure natively. This caused round-robin shifts or flattened
-          aliases to instantly corrupt active cached arrays across all clients organically.
   1.1.0 - [SECURITY/FIX] deriveCacheKey and resolveUpstreamGroup resolved the
           upstream group INDEPENDENTLY, out of the same map, with different
           fallback rules.
@@ -113,7 +113,7 @@ func (qc *queryCtx) serveFromCache() bool {
 	poolMsg := msgPool.Get().(*dns.Msg)
 	*poolMsg = dns.Msg{}
 
-	isStale, isPrefetch, cacheOK, _ := CacheGet(qc.cacheKey, poolMsg)
+	isStale, isPrefetch, cacheOK, _ := CacheGet(qc.cacheKey, qc.q.Name, poolMsg)
 	if !cacheOK {
 		msgPool.Put(poolMsg)
 		return false
@@ -219,3 +219,4 @@ func (qc *queryCtx) serveFromCache() bool {
 
 	return true
 }
+

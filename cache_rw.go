@@ -1,7 +1,7 @@
 /*
 File:    cache_rw.go
-Version: 1.10.0 (Split)
-Last Updated: 25-Sep-2026 15:10 CEST
+Version: 1.11.0 (Split)
+Last Updated: 17-Oct-2026 20:06 CEST
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
@@ -11,6 +11,13 @@ Description:
   Extracted from cache.go to prioritize hot-path execution clarity.
 
 Changes:
+  1.11.0 - [SECURITY/FIX] Rewrote `out.Question[0].Name` on cache hits in `CacheGet`
+           and `CacheGetExpired` to match the incoming query's exact case (`q.Name`).
+           Because cache keys normalize QNAMEs to lowercase, cached wire responses
+           carried the casing of whichever client populated the cache first, breaking
+           strict stub resolvers that enforce case-sensitive QNAME matching (0x20 bit
+           encoding / RFC 1035) and failing to restore `originalQname` when a spoofed
+           CNAME target hit the cache.
   1.10.0 - [SECURITY/FIX] Enforced `TC=1` truncation guard inside `CacheSetSynth`.
            Definitively protects the memory arrays from caching maliciously 
            truncated synthetic payloads natively.
@@ -193,7 +200,7 @@ func rotateAnswersInPlace(msg *dns.Msg, offset uint32) {
 //
 // Returns ok=false on a miss or when the stale window has passed.
 // out is in an undefined state when ok=false — do not use it.
-func CacheGet(key DNSCacheKey, out *dns.Msg) (isStale bool, isPrefetch bool, ok bool, hits uint32) {
+func CacheGet(key DNSCacheKey, qName string, out *dns.Msg) (isStale bool, isPrefetch bool, ok bool, hits uint32) {
 	if !cfg.Cache.Enabled {
 		return false, false, false, 0
 	}
@@ -241,6 +248,11 @@ func CacheGet(key DNSCacheKey, out *dns.Msg) (isStale bool, isPrefetch bool, ok 
 	packedData := item.packed.Load()
 	if err := out.Unpack(*packedData); err != nil {
 		return false, false, false, 0
+	}
+
+	// [SECURITY/FIX 1.11.0] Preserve the requesting client's exact Question casing (0x20 bit encoding).
+	if qName != "" && len(out.Question) > 0 {
+		out.Question[0].Name = qName
 	}
 
 	// Rewrite TTLs to reflect actual remaining lifetime.
@@ -297,7 +309,7 @@ func CacheGet(key DNSCacheKey, out *dns.Msg) (isStale bool, isPrefetch bool, ok 
 // CacheGetExpired retrieves any cached record regardless of its TTL/stale
 // bounds. Emergency fallback only: used when upstream exchanges fail and
 // serve_stale_infinite is enabled.
-func CacheGetExpired(key DNSCacheKey, out *dns.Msg) bool {
+func CacheGetExpired(key DNSCacheKey, qName string, out *dns.Msg) bool {
 	if !cfg.Cache.Enabled {
 		return false
 	}
@@ -313,6 +325,11 @@ func CacheGetExpired(key DNSCacheKey, out *dns.Msg) bool {
 	packedData := item.packed.Load()
 	if err := out.Unpack(*packedData); err != nil {
 		return false
+	}
+
+	// [SECURITY/FIX 1.11.0] Preserve the requesting client's exact Question casing (0x20 bit encoding).
+	if qName != "" && len(out.Question) > 0 {
+		out.Question[0].Name = qName
 	}
 
 	// Force a short 30s TTL so clients don't permanently cache the dead record
@@ -620,3 +637,4 @@ func CacheUpdateOrder(key DNSCacheKey, msg *dns.Msg) {
 	}
 	largeBufPool.Put(bufp)
 }
+

@@ -1,11 +1,15 @@
 /*
 File:    version.go
-Version: 1.501.0
-Last Updated: 17-Oct-2026 20:00 CEST
+Version: 1.502.0
+Last Updated: 17-Oct-2026 20:06 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.502.0 - [SECURITY/FIX] Preserved the requesting client's exact Question QNAME
+            casing (0x20 bit encoding / RFC 1035) on cache hits (`CacheGet`,
+            `CacheGetExpired` in `cache_rw.go`, `process_cachehit.go`) and across
+            SingleFlight coalesced upstream responses (`process_upstream.go`).
   1.501.0 - [SECURITY/FIX] Preserved `key.Qclass` during background cache revalidation
             in `process_cache.go` (`backgroundRevalidate`).
           - [CLEANUP] Removed redundant `path:` prefix and trailing slash stripping in
@@ -64,11 +68,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.501.0"
+	BuildVersion string = "v1.502.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "17-Oct-2026 20:00 CEST"
+	BuildTime string = "17-Oct-2026 20:06 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "560"
+	BuildNumber string = "561"
 )
+
