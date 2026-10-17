@@ -1,7 +1,7 @@
 /*
 File:    server_init.go
-Version: 1.21.0 (Split)
-Last Updated: 15-Oct-2026 18:20 CEST
+Version: 1.22.0 (Split)
+Last Updated: 17-Oct-2026 19:54 CEST
 
 Description:
   Listener initialization and OS binding orchestration.
@@ -9,6 +9,15 @@ Description:
   (UDP, TCP, TLS, DoH, DoQ) from the runtime protocol payload handlers.
 
 Changes:
+  1.22.0 - [SECURITY/FIX] Bound graceful shutdown hooks (`shutdownCh`) to TCP, DoT,
+           DoH (HTTP/2), and DoH3 (HTTP/3) listeners so active sockets close cleanly
+           upon `SIGTERM`/`SIGINT`.
+         - [SECURITY/FIX] Moved `activeDoQConns` outside the `superviseListener` closure
+           so a DoQ listener restart does not reset the connection counter while
+           existing connections are still draining.
+         - [SECURITY/FIX] Cloned `tlsConf` for `http3.Server` and explicitly set
+           `NextProtos = []string{"h3"}` to avoid mutating the shared `tls.Config`
+           across concurrent listeners.
   1.21.0 - [SECURITY/FIX] Injected `http.LocalAddrContextKey` via `ConnContext` on
            `http3.Server` (DoH3). Unlike standard `net/http.Server`, `quic-go/http3`
            does not populate `http.LocalAddrContextKey` by default, which caused
@@ -223,6 +232,17 @@ func StartServers(tlsConf *tls.Config) {
 			if logSystem {
 				log.Printf("[LISTEN] TCP on %s (Max Conns: %d)", addr, maxTCP)
 			}
+
+			served := make(chan struct{})
+			defer close(served)
+			go func() {
+				select {
+				case <-shutdownCh:
+					_ = server.Shutdown()
+				case <-served:
+				}
+			}()
+
 			return server.ActivateAndServe()
 		})
 	}
@@ -240,7 +260,9 @@ func StartServers(tlsConf *tls.Config) {
 			}
 
 			l = netutil.LimitListener(l, maxTCP)
-			tlsL := tls.NewListener(l, tlsConf)
+			dotTLS := tlsConf.Clone()
+			dotTLS.NextProtos = []string{"dot"}
+			tlsL := tls.NewListener(l, dotTLS)
 
 			server := &dns.Server{
 				Listener:     tlsL,
@@ -251,6 +273,17 @@ func StartServers(tlsConf *tls.Config) {
 			if logSystem {
 				log.Printf("[LISTEN] DoT on %s (Max Conns: %d)", addr, maxTCP)
 			}
+
+			served := make(chan struct{})
+			defer close(served)
+			go func() {
+				select {
+				case <-shutdownCh:
+					_ = server.Shutdown()
+				case <-served:
+				}
+			}()
+
 			return server.ActivateAndServe()
 		})
 	}
@@ -317,16 +350,6 @@ func StartServers(tlsConf *tls.Config) {
 		dohTLS := tlsConf.Clone()
 		dohTLS.NextProtos = []string{"h2", "http/1.1"}
 
-		h2Server := &http.Server{
-			Handler:           mux,
-			ReadTimeout:       tcpReadTimeout,
-			ReadHeaderTimeout: 3 * time.Second,
-			WriteTimeout:      tcpWriteTimeout,
-			IdleTimeout:       tcpIdleTimeout,
-			MaxHeaderBytes:    8192,
-			ErrorLog:          log.New(io.Discard, "", 0),
-		}
-
 		go superviseListener("DoH", addr, func(attempt int) error {
 			l, err := net.Listen("tcp", addr)
 			if err != nil {
@@ -339,6 +362,16 @@ func StartServers(tlsConf *tls.Config) {
 			l = netutil.LimitListener(l, maxTCP)
 			tlsL := tls.NewListener(l, dohTLS)
 
+			h2Server := &http.Server{
+				Handler:           mux,
+				ReadTimeout:       tcpReadTimeout,
+				ReadHeaderTimeout: 3 * time.Second,
+				WriteTimeout:      tcpWriteTimeout,
+				IdleTimeout:       tcpIdleTimeout,
+				MaxHeaderBytes:    8192,
+				ErrorLog:          log.New(io.Discard, "", 0),
+			}
+
 			if logSystem {
 				log.Printf("[LISTEN] DoH (HTTP/1.1 + HTTP/2) on %s (Max Conns: %d)", addr, maxTCP)
 				if len(ddrECHConfig) > 0 {
@@ -346,29 +379,54 @@ func StartServers(tlsConf *tls.Config) {
 				}
 			}
 
+			served := make(chan struct{})
+			defer close(served)
+			go func() {
+				select {
+				case <-shutdownCh:
+					_ = h2Server.Close()
+				case <-served:
+				}
+			}()
+
 			return h2Server.Serve(tlsL)
 		})
 
-		h3Server := &http3.Server{
-			Addr:      addr,
-			Handler:   mux,
-			TLSConfig: tlsConf,
-			// [SECURITY/FIX 1.21.0] Populate http.LocalAddrContextKey on HTTP/3 requests
-			// so handleDoH can extract the bound local IP and port identically to HTTP/1.1 & HTTP/2.
-			ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
-				return context.WithValue(ctx, http.LocalAddrContextKey, c.LocalAddr())
-			},
-			QUICConfig: &quic.Config{
-				Allow0RTT:          true,
-				MaxIdleTimeout:     tcpIdleTimeout,
-				KeepAlivePeriod:    15 * time.Second,
-				MaxIncomingStreams: 256,
-			},
-		}
+		doh3TLS := tlsConf.Clone()
+		doh3TLS.NextProtos = []string{"h3"}
+
 		go superviseListener("DoH3", addr, func(attempt int) error {
+			h3Server := &http3.Server{
+				Addr:      addr,
+				Handler:   mux,
+				TLSConfig: doh3TLS,
+				// [SECURITY/FIX 1.21.0] Populate http.LocalAddrContextKey on HTTP/3 requests
+				// so handleDoH can extract the bound local IP and port identically to HTTP/1.1 & HTTP/2.
+				ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+					return context.WithValue(ctx, http.LocalAddrContextKey, c.LocalAddr())
+				},
+				QUICConfig: &quic.Config{
+					Allow0RTT:          true,
+					MaxIdleTimeout:     tcpIdleTimeout,
+					KeepAlivePeriod:    15 * time.Second,
+					MaxIncomingStreams: 256,
+				},
+			}
+
 			if logSystem {
 				log.Printf("[LISTEN] DoH3 (QUIC) on %s", addr)
 			}
+
+			served := make(chan struct{})
+			defer close(served)
+			go func() {
+				select {
+				case <-shutdownCh:
+					_ = h3Server.Close()
+				case <-served:
+				}
+			}()
+
 			return h3Server.ListenAndServe()
 		})
 	}
@@ -376,8 +434,8 @@ func StartServers(tlsConf *tls.Config) {
 	// 5. DNS over QUIC (DoQ) — RFC 9250
 	for _, addr := range filterListeners(cfg.Server.ListenDoQ) {
 		addr := addr
+		var activeDoQConns atomic.Int32
 		go superviseListener("DoQ", addr, func(attempt int) error {
-			var activeDoQConns atomic.Int32
 			doqTLS := tlsConf.Clone()
 			doqTLS.NextProtos = []string{"doq"}
 			listener, err := quic.ListenAddr(addr, doqTLS, &quic.Config{
@@ -450,3 +508,4 @@ func StartServers(tlsConf *tls.Config) {
 		})
 	}
 }
+

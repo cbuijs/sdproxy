@@ -1,11 +1,18 @@
 /*
 File:    version.go
-Version: 1.499.0
-Last Updated: 15-Oct-2026 18:55 CEST
+Version: 1.500.0
+Last Updated: 17-Oct-2026 19:54 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.500.0 - [SECURITY/FIX] Bound `shutdownCh` teardown hooks to TCP, DoT, DoH, DoH3,
+            and Web UI HTTP/HTTPS listeners (`server_init.go`, `webui.go`), moved
+            `activeDoQConns` outside the DoQ retry closure, and isolated `doh3TLS`
+            clones with explicit `h3` ALPN.
+          - [SECURITY/FIX] Added `customRulesMinLabels` floor bound and normalized
+            rule `Action` values in `rules.go` and `webui_api.go` (`handleApiRulesSet`),
+            and wired `shutdownCh` into `/api/logs` SSE streams.
   1.499.0 - [SECURITY/FIX] Wrapped UDP listeners (`server_udp_linux.go`, `server_udp_stub.go`)
             in `superviseListener` and bound their teardown to `shutdownCh`, eliminating
             runtime `log.Fatalf` calls that could crash all other active transports.
@@ -63,12 +70,12 @@ package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.499.0"
+	BuildVersion string = "v1.500.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "15-Oct-2026 18:55 CEST"
+	BuildTime string = "17-Oct-2026 19:54 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "558"
+	BuildNumber string = "559"
 )
 

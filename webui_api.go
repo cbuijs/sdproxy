@@ -1,13 +1,18 @@
 /*
 File:    webui_api.go
-Version: 1.15.0
-Last Updated: 01-Oct-2026 15:34 CEST
+Version: 1.16.0
+Last Updated: 17-Oct-2026 19:54 CEST
 
 Description:
   JSON API endpoints for the sdproxy web UI.
   Extracted from webui.go.
 
 Changes:
+  1.16.0 - [SECURITY/FIX] Validated `Action` ("ALLOW" or "BLOCK") and stripped
+           invalid or empty domains in `handleApiRulesSet` before persisting
+           and publishing custom rules.
+         - [SECURITY/FIX] Terminated `/api/logs` SSE streams cleanly when
+           `shutdownCh` closes on process exit.
   1.15.0 - [SECURITY/FIX] Resolved an issue utilizing `sync.Map` in `webuiClientBlocks` natively
            by executing map iterations explicitly safely avoiding bounded OOM restrictions organically.
 */
@@ -183,6 +188,11 @@ func handleApiLogs(w http.ResponseWriter, r *http.Request) {
 			delete(WebUILogStreamer.clients, ch)
 			WebUILogStreamer.mu.Unlock()
 			return
+		case <-shutdownCh:
+			WebUILogStreamer.mu.Lock()
+			delete(WebUILogStreamer.clients, ch)
+			WebUILogStreamer.mu.Unlock()
+			return
 		case line := <-ch:
 			for _, part := range strings.Split(line, "\n") {
 				fmt.Fprintf(w, "data: %s\n", part)
@@ -239,7 +249,31 @@ func handleApiRulesSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	SetRules(newRules)
+	// [SECURITY/FIX 1.16.0] Sanitize and validate incoming rules before committing.
+	sanitized := make([]CustomRule, 0, len(newRules))
+	for _, rule := range newRules {
+		dom := normalizeDomain(rule.Domain)
+		if dom == "" {
+			continue
+		}
+		act := strings.ToUpper(strings.TrimSpace(rule.Action))
+		if act != "ALLOW" && act != "BLOCK" {
+			sendAPIError(w, "invalid rule action: "+rule.Action)
+			return
+		}
+		grp := strings.ToLower(strings.TrimSpace(rule.Group))
+		if grp == "" {
+			grp = "global"
+		}
+		sanitized = append(sanitized, CustomRule{
+			Domain:  dom,
+			Action:  act,
+			Group:   grp,
+			Enabled: rule.Enabled,
+		})
+	}
+
+	SetRules(sanitized)
 	SaveRules()
 
 	sendAPISuccess(w, nil)
@@ -351,17 +385,6 @@ func getKnownClients() []ClientInfo {
 		}
 		// [PERF 1.12.0] Index clientsMap by MAC in a single pass before
 		// reconciling names.
-		//
-		// The previous form rescanned all of clientsMap for every entry in
-		// macToName — O(N*M) with a string comparison per step, executed inline
-		// on the Web UI request thread. This builds the lookup once and turns
-		// the reconciliation into O(N+M) map hits.
-		//
-		// "First match wins" is preserved: map iteration order is randomised, so
-		// the old inner loop's `break` already picked an arbitrary client when a
-		// MAC appeared more than once (it can, via the ARP snapshot mapping
-		// several IPs to one MAC). Keeping the FIRST index insertion reproduces
-		// that arbitrary-but-single choice exactly.
 		byMAC := make(map[string]*ClientInfo, len(clientsMap))
 		for _, c := range clientsMap {
 			if c.MAC == "" {
@@ -374,16 +397,11 @@ func getKnownClients() []ClientInfo {
 
 		for mac, name := range idSnap.macToName {
 			if c, found := byMAC[mac]; found {
-				// Name precedence unchanged: an identity already resolved from a
-				// higher-priority source is never overwritten here.
 				if c.Name == "" {
 					c.Name = name
 				}
 				continue
 			}
-			// No client carries this MAC — surface it as a MAC-only entry.
-			// Also indexed, so a duplicate MAC later in the same range does not
-			// create a second record.
 			entry := &ClientInfo{ID: mac, MAC: mac, Name: name}
 			clientsMap[mac] = entry
 			byMAC[mac] = entry
@@ -429,13 +447,6 @@ func getKnownClients() []ClientInfo {
 	})
 
 	// [FEAT 1.13.0] Materialise the last-seen tracker ONCE for the whole render.
-	//
-	// Every surviving row needs a lookup for its IP and another for its MAC. Run
-	// through statClientSeen.Get() that would be up to 2N lock/unlock round
-	// trips spread over all 32 shards, taken on the Web UI request thread while
-	// the DNS admission path is concurrently writing those same shards on every
-	// query. Snapshot() takes each shard's read lock exactly once and hands back
-	// a plain map, so the loop below finishes lock-free.
 	seenSnap := statClientSeen.Snapshot()
 
 	var wrappers []clientSortWrapper
@@ -448,14 +459,6 @@ func getKnownClients() []ClientInfo {
 			v.IsRandMAC = isRandomizedMAC(v.MAC)
 		}
 
-		// Resolve last-seen from BOTH identities and keep the newer one.
-		//
-		// They normally agree — TouchClientSeen stamps the IP and the MAC from
-		// the same clock read — but they legitimately diverge when a DHCP lease
-		// moves a device to a new address (the MAC record stays live while the
-		// old IP record ages) or when a client reaches sdproxy over DoH/DoT/DoQ
-		// from off-link and therefore has no MAC at all. Taking the max reports
-		// the most recent evidence of activity from either identity.
 		if v.IP != "" {
 			if ts, ok := seenSnap[v.IP]; ok && ts > v.LastSeen {
 				v.LastSeen = ts
@@ -467,7 +470,6 @@ func getKnownClients() []ClientInfo {
 			}
 		}
 
-		
 		cw := clientSortWrapper{info: *v}
 		if v.IP != "" {
 			if a, err := netip.ParseAddr(v.IP); err == nil {
@@ -594,9 +596,6 @@ func handleApiClientsBulkBlock(w http.ResponseWriter, r *http.Request) {
 	modifiedCount := 0
 
 	// [PERF/FIX] Evaluate map length exclusively once.
-	// Bypasses severe O(N^2) complexity spikes by ensuring bounds are tracked
-	// sequentially alongside the client array rather than calling O(N) Range scans
-	// repeatedly inside the iteration block natively.
 	count := 0
 	webuiClientBlocks.Range(func(_, _ any) bool {
 		count++

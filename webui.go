@@ -1,7 +1,7 @@
 /*
 File:    webui.go
-Version: 1.62.0 (Split)
-Last Updated: 15-Oct-2026 17:38 CEST
+Version: 1.63.0 (Split)
+Last Updated: 17-Oct-2026 19:54 CEST
 
 Description:
   Password-protected single-page web admin interface for sdproxy.
@@ -9,6 +9,9 @@ Description:
   and embedded static assets. 
 
 Changes:
+  1.63.0 - [SECURITY/FIX] Wrapped dedicated HTTP and HTTPS Web UI listeners in
+           `superviseListener` and bound their teardown to `shutdownCh` so
+           sockets release cleanly on process shutdown.
   1.62.0 - [SECURITY/FIX] Hardened `webUIMiddleware` source IP normalization and ACL
            enforcement. Previously, `ipStr` was not unmapped before checking
            `loginStates`, allowing IPv4-in-IPv6 (`::ffff:x.x.x.x`) connections to
@@ -333,26 +336,33 @@ func StartWebUI(tlsConf *tls.Config) {
 	// Dedicated HTTP servers
 	for _, addr := range httpAddrs {
 		addr := addr
-		go func() {
+		go superviseListener("WebUI-HTTP", addr, func(attempt int) error {
 			srv := &http.Server{
 				Addr:              addr,
 				Handler:           WebUIMux,
 				ReadTimeout:       10 * time.Second,
-				ReadHeaderTimeout: 5 * time.Second,  // Hardened
-				WriteTimeout:      webUIWriteTimeout, // [SECURITY 1.61.0] Slow-read bound
+				ReadHeaderTimeout: 5 * time.Second,
+				WriteTimeout:      webUIWriteTimeout,
 				IdleTimeout:       30 * time.Second,
 				MaxHeaderBytes:    4096,
-				ErrorLog:          log.New(io.Discard, "", 0), // Suppress generic scanner noise natively
+				ErrorLog:          log.New(io.Discard, "", 0),
 			}
 			if logWebUI {
 				log.Printf("[WEBUI] Admin UI (HTTP) at http://%s", addr)
 			}
-			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				if logWebUI {
-					log.Printf("[WEBUI] HTTP Server error on %s: %v", addr, err)
+
+			served := make(chan struct{})
+			defer close(served)
+			go func() {
+				select {
+				case <-shutdownCh:
+					_ = srv.Close()
+				case <-served:
 				}
-			}
-		}()
+			}()
+
+			return srv.ListenAndServe()
+		})
 	}
 
 	filteredDoH := filterListeners(cfg.Server.ListenDoH)
@@ -376,7 +386,7 @@ func StartWebUI(tlsConf *tls.Config) {
 			continue
 		}
 
-		go func() {
+		go superviseListener("WebUI-HTTPS", addr, func(attempt int) error {
 			// Restrict ALPN to HTTP-only tokens to avoid DoT/DoQ conflicts if reused
 			uiTLS := tlsConf.Clone()
 			uiTLS.NextProtos = []string{"h2", "http/1.1"}
@@ -386,21 +396,28 @@ func StartWebUI(tlsConf *tls.Config) {
 				Handler:           WebUIMux,
 				TLSConfig:         uiTLS,
 				ReadTimeout:       10 * time.Second,
-				ReadHeaderTimeout: 5 * time.Second,  // Hardened
-				WriteTimeout:      webUIWriteTimeout, // [SECURITY 1.61.0] Slow-read bound
+				ReadHeaderTimeout: 5 * time.Second,
+				WriteTimeout:      webUIWriteTimeout,
 				IdleTimeout:       30 * time.Second,
 				MaxHeaderBytes:    4096,
-				ErrorLog:          log.New(io.Discard, "", 0), // Suppress handshake EOF noise natively
+				ErrorLog:          log.New(io.Discard, "", 0),
 			}
 			if logWebUI {
 				log.Printf("[WEBUI] Admin UI (HTTPS) at https://%s", addr)
 			}
-			if err := srv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-				if logWebUI {
-					log.Printf("[WEBUI] HTTPS Server error on %s: %v", addr, err)
+
+			served := make(chan struct{})
+			defer close(served)
+			go func() {
+				select {
+				case <-shutdownCh:
+					_ = srv.Close()
+				case <-served:
 				}
-			}
-		}()
+			}()
+
+			return srv.ListenAndServeTLS("", "")
+		})
 	}
 }
 

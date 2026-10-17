@@ -1,13 +1,20 @@
 /*
 File:    rules.go
-Version: 2.2.0
-Last Updated: 24-Aug-2026 13:31 CEST
+Version: 2.3.0
+Last Updated: 17-Oct-2026 19:54 CEST
 
 Description:
   Custom Rules engine for sdproxy. Provides dynamic, immediate-effect
   allowlisting and blocklisting per-group or globally via the Web UI.
 
 Changes:
+  2.3.0 - [SECURITY/FIX] Added `customRulesMinLabels` floor bound in `LoadRules`,
+          `SetRules`, and `CheckRules` to match `walkDomainMaps` and `categoryOf`,
+          avoiding unnecessary map probes on bare TLD labels when no TLD-level
+          custom rules are active.
+        - [SECURITY/FIX] Normalized `r.Action` to uppercase (`ALLOW` or `BLOCK`)
+          during `LoadRules` and `SetRules` so hand-edited or lowercased JSON
+          files evaluate accurately in `ProcessDNS`.
   2.2.0 - [CLEANUP] Condensed string formatting sequences inside `normalizeDomain` 
           organically, shedding unnecessary multi-line buffer mutations.
   2.1.0 - [PERF/FIX] Replaced localized string counting with the globally standardized 
@@ -40,10 +47,12 @@ var (
 	customRulesMu        sync.RWMutex
 	customRules          []CustomRule
 	customRulesMap       map[string]map[string]CustomRule // group -> domain -> rule
+	customRulesMinLabels atomic.Int32
 	customRulesMaxLabels atomic.Int32
 )
 
 func init() {
+	customRulesMinLabels.Store(1)
 	customRulesMaxLabels.Store(128)
 }
 
@@ -63,6 +72,49 @@ func InitRules() {
 	customRules = []CustomRule{}
 	customRulesMap = make(map[string]map[string]CustomRule)
 	LoadRules()
+}
+
+func rebuildRulesIndexLocked() int {
+	customRulesMap = make(map[string]map[string]CustomRule)
+	activeCount := 0
+	minL, maxL := 128, 0
+
+	for i := range customRules {
+		r := &customRules[i]
+		if r.Group == "" {
+			r.Group = "global"
+		}
+		r.Group = strings.ToLower(strings.TrimSpace(r.Group))
+		r.Domain = normalizeDomain(r.Domain)
+		r.Action = strings.ToUpper(strings.TrimSpace(r.Action))
+
+		if r.Domain == "" || (r.Action != "ALLOW" && r.Action != "BLOCK") {
+			continue
+		}
+
+		if customRulesMap[r.Group] == nil {
+			customRulesMap[r.Group] = make(map[string]CustomRule)
+		}
+		customRulesMap[r.Group][r.Domain] = *r
+		if r.Enabled {
+			activeCount++
+			n := countDomainLabels(r.Domain)
+			if n < minL {
+				minL = n
+			}
+			if n > maxL {
+				maxL = n
+			}
+		}
+	}
+
+	if activeCount == 0 {
+		minL = 1
+		maxL = 128
+	}
+	customRulesMinLabels.Store(int32(minL))
+	customRulesMaxLabels.Store(int32(maxL))
+	return activeCount
 }
 
 func LoadRules() {
@@ -85,37 +137,7 @@ func LoadRules() {
 
 	customRulesMu.Lock()
 	customRules = rules
-	customRulesMap = make(map[string]map[string]CustomRule)
-
-	activeCount := 0
-	maxL := 0
-	for i := range rules {
-		r := &rules[i]
-		if r.Group == "" {
-			r.Group = "global"
-		}
-		r.Group = strings.ToLower(strings.TrimSpace(r.Group))
-		r.Domain = normalizeDomain(r.Domain)
-
-		if customRulesMap[r.Group] == nil {
-			customRulesMap[r.Group] = make(map[string]CustomRule)
-		}
-		customRulesMap[r.Group][r.Domain] = *r
-		if r.Enabled {
-			activeCount++
-			if r.Domain != "" {
-				// Utilize standardized pipeline evaluation helper cleanly
-				n := countDomainLabels(r.Domain)
-				if n > maxL {
-					maxL = n
-				}
-			}
-		}
-	}
-	if maxL == 0 {
-		maxL = 128
-	}
-	customRulesMaxLabels.Store(int32(maxL))
+	activeCount := rebuildRulesIndexLocked()
 	customRulesMu.Unlock()
 
 	if logRouting {
@@ -147,24 +169,26 @@ func CheckRules(domain string, group string) (action string, match string) {
 	customRulesMu.RLock()
 	defer customRulesMu.RUnlock()
 
-	if len(customRules) == 0 {
+	if len(customRules) == 0 || domain == "" {
 		return "", ""
 	}
 
 	group = strings.ToLower(group)
 
-	// [PERF] Resolve both maps once; the walk below would otherwise repeat two
-	// map lookups per label.
 	var groupRules map[string]CustomRule
 	if group != "" && group != "global" {
 		groupRules = customRulesMap[group]
 	}
 	globalRules := customRulesMap["global"]
 
+	if groupRules == nil && globalRules == nil {
+		return "", ""
+	}
+
 	search := domain
-	// [PERF/FIX] Execute standardized label boundary bounds organically.
 	labels := countDomainLabels(domain)
 	ceiling := int(customRulesMaxLabels.Load())
+	floor := int(customRulesMinLabels.Load())
 
 	// Skip label levels deeper than any configured rule.
 	for labels > ceiling {
@@ -190,10 +214,11 @@ func CheckRules(domain string, group string) (action string, match string) {
 		}
 
 		idx := strings.IndexByte(search, '.')
-		if idx < 0 {
+		if idx < 0 || labels <= floor {
 			break
 		}
 		search = search[idx+1:]
+		labels--
 	}
 
 	return "", ""
@@ -214,31 +239,6 @@ func SetRules(rules []CustomRule) {
 	defer customRulesMu.Unlock()
 
 	customRules = rules
-	customRulesMap = make(map[string]map[string]CustomRule)
-
-	maxL := 0
-	for i := range customRules {
-		r := &customRules[i]
-		r.Domain = normalizeDomain(r.Domain)
-		r.Group = strings.ToLower(strings.TrimSpace(r.Group))
-		if r.Group == "" {
-			r.Group = "global"
-		}
-		if customRulesMap[r.Group] == nil {
-			customRulesMap[r.Group] = make(map[string]CustomRule)
-		}
-		customRulesMap[r.Group][r.Domain] = *r
-		if r.Enabled && r.Domain != "" {
-			// Utilize standardized pipeline evaluation helper cleanly
-			n := countDomainLabels(r.Domain)
-			if n > maxL {
-				maxL = n
-			}
-		}
-	}
-	if maxL == 0 {
-		maxL = 128
-	}
-	customRulesMaxLabels.Store(int32(maxL))
+	rebuildRulesIndexLocked()
 }
 
