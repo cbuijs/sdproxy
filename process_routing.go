@@ -1,7 +1,7 @@
 /*
 File:    process_routing.go
-Version: 1.14.0
-Last Updated: 15-Oct-2026 18:20 CEST
+Version: 1.15.0
+Last Updated: 17-Oct-2026 20:00 CEST
 
 Description:
   Routing Engine for sdproxy.
@@ -11,6 +11,9 @@ Description:
     - Client Profile RCODE intercepts
 
 Changes:
+  1.15.0 - [FIX] Removed redundant `path:` prefix and trailing slash stripping on
+           `cleanPath` in `resolveClientRoute` (`hasPathRoutes` branch), as `cleanPath`
+           is already normalized at function entry.
   1.14.0 - [FIX] Normalized `rkIP` comparison in compound routes (`ForceAnd`) to
            unmap IPv4-in-IPv6 keys, and made `sni:`/`path:` matching consistent
            with case-insensitive prefix stripping and root path `"/"` preservation.
@@ -244,14 +247,7 @@ func resolveClientRoute(clientMAC, clientIP string, clientAddr netip.Addr, clien
 		}
 	}
 	if hasPathRoutes && cleanPath != "" {
-		p := cleanPath
-		if strings.HasPrefix(p, "path:") {
-			p = strings.TrimPrefix(p, "path:")
-		}
-		if len(p) > 1 {
-			p = strings.TrimSuffix(p, "/")
-		}
-		if route, ok := pathRoutes[p]; ok {
+		if route, ok := pathRoutes[cleanPath]; ok {
 			if route.Force {
 				return route, true, "PATH"
 			}

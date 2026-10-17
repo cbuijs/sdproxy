@@ -1,11 +1,15 @@
 /*
 File:    version.go
-Version: 1.500.0
-Last Updated: 17-Oct-2026 19:54 CEST
+Version: 1.501.0
+Last Updated: 17-Oct-2026 20:00 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.501.0 - [SECURITY/FIX] Preserved `key.Qclass` during background cache revalidation
+            in `process_cache.go` (`backgroundRevalidate`).
+          - [CLEANUP] Removed redundant `path:` prefix and trailing slash stripping in
+            `process_routing.go` (`resolveClientRoute`).
   1.500.0 - [SECURITY/FIX] Bound `shutdownCh` teardown hooks to TCP, DoT, DoH, DoH3,
             and Web UI HTTP/HTTPS listeners (`server_init.go`, `webui.go`), moved
             `activeDoQConns` outside the DoQ retry closure, and isolated `doh3TLS`
@@ -54,28 +58,17 @@ Changes:
             scanner/size-limit errors in `parental_loader.go` (`loadAllCategoryLists`).
           - [FIX] Sanitized accidental markdown hyperlink formatting in
             `full_reference_config.yaml`.
-  1.494.0 - [SECURITY/FIX] Removed destructive `closer.Close()` in `upstream_net.go`
-            (`exchangeHTTP`) which permanently broke `*http3.Transport` after a single
-            retry, and added a zero-progress read guard (`maxZeroReads = 64`) on
-            upstream HTTP responses.
-          - [SECURITY/FIX] Fixed multi-hop CNAME flattening and minimum TTL tracking
-            in `transform.go` (`flattenCNAME`).
-          - [SECURITY/FIX] Fixed SOA zone corruption and shared RR pointer mutation
-            in `process_spoof.go` (`spoofResponseWriter.WriteMsg`).
-          - [SECURITY/FIX] Hardened `webui_html.go` with POST-only `/logout` enforcement
-            and strike-preserving sampled eviction for `loginStates`.
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.500.0"
+	BuildVersion string = "v1.501.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "17-Oct-2026 19:54 CEST"
+	BuildTime string = "17-Oct-2026 20:00 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "559"
+	BuildNumber string = "560"
 )
-

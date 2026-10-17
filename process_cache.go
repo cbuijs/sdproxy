@@ -1,7 +1,7 @@
 /*
 File:    process_cache.go
-Version: 1.27.0
-Last Updated: 15-Oct-2026 17:55 CEST
+Version: 1.28.0
+Last Updated: 17-Oct-2026 20:00 CEST
 
 Description:
   Background cache revalidation and synthetic message builders.
@@ -9,6 +9,8 @@ Description:
   message synthesis from the direct execution pipeline.
 
 Changes:
+  1.28.0 - [SECURITY/FIX] Preserved `key.Qclass` in `backgroundRevalidate` instead
+           of hardcoding `dns.ClassINET` via `SetQuestion`.
   1.27.0 - [SECURITY/FIX] Preserved `key.RecursionDesired` in `backgroundRevalidate`.
            Previously, `req.RecursionDesired` was hardcoded to `true`, causing
            background revalidation of an `RD=0` cache entry to query upstreams
@@ -121,6 +123,9 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 	req := msgPool.Get().(*dns.Msg)
 	*req = dns.Msg{}
 	req.SetQuestion(dns.Fqdn(key.Name), key.Qtype)
+	if key.Qclass != 0 {
+		req.Question[0].Qclass = key.Qclass
+	}
 	// [SECURITY/FIX 1.27.0] Preserve the exact RecursionDesired state from the cache key.
 	req.RecursionDesired = key.RecursionDesired
 	// [SECURITY/FIX] Inherit CheckingDisabled status to preserve DNSSEC integrity natively
@@ -212,4 +217,3 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 		success = false 
 	}
 }
-
