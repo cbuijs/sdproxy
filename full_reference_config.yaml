@@ -246,18 +246,20 @@ server:
     # Domains to explicitly exempt from subdomain limit tracking.
     # Major CDNs and cloud providers frequently use dynamic subdomains natively.
     exempt:
+      - "aaplimg.com"
       - "akadns.net"
       - "akamaized.net"
       - "amazonaws.com"
       - "apple.com"
       - "apple-dns.net"
+      #- "arpa"
       - "browserleaks.com"
       - "cloud.microsoft"
       - "cloudfront.net"
       - "google.com"
       - "googleapis.com"
       - "ip6.arpa"
-      - "in-addr.arpa"
+      - "ip-addr.arpa"
       - "live.com"
       - "microsoft.com"
       - "microsoft.net"
