@@ -1,7 +1,7 @@
 /*
 File:    subdomain_limit.go
-Version: 1.3.0
-Last Updated: 23-Oct-2026 12:45 CEST
+Version: 1.4.0
+Last Updated: 24-Oct-2026 11:42 CEST
 
 Description:
   Subdomain Rate Limiting engine for sdproxy.
@@ -10,6 +10,16 @@ Description:
   data is smuggled via dynamically generated label prefixes.
 
 Changes:
+  1.4.0 - [SECURITY/FIX] Fixed `exempt:` domain matching in `AnalyzeSubdomainLimit`
+          and `addSDLExempt`:
+          1. Added a label-by-label suffix walk (`isSDLExempt`) so single-label/TLD
+             exemptions (e.g. `arpa`, `local`), multi-label subdomain exemptions
+             (e.g. `in-addr.arpa`, `ip6.arpa`, `dns.quad9.net`), and comma-separated
+             entries in `exempt:` match the queried domain and all of its subdomains
+             instead of only checking `sdlExempt[apex]`.
+          2. Stopped `addSDLExempt` from promoting multi-label exemptions (such as
+             `in-addr.arpa`, `ip6.arpa`, or `dns.quad9.net`) to their parent eTLD+1
+             only, while avoiding poisoning entire TLDs unless explicitly configured.
   1.3.0 - [FEAT] Added support for `cfg.Server.SubdomainLimit.ExemptSharedHosting`
           to optionally exempt all domains (and their eTLD+1 apexes) in
           `sharedHostingDomains` (`sharedhosting.go`) from subdomain limit tracking.
@@ -17,18 +27,10 @@ Changes:
           (e.g. `dns.quad9.net`) via `extractETLDPlusOne` and checked both `apex`
           and `isSharedHostingDomain(qname)` when `exempt_shared_hosting` is enabled.
   1.2.0 - [SECURITY/FIX] Prevented newly created `sdlBucket` entries from evicting
-          active or blocked buckets before `bucket.blocked` expires. Previously,
-          the sweeper and sampled eviction compared `b.lastUpdate` instead of
-          preserving blocked apexes for the full `windowStart + windowNanos`
-          duration, allowing an attacker to flood random apexes and evict a
-          currently blocked exfiltration domain.
+          active or blocked buckets before `bucket.blocked` expires.
   1.1.0 - [SECURITY/FIX] Replaced sliding `lastUpdate` window checks with a fixed 
-          `windowStart` anchor. Previously, sustained queries below the threshold 
-          reset `lastUpdate` on every packet, preventing the window from ever 
-          expiring and permanently banning active domains.
-  1.0.0 - Initial implementation. Features sharded mutex locks for O(1) 
-          hot-path throughput, cryptographic map hashing to prevent DoS, 
-          and autonomous sampled eviction sweeps.
+          `windowStart` anchor.
+  1.0.0 - Initial implementation.
 */
 
 package main
@@ -61,16 +63,41 @@ var (
 	sdlExempt   map[string]bool
 )
 
-// addSDLExempt registers a domain and its eTLD+1 apex in sdlExempt.
-func addSDLExempt(d string) {
-	clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(d), "."))
-	if clean == "" {
-		return
+// addSDLExempt registers one or more comma-separated domain suffixes in sdlExempt.
+func addSDLExempt(raw string) {
+	for _, part := range strings.Split(raw, ",") {
+		clean := strings.ToLower(strings.Trim(strings.TrimSpace(part), "."))
+		clean = strings.TrimPrefix(clean, "*.")
+		if clean == "" {
+			continue
+		}
+		sdlExempt[clean] = true
 	}
-	sdlExempt[clean] = true
-	if apex, _ := extractETLDPlusOne(clean); apex != "" {
-		sdlExempt[apex] = true
+}
+
+// isSDLExempt performs a zero-allocation label-by-label suffix walk over qname
+// and also checks the extracted apex, ensuring bare TLDs ("arpa", "local"),
+// zone delegations ("in-addr.arpa", "ip6.arpa"), apexes ("example.com"), and
+// specific sub-trees ("sub.example.com") in sdlExempt all match any subdomain.
+func isSDLExempt(qname, apex string) bool {
+	if len(sdlExempt) == 0 {
+		return false
 	}
+	if apex != "" && sdlExempt[apex] {
+		return true
+	}
+	search := qname
+	for {
+		if sdlExempt[search] {
+			return true
+		}
+		idx := strings.IndexByte(search, '.')
+		if idx < 0 {
+			break
+		}
+		search = search[idx+1:]
+	}
+	return false
 }
 
 // InitSubdomainLimit initializes the trackers and bounds needed to defend against
@@ -95,14 +122,12 @@ func InitSubdomainLimit() {
 		addSDLExempt(d)
 	}
 
-	// [SECURITY/PERF] Auto-trust infrastructure platforms explicitly.
-	// Massive CDNs and tech platforms organically cycle subdomains natively, 
-	// evaluating them through the rate limiter blindly invites severe false positives.
+	// Auto-trust infrastructure platforms explicitly.
 	for _, d := range dgaSafeDomains {
 		addSDLExempt(d)
 	}
 
-	// [FEAT 1.3.0] Optionally include sharedHostingDomains from sharedhosting.go
+	// Optionally include sharedHostingDomains from sharedhosting.go
 	if cfg.Server.SubdomainLimit.ExemptSharedHosting {
 		for d := range sharedHostingDomains {
 			addSDLExempt(d)
@@ -110,8 +135,8 @@ func InitSubdomainLimit() {
 	}
 
 	if logSystem {
-		log.Printf("[SUBDOMAIN-LIMIT] Active: Threshold %d unique subdomains per %d mins | Max Apexes: %d | Exempt Shared Hosting: %v | Action: %s",
-			cfg.Server.SubdomainLimit.Threshold, cfg.Server.SubdomainLimit.WindowMinutes, cfg.Server.SubdomainLimit.MaxTrackedApexes, cfg.Server.SubdomainLimit.ExemptSharedHosting, cfg.Server.SubdomainLimit.Action)
+		log.Printf("[SUBDOMAIN-LIMIT] Active: Threshold %d unique subdomains per %d mins | Max Apexes: %d | Exempt Rules: %d (User: %d) | Exempt Shared Hosting: %v | Action: %s",
+			cfg.Server.SubdomainLimit.Threshold, cfg.Server.SubdomainLimit.WindowMinutes, cfg.Server.SubdomainLimit.MaxTrackedApexes, len(sdlExempt), len(cfg.Server.SubdomainLimit.Exempt), cfg.Server.SubdomainLimit.ExemptSharedHosting, cfg.Server.SubdomainLimit.Action)
 	}
 
 	go runSubdomainLimitSweeper()
@@ -133,7 +158,7 @@ func AnalyzeSubdomainLimit(qname string) (bool, string) {
 		return true, ""
 	}
 
-	if sdlExempt[apex] {
+	if isSDLExempt(qname, apex) {
 		return true, ""
 	}
 
@@ -160,8 +185,6 @@ func AnalyzeSubdomainLimit(qname string) (bool, string) {
 		if maxPerShard < 1 {
 			maxPerShard = 1
 		}
-		// [SECURITY/FIX 1.2.0] Two-tier sampled eviction: prefer unblocked or
-		// expired buckets over actively blocked exfiltration apexes.
 		if len(shard.buckets) >= maxPerShard {
 			var (
 				bestKey       string
@@ -196,8 +219,6 @@ func AnalyzeSubdomainLimit(qname string) (bool, string) {
 		shard.buckets[apex] = bucket
 	}
 
-	// [SECURITY/FIX 1.1.0] Evaluate against windowStart so sustained traffic 
-	// cannot infinitely extend the window or lock a blocked domain forever.
 	if now-bucket.windowStart > windowNanos {
 		clear(bucket.subs)
 		bucket.blocked = false
@@ -210,11 +231,9 @@ func AnalyzeSubdomainLimit(qname string) (bool, string) {
 		return false, cfg.Server.SubdomainLimit.Action
 	}
 
-	// Execute mathematical hash compression on the subdomain string to conserve RAM globally
 	subHash := maphash.String(sdlHashSeed, subdomain)
 	bucket.subs[subHash] = struct{}{}
 
-	// Instant block trigger upon reaching limits
 	if len(bucket.subs) > cfg.Server.SubdomainLimit.Threshold {
 		bucket.blocked = true
 		return false, cfg.Server.SubdomainLimit.Action
@@ -251,3 +270,4 @@ func runSubdomainLimitSweeper() {
 		}
 	}
 }
+

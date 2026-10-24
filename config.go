@@ -1,7 +1,7 @@
 /*
 File:    config.go
-Version: 1.83.0
-Last Updated: 23-Oct-2026 17:03 CEST
+Version: 1.84.0
+Last Updated: 24-Oct-2026 11:42 CEST
 
 Description:
   All YAML-mapped configuration structs for sdproxy. Covers every top-level
@@ -10,6 +10,11 @@ Description:
   and spoofed records (RRs).
 
 Changes:
+  1.84.0 - [FIX] Extracted `SubdomainLimitConfig` and added YAML alias support
+           for `subdomain_limiter`, `subnet_limiter`, and `subnet_limit` under
+           `server:` so configurations using `subnet_limiter:` or
+           `subdomain_limiter:` are merged into `cfg.Server.SubdomainLimit`
+           instead of being silently ignored by `yaml.v3`.
   1.83.0 - [FIX] Handled escaped forward slashes (`\/`) inside character classes
            `[...]` and preserved regex patterns containing unescaped `/` inside
            character classes (e.g. `/^[a/b]\.com$/`) in `splitDomainPolicyKeys`.
@@ -34,9 +39,7 @@ Changes:
            under `Server.SubdomainLimit` (default: false) to optionally include
            `sharedHostingDomains` from `sharedhosting.go` as exempted domains.
   1.76.0 - [SECURITY/FIX] Resolved YAML unmarshaling nil pointer dereference 
-           vulnerabilities. Instantiated default map structures natively within 
-           `UnmarshalYAML` logic for `RouteConfig`, `DomainRouteConfig`, and 
-           `UpstreamGroupConfig` to definitively prevent panics on partial arrays.
+           vulnerabilities.
   1.75.0 - [FEAT] Added `SubdomainLimit` configuration structures and validation bounds.
 */
 
@@ -276,6 +279,45 @@ type ECSConfig struct {
 	Action   string `yaml:"action"`
 	IPv4Mask int    `yaml:"ipv4_mask"`
 	IPv6Mask int    `yaml:"ipv6_mask"`
+}
+
+// ---------------------------------------------------------------------------
+// SubdomainLimitConfig
+// ---------------------------------------------------------------------------
+
+// SubdomainLimitConfig configures subdomain rate limiting (Info-Stealer / DNS Tunneling defense).
+type SubdomainLimitConfig struct {
+	Enabled             bool     `yaml:"enabled"`
+	Threshold           int      `yaml:"threshold"`
+	WindowMinutes       int      `yaml:"window_minutes"`
+	Action              string   `yaml:"action"`
+	MaxTrackedApexes    int      `yaml:"max_tracked_apexes"`
+	ExemptSharedHosting bool     `yaml:"exempt_shared_hosting"`
+	Exempt              []string `yaml:"exempt"`
+}
+
+func mergeSubdomainLimitConfig(dst *SubdomainLimitConfig, src SubdomainLimitConfig) {
+	if src.Enabled {
+		dst.Enabled = true
+	}
+	if src.Threshold > 0 && dst.Threshold == 0 {
+		dst.Threshold = src.Threshold
+	}
+	if src.WindowMinutes > 0 && dst.WindowMinutes == 0 {
+		dst.WindowMinutes = src.WindowMinutes
+	}
+	if src.Action != "" && dst.Action == "" {
+		dst.Action = src.Action
+	}
+	if src.MaxTrackedApexes > 0 && dst.MaxTrackedApexes == 0 {
+		dst.MaxTrackedApexes = src.MaxTrackedApexes
+	}
+	if src.ExemptSharedHosting {
+		dst.ExemptSharedHosting = true
+	}
+	if len(src.Exempt) > 0 {
+		dst.Exempt = append(dst.Exempt, src.Exempt...)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -555,16 +597,11 @@ type Config struct {
 			} `yaml:"penalty_box"`
 		} `yaml:"exfiltration"`
 
-		// Subdomain Rate Limiting (Info-Stealer Defense)
-		SubdomainLimit struct {
-			Enabled             bool     `yaml:"enabled"`
-			Threshold           int      `yaml:"threshold"`
-			WindowMinutes       int      `yaml:"window_minutes"`
-			Action              string   `yaml:"action"`
-			MaxTrackedApexes    int      `yaml:"max_tracked_apexes"`
-			ExemptSharedHosting bool     `yaml:"exempt_shared_hosting"`
-			Exempt              []string `yaml:"exempt"`
-		} `yaml:"subdomain_limit"`
+		// Subdomain Rate Limiting (Info-Stealer Defense) + common YAML key aliases
+		SubdomainLimit   SubdomainLimitConfig `yaml:"subdomain_limit"`
+		SubdomainLimiter SubdomainLimitConfig `yaml:"subdomain_limiter"`
+		SubnetLimiter    SubdomainLimitConfig `yaml:"subnet_limiter"`
+		SubnetLimit      SubdomainLimitConfig `yaml:"subnet_limit"`
 
 		SupportIPVersion           string    `yaml:"support_ip_version"`
 		BlockAction                string    `yaml:"block_action"`
@@ -722,6 +759,11 @@ func validateConfig() error {
 	if cfg.Server.MaxSecureUpstreams <= 0 {
 		cfg.Server.MaxSecureUpstreams = 5
 	}
+
+	// Merge subdomain_limiter / subnet_limiter / subnet_limit aliases into SubdomainLimit
+	mergeSubdomainLimitConfig(&cfg.Server.SubdomainLimit, cfg.Server.SubdomainLimiter)
+	mergeSubdomainLimitConfig(&cfg.Server.SubdomainLimit, cfg.Server.SubnetLimiter)
+	mergeSubdomainLimitConfig(&cfg.Server.SubdomainLimit, cfg.Server.SubnetLimit)
 
 	// Subdomain Limit Normalization
 	if cfg.Server.SubdomainLimit.Enabled {
@@ -975,3 +1017,4 @@ func validateConfig() error {
 
 	return nil
 }
+

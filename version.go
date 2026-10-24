@@ -1,11 +1,17 @@
 /*
 File:    version.go
-Version: 1.533.0
-Last Updated: 23-Oct-2026 17:18 CEST
+Version: 1.534.0
+Last Updated: 24-Oct-2026 11:42 CEST
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.534.0 - [SECURITY/FIX] Fixed `exempt:` domain matching in `subdomain_limit.go`
+            via a label-by-label suffix walk (`isSDLExempt`) so bare TLDs (`arpa`,
+            `local`), multi-label zones (`in-addr.arpa`, `ip6.arpa`,
+            `sub.example.com`), and comma-separated entries exempt the domain and
+            all of its subdomains, and added YAML alias support in `config.go` for
+            `subdomain_limiter:`, `subnet_limiter:`, and `subnet_limit:`.
   1.533.0 - [SECURITY/FIX] Persisted metadata (`LastFetch`) on HTTP `304 Not Modified`
             across `identity_asn.go`, `init_policy.go`, and `parental_loader.go` so
             the 3-hour freshness TTL survives restarts; checked `scanner.Err()` on
@@ -41,23 +47,18 @@ Changes:
             parsers cannot strip `[T any]` type parameters.
   1.529.1 - [FIX] Added `loadCompiledPolicyGob` in `helpers_io.go` and updated
             `init_policy.go` to avoid bracketed generic instantiation syntax.
-  1.529.0 - [FEAT] Added regular expression matching (`/pattern/`) for DNS domains
-            in `domain_policy:`, `domain_policy_files:`, `domain_policy_urls:`,
-            `rrs:`, and `groups.<group>.rrs:`, including load/startup regex syntax
-            validation (`config.go`, `globals.go`, `init_core.go`, `init_policy.go`,
-            `policy.go`, `process_spoof.go`, `full_reference_config.yaml`).
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.533.0"
+	BuildVersion string = "v1.534.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "23-Oct-2026 17:18 CEST"
+	BuildTime string = "24-Oct-2026 11:42 CEST"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "598"
+	BuildNumber string = "599"
 )
 
