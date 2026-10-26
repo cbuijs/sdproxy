@@ -267,6 +267,7 @@ server:
       - "live.com"
       - "microsoft.com"
       - "microsoft.net"
+      - "mullvad.net"
       - "office.net"
       - "windows.net"
 
