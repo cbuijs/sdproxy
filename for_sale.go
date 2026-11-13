@@ -1,7 +1,7 @@
 /*
 File:    for_sale.go
-Version: 1.13.0
-Last Updated: 13-Nov-2026 13:15 CET
+Version: 1.14.0
+Last Updated: 13-Nov-2026 14:10 CET
 
 Description:
   RFC 10023 ("The '_for-sale' Underscored and Globally Scoped DNS Node Name")
@@ -12,6 +12,11 @@ Description:
   records using the query's resolved upstream group.
 
 Changes:
+  1.14.0 - [SECURITY/FIX] Treated `consensus-log(...)` responses from
+           `group.Exchange` in `probeForSaleTarget` identically to `consensus(...)`
+           failure responses (`fsFailTTL`), preventing unverified consensus-failed
+           responses in `block_action: "LOG"` mode from being cached as valid
+           RFC 10023 `_for-sale.` verdicts.
   1.13.0 - [SECURITY/FIX] Treated `consensus(...)` failure responses from
            `group.Exchange` in `probeForSaleTarget` as probe failures (`fsFailTTL`)
            rather than valid negative DNS responses (`fsNegTTL`).
@@ -33,8 +38,6 @@ Changes:
   1.6.0  - [SECURITY/FIX] Cached negative verdicts in `enforceForSaleResponseCheck`.
   1.5.0  - [SECURITY/FIX] Attached validated incoming `EDNS0_SUBNET` (`ecsAddr` /
            `ecsPrefix`) to outbound `_for-sale.` probe requests when `group.ECSAction == "pass"`.
-  1.4.0  - [SECURITY/FIX] Aligned `mainKey` DNS cache lookaside in `probeForSaleTarget`
-           with the client query's `BypassGlobal` and `BypassPolicies` partitions.
 */
 
 package main
@@ -439,7 +442,7 @@ func probeForSaleTarget(parentCtx context.Context, group *UpstreamGroup, routeId
 		msgPool.Put(req)
 
 		var entry fsCacheEntry
-		if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") {
+		if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") || strings.HasPrefix(uAddr, "consensus-log(") {
 			entry = fsCacheEntry{
 				forSale:    false,
 				expireNano: time.Now().Add(fsFailTTL).UnixNano(),

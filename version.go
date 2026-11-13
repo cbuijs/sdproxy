@@ -1,11 +1,19 @@
 /*
 File:    version.go
-Version: 1.605.0
-Last Updated: 13-Nov-2026 13:30 CET
+Version: 1.606.1
+Last Updated: 13-Nov-2026 14:20 CET
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.606.1 - [FIX] Fixed `r.ownerZone` struct field reference in `probeParkedTarget`
+            (`parked.go` 1.15.1).
+  1.606.0 - [SECURITY/FIX] Treated `consensus-log(...)` responses identically to
+            `consensus(...)` failure responses in `probeForSaleTarget` (`for_sale.go`
+            1.14.0), `probeParkedTarget` (`parked.go` 1.15.0), and
+            `backgroundRevalidate` (`process_cache.go` 1.34.0) so unverified
+            consensus-failed responses in `block_action: "LOG"` mode are never
+            cached by internal probes or background cache revalidators.
   1.605.0 - [SECURITY/FIX] Honored `block_action: "LOG"` on `strategy: "secure"`
             consensus validation failures (`upstream_race.go` 2.64.0,
             `process_upstream.go` 1.25.0) so audit mode logs the consensus mismatch
@@ -62,31 +70,17 @@ Changes:
             TTLs are never written back into the shared cache item, and merged
             secondary `client-name` route properties in `ProcessDNS` (`process.go`
             3.123.0) when a higher-precedence route overrides `client_name`.
-  1.597.0 - [SECURITY/FIX/CLEANUP] Preserved original positive `Answer` and `Extra`
-            record TTLs on cache hits when `remaining >= rr.Header().Ttl` in
-            `CacheGet` and `CacheGetExpired` (`cache_rw.go` 1.31.0), and pruned
-            unused parameters from `enforceSecurityGuards` (`process_security.go`
-            1.32.0) and `determineRouting` (`process_routing.go` 1.22.0,
-            `process.go` 3.122.0).
-  1.596.0 - [SECURITY/FIX] Handled `CNAME` queries across all hops in
-            `handleSpoofedRecords` (`process_spoof.go` 1.34.0) without mutating
-            `q.Name`, evaluated `walkDomainMaps` against `originalQNameTrimmed`
-            before `qNameTrimmed` in `determineRouting` (`process_routing.go`
-            1.21.0) so `rrs:` CNAME aliases cannot bypass `domain_policy` blocks
-            on the original queried domain, and re-evaluated forced client-name
-            routes in `ProcessDNS` (`process.go` 3.121.0) when a route overrides
-            `client_name`.
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.605.0"
+	BuildVersion string = "v1.606.1"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "13-Nov-2026 13:30 CET"
+	BuildTime string = "13-Nov-2026 14:20 CET"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "673"
+	BuildNumber string = "675"
 )

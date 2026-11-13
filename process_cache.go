@@ -1,7 +1,7 @@
 /*
 File:    process_cache.go
-Version: 1.33.0
-Last Updated: 13-Nov-2026 13:15 CET
+Version: 1.34.0
+Last Updated: 13-Nov-2026 14:10 CET
 
 Description:
   Background cache revalidation and synthetic message builders.
@@ -9,6 +9,10 @@ Description:
   message synthesis from the direct execution pipeline.
 
 Changes:
+  1.34.0 - [SECURITY/FIX] Rejected `consensus-log(...)` responses alongside
+           `consensus(...)` in `backgroundRevalidate` so unverified consensus-failed
+           responses in `block_action: "LOG"` mode never overwrite valid cached
+           records during background refreshes.
   1.33.0 - [SECURITY/FIX] Rejected synthetic consensus failure responses
            (`strings.HasPrefix(addr, "consensus(")`) in `backgroundRevalidate`
            so background cache refreshes never overwrite valid cached records
@@ -193,11 +197,13 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 
 	msg, addr, err := group.Exchange(ctx, req, clientID, clientName, bgAddr)
 
+	isConsensusFail := strings.HasPrefix(addr, "consensus(") || strings.HasPrefix(addr, "consensus-log(")
+
 	if logCaching {
 		var status string
 		if err != nil {
 			status = fmt.Sprintf("FAILED: %v", err)
-		} else if strings.HasPrefix(addr, "consensus(") {
+		} else if isConsensusFail {
 			status = "CONSENSUS FAILED"
 		} else if msg != nil {
 			status = RcodeStr(msg.Rcode)
@@ -209,7 +215,7 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 
 	msgPool.Put(req)
 
-	if err != nil || msg == nil || strings.HasPrefix(addr, "consensus(") {
+	if err != nil || msg == nil || isConsensusFail {
 		return
 	}
 

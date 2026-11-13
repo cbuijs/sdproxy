@@ -1,7 +1,7 @@
 /*
 File:    parked.go
-Version: 1.14.0
-Last Updated: 13-Nov-2026 13:15 CET
+Version: 1.15.1
+Last Updated: 13-Nov-2026 14:20 CET
 
 Description:
   Parked Domain detection and enforcement engine for sdproxy.
@@ -13,6 +13,12 @@ Description:
   ParkLogic, RookMedia, Skenzo/Ztomy, Fabulous, etc.).
 
 Changes:
+  1.15.1 - [FIX] Fixed `r.ownerZone` struct field reference in `probeParkedTarget`.
+  1.15.0 - [SECURITY/FIX] Treated `consensus-log(...)` responses from
+           `group.Exchange` in `probeParkedTarget` identically to `consensus(...)`
+           failure responses (`ok: false` / `pkFailTTL`), preventing unverified
+           consensus-failed responses in `block_action: "LOG"` mode from being
+           cached as valid parked-domain verdicts.
   1.14.0 - [SECURITY/FIX] Treated `consensus(...)` failure responses from
            `group.Exchange` in `probeParkedTarget` as probe failures (`ok: false` /
            `pkFailTTL`) rather than valid negative DNS responses (`pkNegTTL`).
@@ -34,10 +40,6 @@ Changes:
            cache lookaside.
   1.7.0  - [FEAT] Added `cacheHit` tracking and Simple Logging Mode (`logSimple` /
            `logQuerySimple`) support in `applyParkedVerdict`.
-  1.6.0  - [SECURITY/FIX] Hardened `inspectMsgForParking` to verify that `matchedOwner`
-           in `msg.Answer` is the queried domain or a parent zone.
-  1.5.0  - [SECURITY/FIX] Hardened `inspectMsgForParking` to attribute Authority
-           (`msg.Ns`) NS/SOA parking matches to the authority record's owner zone.
 */
 
 package main
@@ -716,7 +718,7 @@ func probeParkedTarget(parentCtx context.Context, group *UpstreamGroup, routeIdx
 				resp, uAddr, err := group.Exchange(ctx, req, clientID, clientName, clientAddr)
 				msgPool.Put(req)
 
-				if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") {
+				if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") || strings.HasPrefix(uAddr, "consensus-log(") {
 					subCh <- subRes{ok: false}
 					return
 				}
