@@ -1,11 +1,17 @@
 /*
 File:    version.go
-Version: 1.603.0
-Last Updated: 13-Nov-2026 12:45 CET
+Version: 1.604.0
+Last Updated: 13-Nov-2026 13:15 CET
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.604.0 - [SECURITY/FIX] Treated `consensus(...)` failure responses from
+            `group.Exchange` as probe/revalidation failures rather than valid
+            DNS responses in `probeForSaleTarget` (`for_sale.go` 1.13.0),
+            `probeParkedTarget` (`parked.go` 1.14.0), and `backgroundRevalidate`
+            (`process_cache.go` 1.33.0), and pre-sorted `ip-sort` answers in
+            `backgroundRevalidate` for parity with `serveFromUpstream`.
   1.603.0 - [SECURITY/FIX/PERF] Permitted a forced `client-name` route to override
             or merge with an initial forced route that overrode `client_name` in
             `ProcessDNS` (`process.go` 3.126.0), and cancelled `raceCtx` immediately
@@ -71,21 +77,17 @@ Changes:
             hops with cycle detection) in `handleSpoofedRecords` (`process_spoof.go`
             1.33.0); and included `GlobalDoH3Thresh` in `computeRouteConfigHash`
             (`cache_persistence.go` 2.8.0).
-  1.594.0 - [FEAT] Added configurable `doh3_fallback_threshold` under `server:`
-            and per-group `upstreams:` (`config.go` 1.100.0, `init_upstreams.go`
-            1.9.0, `upstream.go` 2.56.0, `upstream_ddr.go` 2.56.0, `upstream_exchange.go`
-            3.6.0, `upstream_net.go` 1.43.0, `upstream_parser.go` 2.55.0).
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.603.0"
+	BuildVersion string = "v1.604.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "13-Nov-2026 12:45 CET"
+	BuildTime string = "13-Nov-2026 13:15 CET"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "671"
+	BuildNumber string = "672"
 )

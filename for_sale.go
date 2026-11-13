@@ -1,7 +1,7 @@
 /*
 File:    for_sale.go
-Version: 1.12.0
-Last Updated: 05-Nov-2026 17:30 CET
+Version: 1.13.0
+Last Updated: 13-Nov-2026 13:15 CET
 
 Description:
   RFC 10023 ("The '_for-sale' Underscored and Globally Scoped DNS Node Name")
@@ -12,6 +12,9 @@ Description:
   records using the query's resolved upstream group.
 
 Changes:
+  1.13.0 - [SECURITY/FIX] Treated `consensus(...)` failure responses from
+           `group.Exchange` in `probeForSaleTarget` as probe failures (`fsFailTTL`)
+           rather than valid negative DNS responses (`fsNegTTL`).
   1.12.0 - [SECURITY/FIX] Evaluated `qc.originalQNameTrimmed` in addition to
            `qc.qNameTrimmed` in `enforceForSaleCachedOnly` and `enforceForSaleCheck`
            when a query was rewritten by an `rrs:` CNAME alias, preventing CNAME
@@ -32,7 +35,6 @@ Changes:
            `ecsPrefix`) to outbound `_for-sale.` probe requests when `group.ECSAction == "pass"`.
   1.4.0  - [SECURITY/FIX] Aligned `mainKey` DNS cache lookaside in `probeForSaleTarget`
            with the client query's `BypassGlobal` and `BypassPolicies` partitions.
-  1.3.0  - [SECURITY/FIX] Decoupled the `singleflight.Group` upstream exchange context.
 */
 
 package main
@@ -432,12 +434,12 @@ func probeForSaleTarget(parentCtx context.Context, group *UpstreamGroup, routeId
 		}
 
 		ctx, cancel := context.WithTimeout(WithBypassUpstreamThrottle(context.Background()), fsProbeBudget)
-		resp, _, err := group.Exchange(ctx, req, clientID, clientName, clientAddr)
+		resp, uAddr, err := group.Exchange(ctx, req, clientID, clientName, clientAddr)
 		cancel()
 		msgPool.Put(req)
 
 		var entry fsCacheEntry
-		if err != nil || resp == nil {
+		if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") {
 			entry = fsCacheEntry{
 				forSale:    false,
 				expireNano: time.Now().Add(fsFailTTL).UnixNano(),

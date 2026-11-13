@@ -1,7 +1,7 @@
 /*
 File:    process_cache.go
-Version: 1.32.0
-Last Updated: 05-Nov-2026 16:36 CET
+Version: 1.33.0
+Last Updated: 13-Nov-2026 13:15 CET
 
 Description:
   Background cache revalidation and synthetic message builders.
@@ -9,6 +9,10 @@ Description:
   message synthesis from the direct execution pipeline.
 
 Changes:
+  1.33.0 - [SECURITY/FIX] Rejected synthetic consensus failure responses
+           (`strings.HasPrefix(addr, "consensus(")`) in `backgroundRevalidate`
+           so background cache refreshes never overwrite valid cached records
+           with synthetic consensus block payloads.
   1.32.0 - [CRITICAL/FIX] Marked `backgroundRevalidate` context with
            `WithBypassUpstreamThrottle` (`throttle.go` 2.7.0) since background
            revalidation is already bounded by the 32-slot `revalSem` semaphore
@@ -37,6 +41,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/miekg/dns"
@@ -192,6 +197,8 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 		var status string
 		if err != nil {
 			status = fmt.Sprintf("FAILED: %v", err)
+		} else if strings.HasPrefix(addr, "consensus(") {
+			status = "CONSENSUS FAILED"
 		} else if msg != nil {
 			status = RcodeStr(msg.Rcode)
 		}
@@ -202,8 +209,12 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 
 	msgPool.Put(req)
 
-	if err != nil || msg == nil {
+	if err != nil || msg == nil || strings.HasPrefix(addr, "consensus(") {
 		return
+	}
+
+	if cfg.Cache.AnswerSort == "ip-sort" {
+		applyAnswerSort(msg, "ip-sort")
 	}
 
 	isNeg := msg.Rcode == dns.RcodeNameError || (msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)

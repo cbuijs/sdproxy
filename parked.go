@@ -1,7 +1,7 @@
 /*
 File:    parked.go
-Version: 1.13.0
-Last Updated: 05-Nov-2026 17:30 CET
+Version: 1.14.0
+Last Updated: 13-Nov-2026 13:15 CET
 
 Description:
   Parked Domain detection and enforcement engine for sdproxy.
@@ -13,6 +13,9 @@ Description:
   ParkLogic, RookMedia, Skenzo/Ztomy, Fabulous, etc.).
 
 Changes:
+  1.14.0 - [SECURITY/FIX] Treated `consensus(...)` failure responses from
+           `group.Exchange` in `probeParkedTarget` as probe failures (`ok: false` /
+           `pkFailTTL`) rather than valid negative DNS responses (`pkNegTTL`).
   1.13.0 - [SECURITY/FIX] Evaluated `qc.originalQNameTrimmed` in addition to
            `qc.qNameTrimmed` in `enforceParkedCachedOnly` and `enforceParkedCheck`
            when a query was rewritten by an `rrs:` CNAME alias, preventing CNAME
@@ -35,8 +38,6 @@ Changes:
            in `msg.Answer` is the queried domain or a parent zone.
   1.5.0  - [SECURITY/FIX] Hardened `inspectMsgForParking` to attribute Authority
            (`msg.Ns`) NS/SOA parking matches to the authority record's owner zone.
-  1.4.0  - [SECURITY/FIX] Attached validated incoming `EDNS0_SUBNET` (`ecsAddr` /
-           `ecsPrefix`) to outbound parked probe requests when `group.ECSAction == "pass"`.
 */
 
 package main
@@ -712,10 +713,10 @@ func probeParkedTarget(parentCtx context.Context, group *UpstreamGroup, routeIdx
 					injectPassedECS(req, ecsAddr, ecsPrefix)
 				}
 
-				resp, _, err := group.Exchange(ctx, req, clientID, clientName, clientAddr)
+				resp, uAddr, err := group.Exchange(ctx, req, clientID, clientName, clientAddr)
 				msgPool.Put(req)
 
-				if err != nil || resp == nil {
+				if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") {
 					subCh <- subRes{ok: false}
 					return
 				}
