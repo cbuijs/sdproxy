@@ -1,12 +1,16 @@
 /*
 File:    process.go
-Version: 3.124.0
-Last Updated: 12-Nov-2026 17:10 CET
+Version: 3.125.0
+Last Updated: 13-Nov-2026 12:35 CET
 
 Description:
   Master orchestrator for the sdproxy per-query DNS resolution pipeline.
 
 Changes:
+  3.125.0 - [SECURITY/FIX] Preserved non-empty `Upstream`, `HasRcode`/`Rcode`,
+            `BypassLocal`, and `BypassGlobal` fields from the primary route when
+            a `client_name` override triggers a secondary `cr2` match with
+            `cr2.Force == true` that leaves those fields unset.
   3.124.0 - [SECURITY/FIX] Re-evaluated `clientGroup` upstream/bypass_local
             fallback in `ProcessDNS` unconditionally after a `client_name`
             override re-runs `ResolveStateKeyAndGroup`, even when the initial
@@ -40,9 +44,6 @@ Changes:
             a client route's `client_name` override changes `clientGroup`.
   3.116.0 - [SECURITY/FIX] Re-evaluated `determineRouting` when a client route's
             `client_name` override in step 2 changes `clientGroup`.
-  3.115.0 - [SECURITY/FIX] Re-evaluated `CheckParental` against `qNameTrimmed`
-            after step 2 when a client route's `client_name` override changes
-            `clientGroup`.
 */
 
 package main
@@ -238,6 +239,19 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 				if cr2.Force {
 					if cr2.ClientName == "" {
 						cr2.ClientName = clientName
+					}
+					if cr2.Upstream == "" && clientRoute.Upstream != "" && !cr2.HasRcode {
+						cr2.Upstream = clientRoute.Upstream
+					}
+					if !cr2.HasRcode && clientRoute.HasRcode {
+						cr2.HasRcode = true
+						cr2.Rcode = clientRoute.Rcode
+					}
+					if !cr2.BypassLocal && clientRoute.BypassLocal {
+						cr2.BypassLocal = true
+					}
+					if !cr2.BypassGlobal && clientRoute.BypassGlobal {
+						cr2.BypassGlobal = true
 					}
 					clientRoute, clientRouteMatched, routeOriginType = cr2, ok2, orig2
 				} else {

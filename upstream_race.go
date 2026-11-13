@@ -1,13 +1,16 @@
 /*
 File:    upstream_race.go
-Version: 2.61.1
-Last Updated: 09-Nov-2026 10:15 CET
+Version: 2.62.0
+Last Updated: 13-Nov-2026 12:35 CET
 
 Description:
   Advanced routing and parallel execution strategies for sdproxy upstream groups.
   Abstracts away `stagger`, `round-robin`, `random`, `fastest`, and `secure` strategies.
 
 Changes:
+  2.62.0 - [FIX] Normalized `*dns.AAAA` addresses with `.Unmap()` in `canonicalizeRR`
+           so IPv4-mapped IPv6 addresses canonicalize identically across `strict`
+           consensus fingerprinting and `consolidate` deduplication.
   2.61.1 - [CLEANUP] Removed dead no-op `extraOrErr` helper in `exchangeSecure`.
   2.61.0 - [SECURITY/FIX] Marked `bootstrapResolve` contexts with
            `WithBypassUpstreamThrottle` so bootstrap A/AAAA resolution queries do
@@ -29,8 +32,6 @@ Changes:
   2.55.0 - [SECURITY/FIX] Hardened `extractAnswerFingerprint` and `consolidate` in
            `exchangeSecure`.
   2.54.0 - [SECURITY/FIX] Upgraded `bootstrapResolve` to follow CNAME chains.
-  2.53.2 - [SECURITY/FIX] Explicitly enforced `msgPool.Put()` returns on synthetic
-           block generation constructed during consensus abort short-circuits.
 */
 
 package main
@@ -777,7 +778,7 @@ func canonicalizeRR(rr dns.RR) string {
 		return prefix + r.A.String()
 	case *dns.AAAA:
 		if addr, ok := netip.AddrFromSlice(r.AAAA); ok {
-			return prefix + addr.String()
+			return prefix + addr.Unmap().String()
 		}
 		return prefix + r.AAAA.String()
 	case *dns.CNAME:

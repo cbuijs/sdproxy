@@ -1,7 +1,7 @@
 /*
 File:    process_upstream.go
-Version: 1.23.0
-Last Updated: 11-Nov-2026 16:53 CET
+Version: 1.24.0
+Last Updated: 13-Nov-2026 12:35 CET
 
 Description:
   Upstream exchange stage for the sdproxy resolution pipeline — the cache-miss
@@ -10,6 +10,11 @@ Description:
   and the final client write.
 
 Changes:
+  1.24.0 - [SECURITY/FIX] Detected synthetic consensus blocks (`strings.HasPrefix(addr, "consensus(")`)
+           in `serveFromUpstream` so consensus validation failures are never
+           cached in `CacheSet` and always record `IncrPolicyBlock()` and
+           `RecordBlockEvent()` regardless of `block_action` (`NULL`, `NXDOMAIN`,
+           `REFUSED`, `IP`, or `DROP`).
   1.23.0 - [PERF/FIX] Pre-sorted upstream answers before `CacheSet` inside the
            `sfGroup.Do` closure when `cfg.Cache.AnswerSort == "ip-sort"`,
            eliminating a redundant message repack (`CacheUpdateOrder`) on every
@@ -34,8 +39,6 @@ Changes:
            returning `SERVFAIL` on unconfigured upstreams or failed exchanges.
   1.16.1 - [FIX] Formatted upstream failure/unconfigured error logs with
            `qc.protoEndpoint` and `qc.clientIP` when `logSimple` is enabled.
-  1.16.0 - [FEAT] Added Simple Logging Mode (`logSimple` / `logQuerySimple`)
-           support across QNAME label bounds, consensus drops, and upstream responses.
 */
 
 package main
@@ -45,6 +48,7 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"strings"
 
 	"github.com/miekg/dns"
 )
@@ -153,7 +157,7 @@ func (qc *queryCtx) serveFromUpstream() {
 
 		msg, addr, err := qc.group.Exchange(ctx, qc.r, qc.clientID, qc.clientName, qc.clientAddr)
 		if err != nil || msg == nil {
-			if cfg.Cache.ServeStaleInfinite {
+			if cfg.Cache.ServeStaleInfinite && !errors.Is(err, ErrSilentDrop) {
 				fallbackMsg := new(dns.Msg)
 				if CacheGetExpired(qc.cacheKey, qc.q.Name, fallbackMsg) {
 					return sfResult{msg: fallbackMsg, addr: "stale-fallback"}, nil
@@ -162,13 +166,16 @@ func (qc *queryCtx) serveFromUpstream() {
 			return sfResult{msg: msg, addr: addr}, err
 		}
 
-		if cfg.Cache.AnswerSort == "ip-sort" {
-			applyAnswerSort(msg, "ip-sort")
-		}
+		isConsensusBlock := strings.HasPrefix(addr, "consensus(")
+		if !isConsensusBlock {
+			if cfg.Cache.AnswerSort == "ip-sort" {
+				applyAnswerSort(msg, "ip-sort")
+			}
 
-		isNeg := msg.Rcode == dns.RcodeNameError || (msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)
-		if !isNeg || cacheUpstreamNeg {
-			CacheSet(qc.cacheKey, msg, qc.route.routeName)
+			isNeg := msg.Rcode == dns.RcodeNameError || (msg.Rcode == dns.RcodeSuccess && len(msg.Answer) == 0)
+			if !isNeg || cacheUpstreamNeg {
+				CacheSet(qc.cacheKey, msg, qc.route.routeName)
+			}
 		}
 		return sfResult{msg: msg, addr: addr}, nil
 	})
@@ -194,6 +201,8 @@ func (qc *queryCtx) serveFromUpstream() {
 
 	if finalResp == nil {
 		if sfErr != nil && errors.Is(sfErr, ErrSilentDrop) {
+			IncrPolicyBlock()
+			RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, "Consensus Validation ("+qc.route.routeName+")")
 			if logQueries {
 				if logSimple {
 					logQuerySimple(qc.protoEndpoint, qc.clientIP, qc.originalQName, qc.qtypeStr(), "DROP", "Consensus ("+qc.route.routeName+")", false)
@@ -221,6 +230,27 @@ func (qc *queryCtx) serveFromUpstream() {
 		}
 		IncrReturnCode(dns.RcodeServerFailure, false)
 		dns.HandleFailed(qc.w, qc.r)
+		return
+	}
+
+	isConsensusBlock := strings.HasPrefix(upstreamUsed, "consensus(")
+	if isConsensusBlock {
+		IncrPolicyBlock()
+		RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, "Consensus Validation ("+qc.route.routeName+")")
+		finalResp.Id = qc.originalID
+		recordBlockMsgStats(finalResp, qc.originalQNameTrimmed)
+		enforceUDPDefenses(qc.r, finalResp, qc.protocol, qc.clientAddr, qc.group)
+		qc.w.WriteMsg(finalResp)
+		if logQueries {
+			rcStr := getBlockActionLogStr(qc.q.Qtype)
+			if logSimple {
+				logQuerySimple(qc.protoEndpoint, qc.clientIP, qc.originalQName, qc.qtypeStr(), rcStr, "Consensus ("+qc.route.routeName+")", false)
+			} else {
+				log.Printf("[DNS] [%s] %s -> %s %s | ROUTE: %s (%s) | CONSENSUS BLOCK | %s",
+					qc.protocol, qc.clientID, qc.originalQName, qc.qtypeStr(),
+					qc.route.routeName, qc.route.routeOriginType, rcStr)
+			}
+		}
 		return
 	}
 

@@ -1,11 +1,19 @@
 /*
 File:    version.go
-Version: 1.601.0
-Last Updated: 12-Nov-2026 17:10 CET
+Version: 1.602.0
+Last Updated: 13-Nov-2026 12:35 CET
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.602.0 - [SECURITY/FIX] Prevented synthetic consensus blocks (`consensus(<group>)`)
+            from being stored in `CacheSet` and ensured `IncrPolicyBlock()` and
+            `RecordBlockEvent()` are recorded across all `block_action` modes in
+            `serveFromUpstream` (`process_upstream.go` 1.24.0); preserved primary
+            route properties when a `client_name` override matches a forced
+            `client-name` route in `ProcessDNS` (`process.go` 3.125.0); and
+            normalized `*dns.AAAA` addresses with `.Unmap()` in `canonicalizeRR`
+            (`upstream_race.go` 2.62.0).
   1.601.0 - [SECURITY/FIX] Fixed `force: true` scanning across `macWildRoutes`,
             `ednsMACWildRoutes`, `cidrRoutes`, and `ecsCIDRRoutes` in both
             `resolveClientRoute` (`process_routing.go` 1.24.0) and
@@ -68,22 +76,17 @@ Changes:
             2.61.1), redundant `file.Close()` (`arp.go` 1.20.1), redundant slice length
             check (`config.go` 1.99.2), and unreachable step-2 `clientName` block
             (`process.go` 3.120.0).
-  1.592.0 - [SECURITY/FIX] Preserved authority SOA TTL bounds on cached negative
-            responses when `remaining >= rr.Header().Ttl` (`cache_rw.go` 1.29.0)
-            and synchronized `clientName` / `clientID` before step 1.6 `rrs:`
-            evaluation when a client route specifies a `client_name` override
-            (`process.go` 3.119.0).
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.601.0"
+	BuildVersion string = "v1.602.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "12-Nov-2026 17:10 CET"
+	BuildTime string = "13-Nov-2026 12:35 CET"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "669"
+	BuildNumber string = "670"
 )
