@@ -1,13 +1,17 @@
 /*
 File:    upstream_race.go
-Version: 2.64.0
-Last Updated: 13-Nov-2026 13:30 CET
+Version: 2.65.0
+Last Updated: 13-Nov-2026 15:00 CET
 
 Description:
   Advanced routing and parallel execution strategies for sdproxy upstream groups.
   Abstracts away `stagger`, `round-robin`, `random`, `fastest`, and `secure` strategies.
 
 Changes:
+  2.65.0 - [SECURITY/FIX] Rejected NULL-IP (`0.0.0.0` / `::`) responses in
+           `pickFallback` inside `exchangeSecure` so `block_action: "LOG"`
+           consensus-audit fallbacks never prefer an upstream response carrying
+           a sinkhole NULL-IP when a clean peer response is available.
   2.64.0 - [SECURITY/FIX] Honored `globalBlockAction == BlockActionLog` in
            `synthesizeConsensusBlock` and `exchangeSecure`. When `block_action`
            is `"LOG"` (audit mode) and a consensus validation failure occurs,
@@ -15,10 +19,8 @@ Changes:
            tagged with `consensus-log(<addr>)` (or an error if all upstreams failed)
            instead of synthesizing a `NULL-IP` block response.
   2.63.0 - [PERF/FIX] Added `defer cancel()` inside `evaluateResult` failures and
-           early majority exits in `exchangeSecure` (now satisfied by the top-level
-           `defer cancel()`), and cancelled `raceCtx` immediately upon consensus
-           validation failure or loose majority completion so remaining in-flight
-           upstream goroutines abort immediately.
+           early majority exits in `exchangeSecure`, and cancelled `raceCtx`
+           immediately upon consensus validation failure or loose majority completion.
   2.62.0 - [FIX] Normalized `*dns.AAAA` addresses with `.Unmap()` in `canonicalizeRR`
            so IPv4-mapped IPv6 addresses canonicalize identically across `strict`
            consensus fingerprinting and `consolidate` deduplication.
@@ -37,9 +39,6 @@ Changes:
            `qtypeName`.
   2.57.0 - [SECURITY/FIX] Enforced 100% upstream participation in `strict` consensus
            mode (`exchangeSecure`) and overhauled `extractAnswerFingerprint`.
-  2.56.0 - [SECURITY/FIX] Cleared `baseMsg.AuthenticatedData = false` and `baseMsg.Ns = nil`
-           and skipped `RRSIG` records when merging answers in `consolidate` preference
-           mode (`exchangeSecure`).
 */
 
 package main
@@ -504,12 +503,34 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 
 	consensusAddr := "consensus(" + g.Name + ")"
 
+	msgHasNullIP := func(m *dns.Msg) bool {
+		if m == nil {
+			return false
+		}
+		for _, rr := range m.Answer {
+			switch rec := rr.(type) {
+			case *dns.A:
+				if rec.A.IsUnspecified() {
+					return true
+				}
+			case *dns.AAAA:
+				if rec.AAAA.IsUnspecified() {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
 	pickFallback := func() (*dns.Msg, string) {
 		if len(evalResults) > 0 {
 			return evalResults[0].msg, evalResults[0].addr
 		}
 		for _, r := range results {
-			if r.err == nil && r.msg != nil && (r.msg.Rcode == dns.RcodeSuccess || r.msg.Rcode == dns.RcodeNameError) {
+			if r.err == nil && r.msg != nil && !r.msg.Truncated && (r.msg.Rcode == dns.RcodeSuccess || r.msg.Rcode == dns.RcodeNameError) {
+				if msgHasNullIP(r.msg) {
+					continue
+				}
 				var chainBuf [64]string
 				if len(r.msg.Answer) > 0 && buildMsgBailiwickChain(r.msg, &chainBuf) == nil {
 					continue
@@ -530,21 +551,7 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 				}
 				return false
 			}
-			for _, rr := range r.msg.Answer {
-				switch rec := rr.(type) {
-				case *dns.A:
-					if rec.A.IsUnspecified() {
-						hasNullIP = true
-					}
-				case *dns.AAAA:
-					if rec.AAAA.IsUnspecified() {
-						hasNullIP = true
-					}
-				}
-				if hasNullIP {
-					break
-				}
-			}
+			hasNullIP = msgHasNullIP(r.msg)
 		}
 
 		if g.Mode == "strict" {
