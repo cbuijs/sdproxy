@@ -1,12 +1,15 @@
 /*
 File:    process.go
-Version: 3.125.0
-Last Updated: 13-Nov-2026 12:35 CET
+Version: 3.126.0
+Last Updated: 13-Nov-2026 12:45 CET
 
 Description:
   Master orchestrator for the sdproxy per-query DNS resolution pipeline.
 
 Changes:
+  3.126.0 - [SECURITY/FIX] Permitted a forced `client-name` route (`cr2.Force == true`)
+            to override an initial route even when the initial route also had
+            `force: true` and set a `client_name` override.
   3.125.0 - [SECURITY/FIX] Preserved non-empty `Upstream`, `HasRcode`/`Rcode`,
             `BypassLocal`, and `BypassGlobal` fields from the primary route when
             a `client_name` override triggers a secondary `cr2` match with
@@ -42,8 +45,6 @@ Changes:
             `rrs:` CNAME alias rewrote `qNameTrimmed` to a domain target.
   3.117.0 - [SECURITY/FIX] Permitted per-group `rrs:` evaluation in step 2 when
             a client route's `client_name` override changes `clientGroup`.
-  3.116.0 - [SECURITY/FIX] Re-evaluated `determineRouting` when a client route's
-            `client_name` override in step 2 changes `clientGroup`.
 */
 
 package main
@@ -234,43 +235,41 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 		clientNameLower = strings.ToLower(clientName)
 		clientID = appendClientEDNS(buildClientID(clientIP, clientName, clientAddr), ecsAddr, ecsPrefix, ednsMAC)
 		sk, clientGroup = ResolveStateKeyAndGroup(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientName, clientNameLower, sni, sniLower, path, pathLower, localPort)
-		if !clientRoute.Force {
-			if cr2, ok2, orig2 := resolveClientRoute(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientNameLower, sniLower, pathLower, localPort); ok2 {
-				if cr2.Force {
-					if cr2.ClientName == "" {
-						cr2.ClientName = clientName
-					}
-					if cr2.Upstream == "" && clientRoute.Upstream != "" && !cr2.HasRcode {
-						cr2.Upstream = clientRoute.Upstream
-					}
-					if !cr2.HasRcode && clientRoute.HasRcode {
-						cr2.HasRcode = true
-						cr2.Rcode = clientRoute.Rcode
-					}
-					if !cr2.BypassLocal && clientRoute.BypassLocal {
-						cr2.BypassLocal = true
-					}
-					if !cr2.BypassGlobal && clientRoute.BypassGlobal {
-						cr2.BypassGlobal = true
-					}
-					clientRoute, clientRouteMatched, routeOriginType = cr2, ok2, orig2
-				} else {
-					if clientRoute.Upstream == "" && cr2.Upstream != "" {
-						clientRoute.Upstream = cr2.Upstream
-					}
-					if !clientRoute.HasRcode && cr2.HasRcode {
-						clientRoute.HasRcode = true
-						clientRoute.Rcode = cr2.Rcode
-					}
-					if !clientRoute.BypassLocal && cr2.BypassLocal {
-						clientRoute.BypassLocal = true
-					}
-					if !clientRoute.BypassGlobal && cr2.BypassGlobal {
-						clientRoute.BypassGlobal = true
-					}
+		if cr2, ok2, orig2 := resolveClientRoute(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientNameLower, sniLower, pathLower, localPort); ok2 {
+			if cr2.Force && (!clientRoute.Force || orig2 == "CLIENT-NAME") {
+				if cr2.ClientName == "" {
+					cr2.ClientName = clientName
 				}
-				bypassGlobal = clientRoute.BypassGlobal
+				if cr2.Upstream == "" && clientRoute.Upstream != "" && !cr2.HasRcode {
+					cr2.Upstream = clientRoute.Upstream
+				}
+				if !cr2.HasRcode && clientRoute.HasRcode {
+					cr2.HasRcode = true
+					cr2.Rcode = clientRoute.Rcode
+				}
+				if !cr2.BypassLocal && clientRoute.BypassLocal {
+					cr2.BypassLocal = true
+				}
+				if !cr2.BypassGlobal && clientRoute.BypassGlobal {
+					cr2.BypassGlobal = true
+				}
+				clientRoute, clientRouteMatched, routeOriginType = cr2, ok2, orig2
+			} else {
+				if clientRoute.Upstream == "" && cr2.Upstream != "" && !clientRoute.HasRcode {
+					clientRoute.Upstream = cr2.Upstream
+				}
+				if !clientRoute.HasRcode && cr2.HasRcode {
+					clientRoute.HasRcode = true
+					clientRoute.Rcode = cr2.Rcode
+				}
+				if !clientRoute.BypassLocal && cr2.BypassLocal {
+					clientRoute.BypassLocal = true
+				}
+				if !clientRoute.BypassGlobal && cr2.BypassGlobal {
+					clientRoute.BypassGlobal = true
+				}
 			}
+			bypassGlobal = clientRoute.BypassGlobal
 		}
 	}
 	if clientRouteMatched && clientRoute.Upstream == "" && clientGroup != "" && !clientRoute.HasRcode {

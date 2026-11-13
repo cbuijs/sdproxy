@@ -1,11 +1,17 @@
 /*
 File:    version.go
-Version: 1.602.0
-Last Updated: 13-Nov-2026 12:35 CET
+Version: 1.603.0
+Last Updated: 13-Nov-2026 12:45 CET
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.603.0 - [SECURITY/FIX/PERF] Permitted a forced `client-name` route to override
+            or merge with an initial forced route that overrode `client_name` in
+            `ProcessDNS` (`process.go` 3.126.0), and cancelled `raceCtx` immediately
+            upon consensus failure or loose majority completion in `exchangeSecure`
+            (`upstream_race.go` 2.63.0) so remaining in-flight upstream probes
+            abort immediately.
   1.602.0 - [SECURITY/FIX] Prevented synthetic consensus blocks (`consensus(<group>)`)
             from being stored in `CacheSet` and ensured `IncrPolicyBlock()` and
             `RecordBlockEvent()` are recorded across all `block_action` modes in
@@ -69,24 +75,17 @@ Changes:
             and per-group `upstreams:` (`config.go` 1.100.0, `init_upstreams.go`
             1.9.0, `upstream.go` 2.56.0, `upstream_ddr.go` 2.56.0, `upstream_exchange.go`
             3.6.0, `upstream_net.go` 1.43.0, `upstream_parser.go` 2.55.0).
-  1.593.0 - [SECURITY/FIX/CLEANUP] Enforced `cfg.Cache.MinTTL` / `cfg.Cache.NegativeTTL`
-            floor on DNSSEC-signed (`hasRRSIG`) responses in `CacheSet` while capping
-            at `maxSigTTL` and restricted Authority `DS` records to `doBit == true`
-            (`cache_rw.go` 1.30.0); removed dead `extraOrErr` helper (`upstream_race.go`
-            2.61.1), redundant `file.Close()` (`arp.go` 1.20.1), redundant slice length
-            check (`config.go` 1.99.2), and unreachable step-2 `clientName` block
-            (`process.go` 3.120.0).
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.602.0"
+	BuildVersion string = "v1.603.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "13-Nov-2026 12:35 CET"
+	BuildTime string = "13-Nov-2026 12:45 CET"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "670"
+	BuildNumber string = "671"
 )

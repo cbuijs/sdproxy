@@ -1,13 +1,18 @@
 /*
 File:    upstream_race.go
-Version: 2.62.0
-Last Updated: 13-Nov-2026 12:35 CET
+Version: 2.63.0
+Last Updated: 13-Nov-2026 12:45 CET
 
 Description:
   Advanced routing and parallel execution strategies for sdproxy upstream groups.
   Abstracts away `stagger`, `round-robin`, `random`, `fastest`, and `secure` strategies.
 
 Changes:
+  2.63.0 - [PERF/FIX] Added `defer cancel()` inside `evaluateResult` failures and
+           early majority exits in `exchangeSecure` (now satisfied by the top-level
+           `defer cancel()`), and cancelled `raceCtx` immediately upon consensus
+           validation failure or loose majority completion so remaining in-flight
+           upstream goroutines abort immediately.
   2.62.0 - [FIX] Normalized `*dns.AAAA` addresses with `.Unmap()` in `canonicalizeRR`
            so IPv4-mapped IPv6 addresses canonicalize identically across `strict`
            consensus fingerprinting and `consolidate` deduplication.
@@ -31,7 +36,6 @@ Changes:
            mode (`exchangeSecure`).
   2.55.0 - [SECURITY/FIX] Hardened `extractAnswerFingerprint` and `consolidate` in
            `exchangeSecure`.
-  2.54.0 - [SECURITY/FIX] Upgraded `bootstrapResolve` to follow CNAME chains.
 */
 
 package main
@@ -625,12 +629,14 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 		}
 
 		if !evaluateResult(r) {
+			cancel()
 			return synthesizeConsensusBlock(req, consensusAddr)
 		}
 
 		if g.Mode == "loose" && len(evalResults) > 0 {
 			majority := expectedHealthy/2 + 1
 			if len(evalResults) >= majority {
+				cancel()
 				break
 			}
 		}
@@ -654,6 +660,7 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 					}
 					if !evaluateResult(extra) {
 						grace.Stop()
+						cancel()
 						return synthesizeConsensusBlock(req, consensusAddr)
 					}
 					i++
@@ -662,6 +669,7 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 				}
 			}
 			grace.Stop()
+			cancel()
 			break
 		}
 	}
