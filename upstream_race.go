@@ -1,13 +1,19 @@
 /*
 File:    upstream_race.go
-Version: 2.63.0
-Last Updated: 13-Nov-2026 12:45 CET
+Version: 2.64.0
+Last Updated: 13-Nov-2026 13:30 CET
 
 Description:
   Advanced routing and parallel execution strategies for sdproxy upstream groups.
   Abstracts away `stagger`, `round-robin`, `random`, `fastest`, and `secure` strategies.
 
 Changes:
+  2.64.0 - [SECURITY/FIX] Honored `globalBlockAction == BlockActionLog` in
+           `synthesizeConsensusBlock` and `exchangeSecure`. When `block_action`
+           is `"LOG"` (audit mode) and a consensus validation failure occurs,
+           `exchangeSecure` returns the first valid in-bailiwick non-NULL response
+           tagged with `consensus-log(<addr>)` (or an error if all upstreams failed)
+           instead of synthesizing a `NULL-IP` block response.
   2.63.0 - [PERF/FIX] Added `defer cancel()` inside `evaluateResult` failures and
            early majority exits in `exchangeSecure` (now satisfied by the top-level
            `defer cancel()`), and cancelled `raceCtx` immediately upon consensus
@@ -34,8 +40,6 @@ Changes:
   2.56.0 - [SECURITY/FIX] Cleared `baseMsg.AuthenticatedData = false` and `baseMsg.Ns = nil`
            and skipped `RRSIG` records when merging answers in `consolidate` preference
            mode (`exchangeSecure`).
-  2.55.0 - [SECURITY/FIX] Hardened `extractAnswerFingerprint` and `consolidate` in
-           `exchangeSecure`.
 */
 
 package main
@@ -339,9 +343,15 @@ func (g *UpstreamGroup) exchangeFastest(ctx context.Context, req *dns.Msg, clien
 	return g.executeRace(ctx, req, clientID, clientName, clientAddr, ordered)
 }
 
-func synthesizeConsensusBlock(req *dns.Msg, consensusAddr string) (*dns.Msg, string, error) {
+func synthesizeConsensusBlock(req *dns.Msg, consensusAddr string, fallbackMsg *dns.Msg, fallbackAddr string) (*dns.Msg, string, error) {
 	if globalBlockAction == BlockActionDrop {
 		return nil, consensusAddr, ErrSilentDrop
+	}
+	if globalBlockAction == BlockActionLog {
+		if fallbackMsg != nil {
+			return fallbackMsg, "consensus-log(" + fallbackAddr + ")", nil
+		}
+		return nil, consensusAddr, errors.New("consensus validation failed (no valid upstream responses)")
 	}
 
 	pooled := generateBlockMsg(req, syntheticTTL)
@@ -494,6 +504,22 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 
 	consensusAddr := "consensus(" + g.Name + ")"
 
+	pickFallback := func() (*dns.Msg, string) {
+		if len(evalResults) > 0 {
+			return evalResults[0].msg, evalResults[0].addr
+		}
+		for _, r := range results {
+			if r.err == nil && r.msg != nil && (r.msg.Rcode == dns.RcodeSuccess || r.msg.Rcode == dns.RcodeNameError) {
+				var chainBuf [64]string
+				if len(r.msg.Answer) > 0 && buildMsgBailiwickChain(r.msg, &chainBuf) == nil {
+					continue
+				}
+				return r.msg, r.addr
+			}
+		}
+		return nil, ""
+	}
+
 	evaluateResult := func(r raceResult) bool {
 		hasNullIP := false
 		if r.msg != nil {
@@ -630,7 +656,8 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 
 		if !evaluateResult(r) {
 			cancel()
-			return synthesizeConsensusBlock(req, consensusAddr)
+			fbMsg, fbAddr := pickFallback()
+			return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
 		}
 
 		if g.Mode == "loose" && len(evalResults) > 0 {
@@ -661,7 +688,8 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 					if !evaluateResult(extra) {
 						grace.Stop()
 						cancel()
-						return synthesizeConsensusBlock(req, consensusAddr)
+						fbMsg, fbAddr := pickFallback()
+						return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
 					}
 					i++
 				case <-grace.C:
@@ -678,7 +706,8 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 		if logSystem {
 			log.Printf("[SECURITY] [%s] Consensus validation failed for %s: no valid responses eligible for consensus (mode: %s)", clientID, req.Question[0].Name, g.Mode)
 		}
-		return synthesizeConsensusBlock(req, consensusAddr)
+		fbMsg, fbAddr := pickFallback()
+		return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
 	}
 
 	if g.Mode == "strict" && len(evalResults) != n {
@@ -686,7 +715,8 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 			log.Printf("[SECURITY] [%s] Consensus validation failed for %s: strict mode requires all %d upstreams to agree, only %d succeeded",
 				clientID, req.Question[0].Name, n, len(evalResults))
 		}
-		return synthesizeConsensusBlock(req, consensusAddr)
+		fbMsg, fbAddr := pickFallback()
+		return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
 	}
 
 	var finalMsg *dns.Msg

@@ -1,11 +1,18 @@
 /*
 File:    version.go
-Version: 1.604.0
-Last Updated: 13-Nov-2026 13:15 CET
+Version: 1.605.0
+Last Updated: 13-Nov-2026 13:30 CET
 Description:
   Global version, build time, and build number constants for sdproxy.
 
 Changes:
+  1.605.0 - [SECURITY/FIX] Honored `block_action: "LOG"` on `strategy: "secure"`
+            consensus validation failures (`upstream_race.go` 2.64.0,
+            `process_upstream.go` 1.25.0) so audit mode logs the consensus mismatch
+            and returns the best available valid response without poisoning the
+            cache; and synced `clientName` / `clientGroup` in `ProcessDNS`
+            (`process.go` 3.127.0) if a forced `client-name` route overrides
+            `client_name` a second time.
   1.604.0 - [SECURITY/FIX] Treated `consensus(...)` failure responses from
             `group.Exchange` as probe/revalidation failures rather than valid
             DNS responses in `probeForSaleTarget` (`for_sale.go` 1.13.0),
@@ -69,25 +76,17 @@ Changes:
             on the original queried domain, and re-evaluated forced client-name
             routes in `ProcessDNS` (`process.go` 3.121.0) when a route overrides
             `client_name`.
-  1.595.0 - [SECURITY/FIX] Scoped DoH downgrade on explicit `doh3://` upstreams in
-            `Exchange` (`upstream_exchange.go` 3.6.1) strictly to
-            `u.DoH3FallbackThreshold > 0` so `doh3://` upstreams with default
-            `doh3_fallback_threshold: 0` never downgrade to HTTP/2 when SVCB/HTTPS
-            ALPN advertises `h2`; resolved multi-hop `rrs:` CNAME chains (up to 8
-            hops with cycle detection) in `handleSpoofedRecords` (`process_spoof.go`
-            1.33.0); and included `GlobalDoH3Thresh` in `computeRouteConfigHash`
-            (`cache_persistence.go` 2.8.0).
 */
 
 package main
 
 var (
 	// BuildVersion represents the current release/build version of sdproxy.
-	BuildVersion string = "v1.604.0"
+	BuildVersion string = "v1.605.0"
 
 	// BuildTime records the date and time the binary was compiled.
-	BuildTime string = "13-Nov-2026 13:15 CET"
+	BuildTime string = "13-Nov-2026 13:30 CET"
 
 	// BuildNumber is an internal sequential build tracker or CI pipeline number.
-	BuildNumber string = "672"
+	BuildNumber string = "673"
 )

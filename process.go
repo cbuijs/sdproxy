@@ -1,12 +1,16 @@
 /*
 File:    process.go
-Version: 3.126.0
-Last Updated: 13-Nov-2026 12:45 CET
+Version: 3.127.0
+Last Updated: 13-Nov-2026 13:30 CET
 
 Description:
   Master orchestrator for the sdproxy per-query DNS resolution pipeline.
 
 Changes:
+  3.127.0 - [FIX] Synced `clientName`, `clientNameLower`, and `clientID` with
+            `routeCtx.clientName` after `determineRouting` when a forced
+            `client-name` route overrides `client_name` so `CheckParental` and
+            `queryCtx` always receive the final resolved `clientName`.
   3.126.0 - [SECURITY/FIX] Permitted a forced `client-name` route (`cr2.Force == true`)
             to override an initial route even when the initial route also had
             `force: true` and set a `client_name` override.
@@ -19,12 +23,7 @@ Changes:
             override re-runs `ResolveStateKeyAndGroup`, even when the initial
             route had `force: true` and `upstream: ""`.
   3.123.0 - [SECURITY/FIX] Re-evaluated `resolveClientRoute` unconditionally when
-            a matched client route overrides `client_name`. Previously, when a
-            higher-precedence route (e.g., IP or CIDR) set `client_name: "alice"`
-            without setting `upstream` or `rcode`, a `client-name` route for `"alice"`
-            with `force: false` was ignored because `resolveClientRoute` was only
-            accepted when `cr2.Force` was true, and merged `cr2`'s `Upstream`,
-            `HasRcode`/`Rcode`, `BypassLocal`, and `BypassGlobal` into `clientRoute`.
+            a matched client route overrides `client_name`.
   3.122.0 - [CLEANUP] Removed unused `localPort` parameter from `enforceSecurityGuards`
             and unused `clientMAC`, `clientNameLower`, `sni`, `sniLower`, `path`,
             `pathLower`, and `localPort` parameters from `determineRouting`.
@@ -32,9 +31,7 @@ Changes:
             after `ResolveStateKeyAndGroup` when a client route's `client_name`
             override assigns the client to a parental group after global `rrs:`
             already ran, and verified `walkDomainMaps` against `originalQNameTrimmed`
-            as well as `qNameTrimmed` in `determineRouting` so a global `rrs:` CNAME
-            rewrite cannot bypass a `domain_policy` block on the original queried
-            domain.
+            as well as `qNameTrimmed` in `determineRouting`.
   3.120.0 - [CLEANUP] Removed unreachable step 2 `routeCtx.clientName != clientName`
             re-evaluation block.
   3.119.0 - [SECURITY/FIX] Re-evaluated per-group `handleSpoofedRecords` (`rrs:`),
@@ -43,8 +40,6 @@ Changes:
   3.118.0 - [SECURITY/FIX] Re-evaluated `CheckParental` against `qNameTrimmed`
             in step 2 even when the original query was a `PTR` query if a group
             `rrs:` CNAME alias rewrote `qNameTrimmed` to a domain target.
-  3.117.0 - [SECURITY/FIX] Permitted per-group `rrs:` evaluation in step 2 when
-            a client route's `client_name` override changes `clientGroup`.
 */
 
 package main
@@ -239,6 +234,11 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 			if cr2.Force && (!clientRoute.Force || orig2 == "CLIENT-NAME") {
 				if cr2.ClientName == "" {
 					cr2.ClientName = clientName
+				} else if cr2.ClientName != clientName {
+					clientName = cr2.ClientName
+					clientNameLower = strings.ToLower(clientName)
+					clientID = appendClientEDNS(buildClientID(clientIP, clientName, clientAddr), ecsAddr, ecsPrefix, ednsMAC)
+					sk, clientGroup = ResolveStateKeyAndGroup(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientName, clientNameLower, sni, sniLower, path, pathLower, localPort)
 				}
 				if cr2.Upstream == "" && clientRoute.Upstream != "" && !cr2.HasRcode {
 					cr2.Upstream = clientRoute.Upstream

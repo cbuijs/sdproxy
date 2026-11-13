@@ -1,7 +1,7 @@
 /*
 File:    process_upstream.go
-Version: 1.24.0
-Last Updated: 13-Nov-2026 12:35 CET
+Version: 1.25.0
+Last Updated: 13-Nov-2026 13:30 CET
 
 Description:
   Upstream exchange stage for the sdproxy resolution pipeline — the cache-miss
@@ -10,6 +10,12 @@ Description:
   and the final client write.
 
 Changes:
+  1.25.0 - [SECURITY/FIX] Supported `block_action: "LOG"` on `strategy: "secure"`
+           consensus validation failures (`upstream_race.go` 2.64.0). When a
+           consensus failure occurs in `LOG` audit mode, `exchangeSecure` returns
+           the best available valid response tagged with `consensus-log(<addr>)`,
+           and `serveFromUpstream` logs the consensus warning while allowing the
+           response to resolve normally without poisoning the shared cache.
   1.24.0 - [SECURITY/FIX] Detected synthetic consensus blocks (`strings.HasPrefix(addr, "consensus(")`)
            in `serveFromUpstream` so consensus validation failures are never
            cached in `CacheSet` and always record `IncrPolicyBlock()` and
@@ -37,8 +43,6 @@ Changes:
            unrequested `RRSIG` records from `finalResp`.
   1.17.0 - [FIX] Recorded `IncrReturnCode(dns.RcodeServerFailure, false)` when
            returning `SERVFAIL` on unconfigured upstreams or failed exchanges.
-  1.16.1 - [FIX] Formatted upstream failure/unconfigured error logs with
-           `qc.protoEndpoint` and `qc.clientIP` when `logSimple` is enabled.
 */
 
 package main
@@ -166,7 +170,7 @@ func (qc *queryCtx) serveFromUpstream() {
 			return sfResult{msg: msg, addr: addr}, err
 		}
 
-		isConsensusBlock := strings.HasPrefix(addr, "consensus(")
+		isConsensusBlock := strings.HasPrefix(addr, "consensus(") || strings.HasPrefix(addr, "consensus-log(")
 		if !isConsensusBlock {
 			if cfg.Cache.AnswerSort == "ip-sort" {
 				applyAnswerSort(msg, "ip-sort")
@@ -233,6 +237,17 @@ func (qc *queryCtx) serveFromUpstream() {
 		return
 	}
 
+	isConsensusLog := false
+	if strings.HasPrefix(upstreamUsed, "consensus-log(") {
+		isConsensusLog = true
+		upstreamUsed = strings.TrimSuffix(strings.TrimPrefix(upstreamUsed, "consensus-log("), ")")
+		if logQueries && !logSimple {
+			log.Printf("[DNS] [%s] %s -> %s %s | ROUTE: %s (%s) | CONSENSUS BLOCK (LOG ONLY) | Allowing fallback response",
+				qc.protocol, qc.clientID, qc.originalQName, qc.qtypeStr(),
+				qc.route.routeName, qc.route.routeOriginType)
+		}
+	}
+
 	isConsensusBlock := strings.HasPrefix(upstreamUsed, "consensus(")
 	if isConsensusBlock {
 		IncrPolicyBlock()
@@ -273,7 +288,7 @@ func (qc *queryCtx) serveFromUpstream() {
 	}
 
 	// ── Answer sorting ────────────────────────────────────────────────────
-	if cfg.Cache.AnswerSort != "none" && cfg.Cache.AnswerSort != "ip-sort" {
+	if cfg.Cache.AnswerSort != "none" && (cfg.Cache.AnswerSort != "ip-sort" || isConsensusLog) {
 		var lAddr netip.Addr
 		if cfg.Cache.AnswerSort == "proximity" {
 			if ip := localAddrIP(qc.w); ip != nil {
