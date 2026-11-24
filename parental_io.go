@@ -1,28 +1,33 @@
 /*
 File:    parental_io.go
-Version: 2.2.0
-Last Updated: 04-Nov-2026 19:38 CET
+Version: 2.3.0
+Last Updated: 24-Nov-2026 12:30 CET
 
 Description:
-  Snapshot persistence for the sdproxy parental subsystem.
-  Extracted from parental.go to isolate disk I/O.
+  Snapshot persistence and daily snapshot pruning for the sdproxy parental subsystem.
 
 Changes:
+  2.3.0 - [SECURITY/FIX] Scoped `loadSnapshot` strictly to keys currently active
+          in `gs.remaining` (clamped to `[0, configuredMax]`) so categories
+          removed or switched to `UNLIMITED`/`ALLOW`/`FREE`/`LOG`/`UNTRIGGER`
+          are never resurrected as exhausted budgets.
+        - [SECURITY/HYGIENE] Hardened `snapshotPathForKey` against invalid/traversal
+          characters and excessive lengths, and added `pruneOldSnapshots()` to
+          reclaim outdated `parental-*-YYYY-MM-DD.json` files.
   2.2.0 - [FIX] Enabled snapshot write failure warnings in `saveSnapshot` when
-          `logSystem` or `logParental` is active so Simple Logging Mode
-          (`logSimple: true`) retains all disk I/O warnings.
+          `logSystem` or `logParental` is active.
   2.1.0 - [SECURITY/FIX] Aligned `today()` with `cfg.Parental.TimeOffsetHours` and
-          `.Local()` so snapshot filenames roll over at the exact same timezone-adjusted
-          midnight boundary as `runMidnightReset` and `inAnyScheduleWindow`.
-  2.0.0 - [TIER 2] saveSnapshot moved onto atomicWrite.
+          `.Local()`.
+  2.0.0 - [TIER 2] `saveSnapshot` moved onto `atomicWrite`.
   1.5.0 - [SECURITY/RELIABILITY] Directory fsync so renames survive power loss.
-  1.4.0 - [SECURITY/FIX] Failed writes now purge the .tmp so a 0-byte artifact
-          cannot linger on disk.
+  1.4.0 - [SECURITY/FIX] Failed writes purge `.tmp` artifacts.
 */
 
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"os"
@@ -65,6 +70,15 @@ func loadSnapshot(sk string, gs *groupState) {
 	}
 
 	for k, v := range data.Remaining {
+		cfgMax, active := gs.remaining[k]
+		if !active {
+			continue
+		}
+		if v < 0 {
+			v = 0
+		} else if v > cfgMax {
+			v = cfgMax
+		}
 		gs.remaining[k] = v
 	}
 
@@ -73,10 +87,66 @@ func loadSnapshot(sk string, gs *groupState) {
 	}
 }
 
+func sanitizeSnapshotKey(sk string) string {
+	var b strings.Builder
+	b.Grow(len(sk))
+	for i := 0; i < len(sk); i++ {
+		c := sk[i]
+		switch {
+		case (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_':
+			b.WriteByte(c)
+		case c == ':':
+			b.WriteByte('-')
+		case c == '.':
+			if i+1 < len(sk) && sk[i+1] == '.' {
+				b.WriteByte('_')
+			} else {
+				b.WriteByte('.')
+			}
+		default:
+			b.WriteByte('_')
+		}
+	}
+	safe := strings.Trim(b.String(), ".")
+	if safe == "" {
+		safe = "default"
+	}
+	if len(safe) > 120 {
+		h := sha256.Sum256([]byte(sk))
+		safe = safe[:96] + "-" + hex.EncodeToString(h[:8])
+	}
+	return safe
+}
+
 func snapshotPathForKey(sk string) string {
-	safe := strings.ReplaceAll(sk, "/", "_")
-	safe = strings.ReplaceAll(safe, ":", "-")
-	return filepath.Join(snapshotDir(), "parental-"+safe+"-"+today()+".json")
+	return filepath.Join(snapshotDir(), "parental-"+sanitizeSnapshotKey(sk)+"-"+today()+".json")
+}
+
+func pruneOldSnapshots() {
+	dir := snapshotDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	keepSuffix := "-" + today() + ".json"
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !strings.HasPrefix(name, "parental-") || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, keepSuffix) {
+			continue
+		}
+		if len(name) < len("parental-x-2006-01-02.json") {
+			continue
+		}
+		datePart := name[len(name)-len("2006-01-02.json") : len(name)-len(".json")]
+		if len(datePart) == 10 && datePart[4] == '-' && datePart[7] == '-' &&
+			name[len(name)-len("-2006-01-02.json")] == '-' &&
+			isAllDigits(datePart[0:4]) && isAllDigits(datePart[5:7]) && isAllDigits(datePart[8:10]) {
+			_ = os.Remove(filepath.Join(dir, name))
+		}
+	}
 }
 
 func snapshotDir() string {

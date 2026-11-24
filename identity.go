@@ -1,27 +1,26 @@
 /*
 File:    identity.go
-Version: 2.14.0
-Last Updated: 04-Nov-2026 19:38 CET
+Version: 2.15.0
+Last Updated: 24-Nov-2026 12:46 CET
 
-Description: 
+Description:
   Local client identity resolution from hosts files, DHCP leases, and IPinfo ASN databases.
   Extracted parsing rules into identity_parsers.go.
 
 Changes:
+  2.15.0 - [FIX] Canonicalized parsed IP strings (`parsedAddr.String()`) in
+           `storeEntry` so non-canonical or uppercase IPv6/IPv4 entries in hosts
+           and lease files match `LookupNameByMACOrIP` and deduplicate accurately.
+         - [FIX] Tracked `fileSize` alongside `cachedAt` mtime in `parsedFile` so
+           sub-second atomic file replacements with identical filesystem mtime
+           granularity still trigger a re-parse.
   2.14.0 - [FIX] Enabled startup messages (`InitIdentity`) and file stat/read warnings
-           (`getOrParse`) when `logSystem` or `logIdentity` is active so Simple
-           Logging Mode (`logSimple: true`) retains startup messages and warnings.
-  2.13.0 - [SECURITY/FIX] Eradicated a persistent zombie goroutine organically. 
-           The periodic `pollIdentity` polling loop now explicitly bounds execution 
-           against the global `shutdownCh` to abort safely during structural reloads.
-  2.12.0 - [REFACTOR] Consolidated file parsing loops in `pollIdentity` using a 
-           unified helper closure, drastically reducing code duplication and 
-           improving maintainability natively.
-  2.11.0 - [LOGGING] Applied granular logging bounds natively. Memory rebuilds and 
-           database loads are now organically controlled by the `logIdentity` toggle.
-  2.10.0 - [SECURITY/FIX] Resolved a severe state-retention vulnerability where 
-           deleted `Hosts` or `DHCP` files failed to trigger an identity map rebuild.
-  2.9.0  - [FIX] Addressed an internal deduplication loop flaw in `mergePartial`.
+           (`getOrParse`) when `logSystem` or `logIdentity` is active.
+  2.13.0 - [SECURITY/FIX] Bounded periodic `pollIdentity` loop to `shutdownCh`.
+  2.12.0 - [REFACTOR] Consolidated file parsing loops in `pollIdentity`.
+  2.11.0 - [LOGGING] Controlled rebuild logs via `logIdentity`.
+  2.10.0 - [SECURITY/FIX] Triggered identity map rebuild when source files are deleted.
+  2.9.0  - [FIX] Fixed deduplication loop in `mergePartial`.
 */
 
 package main
@@ -66,6 +65,7 @@ func init() {
 
 type parsedFile struct {
 	cachedAt    time.Time
+	fileSize    int64
 	ipToName    map[string]string
 	macToName   map[string]string
 	nameToIPs   map[string][]netip.Addr
@@ -263,8 +263,9 @@ func getOrParse(path, kind string) (*parsedFile, bool) {
 		return nil, false
 	}
 	mtime := info.ModTime()
+	fsize := info.Size()
 
-	if cached, ok := fileCache[path]; ok && cached.cachedAt.Equal(mtime) {
+	if cached, ok := fileCache[path]; ok && cached.cachedAt.Equal(mtime) && cached.fileSize == fsize {
 		return cached, false
 	}
 
@@ -294,6 +295,7 @@ func getOrParse(path, kind string) (*parsedFile, bool) {
 		pf = parseHostsBytes(data)
 	}
 	pf.cachedAt = mtime
+	pf.fileSize = fsize
 	fileCache[path] = pf
 
 	if logIdentity {
@@ -375,7 +377,7 @@ func storeEntry(ip, rawName string, pf *parsedFile) string {
 	if err != nil {
 		return ""
 	}
-	parsedAddr = parsedAddr.Unmap()
+	parsedAddr = parsedAddr.Unmap().WithZone("")
 
 	if ipVersionSupport != "both" {
 		if ipVersionSupport == "ipv4" && !parsedAddr.Is4() {
@@ -386,6 +388,8 @@ func storeEntry(ip, rawName string, pf *parsedFile) string {
 		}
 	}
 
+	canonIP := parsedAddr.String()
+
 	shortName := rawName
 	if idx := strings.IndexByte(rawName, '.'); idx > 0 {
 		shortName = rawName[:idx]
@@ -394,19 +398,19 @@ func storeEntry(ip, rawName string, pf *parsedFile) string {
 	sink := isSinkAddr(parsedAddr)
 	fullKey := strings.ToLower(rawName)
 
-	dedupKey := fullKey + "|" + ip
+	dedupKey := fullKey + "|" + canonIP
 	if !pf.seen[dedupKey] {
 		pf.seen[dedupKey] = true
 		pf.nameToIPs[fullKey] = append(pf.nameToIPs[fullKey], parsedAddr)
 
-		if arpa, err := dns.ReverseAddr(ip); err == nil {
+		if arpa, err := dns.ReverseAddr(canonIP); err == nil {
 			key := arpa[:len(arpa)-1]
 			pf.arpaToNames[key] = append(pf.arpaToNames[key], rawName)
 		}
 	}
 
 	if !sink {
-		pf.ipToName[ip] = shortName
+		pf.ipToName[canonIP] = shortName
 	}
 	return shortName
 }

@@ -1,35 +1,33 @@
 /*
 File:    upstream_race.go
-Version: 2.69.0
-Last Updated: 23-Nov-2026 14:35 CET
+Version: 2.70.0
+Last Updated: 24-Nov-2026 14:30 CET
 
 Description:
   Advanced routing and parallel execution strategies for sdproxy upstream groups.
   Implements `stagger`, `round-robin`, `random`, `fastest`, and `secure` strategies.
 
 Changes:
-  2.69.0 - [SECURITY/FIX] Fixed `Preference == "consolidate"` in `exchangeSecure`:
-           when merging answers across upstreams that return different CNAME/DNAME
-           chains, terminal `A`/`AAAA` records are collapsed onto `req.Question[0].Name`
-           with TTL clamped to each response's `minAliasTTL`. Prevents orphaned
-           target owner names from failing `CacheSet` bailiwick validation or
-           being dropped by `flattenCNAME`.
-  2.68.0 - [SECURITY/FIX] Filtered out non-matching record types in the
-           `Preference == "consolidate"` answer merger inside `exchangeSecure`.
-  2.67.0 - [REFACTOR/CLEANUP] Switched `buildMsgBailiwickChain` to use
-           `walkBailiwickChain` (`cache_rw.go`).
-  2.66.0 - [PERF] Eliminated `fmt.Sprintf` reflection and intermediate slice heap
-           allocations in `canonicalizeRR` and `extractAnswerFingerprint`.
-  2.65.0 - [SECURITY/FIX] Rejected NULL-IP (`0.0.0.0` / `::`) responses in
-           `pickFallback` inside `exchangeSecure`.
+  2.70.0 - [CRITICAL/CONCURRENCY] Removed the premature `majority` early-exit in
+           `exchangeSecure` (`Mode == "loose"`) so all healthy upstreams (`expectedHealthy`)
+           participate in consensus verification, `ordered` selection, and
+           `consolidate` merging, and added a throttled (10s) detached recovery
+           probe (`maybeProbeUnhealthy`) so unhealthy upstreams never starve
+           permanently behind `raceCtx` cancellation.
+         - [SECURITY/FIX] Preserved signed `RRSIG`/`AD` responses in `exchangeSecure`
+           by bypassing `consolidate` RR-rewriting when `DO=1` or `RequireDNSSECAD`
+           is active.
+  2.69.0 - [SECURITY/FIX] Collapsed terminal `A`/`AAAA` records onto
+           `req.Question[0].Name` with `minAliasTTL` clamping in `consolidate` mode.
+  2.68.0 - [SECURITY/FIX] Filtered non-matching record types in `consolidate`.
+  2.67.0 - [REFACTOR/CLEANUP] Switched `buildMsgBailiwickChain` to `walkBailiwickChain`.
+  2.66.0 - [PERF] Zero-reflection `canonicalizeRR` and `extractAnswerFingerprint`.
+  2.65.0 - [SECURITY/FIX] Rejected NULL-IP responses in `pickFallback`.
   2.64.0 - [SECURITY/FIX] Honored `globalBlockAction == BlockActionLog` in
            `synthesizeConsensusBlock` and `exchangeSecure`.
-  2.63.0 - [PERF/FIX] Cancelled `raceCtx` immediately upon consensus validation
-           failure or loose majority completion in `exchangeSecure`.
-  2.62.0 - [FIX] Normalized `*dns.AAAA` addresses with `.Unmap()` in `canonicalizeRR`.
-  2.61.1 - [CLEANUP] Removed dead no-op `extraOrErr` helper in `exchangeSecure`.
-  2.61.0 - [SECURITY/FIX] Marked `bootstrapResolve` contexts with
-           `WithBypassUpstreamThrottle`.
+  2.63.0 - [PERF/FIX] Cancelled `raceCtx` immediately upon consensus failure.
+  2.62.0 - [FIX] Normalized `*dns.AAAA` addresses with `.Unmap()`.
+  2.61.1 - [CLEANUP] Removed dead `extraOrErr` helper.
 */
 
 package main
@@ -51,9 +49,36 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ---------------------------------------------------------------------------
-// Upstream Group Dispatcher
-// ---------------------------------------------------------------------------
+const recoveryProbeCooldownNano = int64(10 * time.Second)
+
+func (g *UpstreamGroup) maybeProbeUnhealthy(req *dns.Msg, clientName string, clientAddr netip.Addr) {
+	if req == nil || len(req.Question) == 0 {
+		return
+	}
+	nowNano := time.Now().UnixNano()
+	for _, up := range g.Servers {
+		if up == nil || up.isHealthy() {
+			continue
+		}
+		if !up.claimRecoveryProbe(nowNano, recoveryProbeCooldownNano) {
+			continue
+		}
+		probeReq := req.Copy()
+		go func(u *Upstream) {
+			pCtx, pCancel := context.WithTimeout(WithBypassUpstreamThrottle(context.Background()), 3*time.Second)
+			defer pCancel()
+			start := time.Now()
+			resp, _, err := u.Exchange(pCtx, probeReq, "health-probe", clientName, clientAddr)
+			if err == nil && resp != nil {
+				u.recordSuccess()
+				g.updateRTT(u, time.Since(start).Nanoseconds())
+			} else if err != nil && !errors.Is(err, context.Canceled) {
+				u.recordFailure()
+				g.penalizeRTT(u)
+			}
+		}(up)
+	}
+}
 
 func (g *UpstreamGroup) Exchange(ctx context.Context, req *dns.Msg, clientID string, clientName string, clientAddr netip.Addr) (*dns.Msg, string, error) {
 	if len(g.Servers) == 0 {
@@ -427,6 +452,10 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 		maxSecure = 5
 	}
 
+	if g.Mode == "loose" {
+		g.maybeProbeUnhealthy(req, clientName, clientAddr)
+	}
+
 	servers := selectSecureFanout(g.Servers, maxSecure)
 	n := len(servers)
 
@@ -440,9 +469,22 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 	defer cancel()
 
 	expectedHealthy := 0
-	for _, up := range servers {
-		if up.isHealthy() {
-			expectedHealthy++
+	var healthyFlag [8]bool
+	var healthyMap map[*Upstream]bool
+	if n <= len(healthyFlag) {
+		for idx, up := range servers {
+			if up.isHealthy() {
+				healthyFlag[idx] = true
+				expectedHealthy++
+			}
+		}
+	} else {
+		healthyMap = make(map[*Upstream]bool, n)
+		for _, up := range servers {
+			if up.isHealthy() {
+				healthyMap[up] = true
+				expectedHealthy++
+			}
 		}
 	}
 	if expectedHealthy == 0 {
@@ -450,20 +492,27 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 	}
 
 	type raceResult struct {
-		msg  *dns.Msg
-		addr string
-		up   *Upstream
-		err  error
-		rtt  int64
+		msg        *dns.Msg
+		addr       string
+		up         *Upstream
+		err        error
+		rtt        int64
+		wasHealthy bool
 	}
 
 	ch := make(chan raceResult, n)
-	for _, up := range servers {
-		go func(u *Upstream) {
+	for idx, up := range servers {
+		wasH := false
+		if healthyMap != nil {
+			wasH = healthyMap[up]
+		} else {
+			wasH = healthyFlag[idx]
+		}
+		go func(u *Upstream, h bool) {
 			start := time.Now()
 			msg, addr, err := u.Exchange(raceCtx, req, clientID, clientName, clientAddr)
-			ch <- raceResult{msg, addr, u, err, time.Since(start).Nanoseconds()}
-		}(up)
+			ch <- raceResult{msg, addr, u, err, time.Since(start).Nanoseconds(), h}
+		}(up, wasH)
 	}
 
 	var resultsBuf [8]raceResult
@@ -584,38 +633,38 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 			}
 			evalResults = append(evalResults, r)
 			return true
-		} else {
-			if r.err == nil && r.msg != nil && (r.msg.Rcode == dns.RcodeSuccess || r.msg.Rcode == dns.RcodeNameError) {
-				if hasNullIP {
+		}
+
+		if r.err == nil && r.msg != nil && !r.msg.Truncated && (r.msg.Rcode == dns.RcodeSuccess || r.msg.Rcode == dns.RcodeNameError) {
+			if hasNullIP {
+				if logSystem {
+					log.Printf("[SECURITY] [%s] Consensus validation failed for %s: NULL-IP detected from %s", clientID, req.Question[0].Name, r.addr)
+				}
+				return false
+			}
+			if !baseSet {
+				baseRcode = r.msg.Rcode
+				baseHasAnswers = len(r.msg.Answer) > 0
+				baseSet = true
+			} else {
+				if r.msg.Rcode != baseRcode {
 					if logSystem {
-						log.Printf("[SECURITY] [%s] Consensus validation failed for %s: NULL-IP detected from %s", clientID, req.Question[0].Name, r.addr)
+						log.Printf("[SECURITY] [%s] Consensus validation failed for %s: RCODE mismatch (base: %d, peer: %d) from %s", clientID, req.Question[0].Name, baseRcode, r.msg.Rcode, r.addr)
 					}
 					return false
 				}
-				if !baseSet {
-					baseRcode = r.msg.Rcode
-					baseHasAnswers = len(r.msg.Answer) > 0
-					baseSet = true
-				} else {
-					if r.msg.Rcode != baseRcode {
+				if baseRcode == dns.RcodeSuccess {
+					if (len(r.msg.Answer) > 0) != baseHasAnswers {
 						if logSystem {
-							log.Printf("[SECURITY] [%s] Consensus validation failed for %s: RCODE mismatch (base: %d, peer: %d) from %s", clientID, req.Question[0].Name, baseRcode, r.msg.Rcode, r.addr)
+							log.Printf("[SECURITY] [%s] Consensus validation failed for %s: mixed empty/non-empty NOERROR responses from %s", clientID, req.Question[0].Name, r.addr)
 						}
 						return false
 					}
-					if baseRcode == dns.RcodeSuccess {
-						if (len(r.msg.Answer) > 0) != baseHasAnswers {
-							if logSystem {
-								log.Printf("[SECURITY] [%s] Consensus validation failed for %s: mixed empty/non-empty NOERROR responses from %s", clientID, req.Question[0].Name, r.addr)
-							}
-							return false
-						}
-					}
 				}
-				evalResults = append(evalResults, r)
 			}
-			return true
+			evalResults = append(evalResults, r)
 		}
+		return true
 	}
 
 	healthyReceived := 0
@@ -623,7 +672,7 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 		r := <-ch
 		results = append(results, r)
 
-		if r.up.isHealthy() {
+		if r.wasHealthy {
 			healthyReceived++
 		}
 
@@ -641,43 +690,37 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 			return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
 		}
 
-		if g.Mode == "loose" && len(evalResults) > 0 {
-			majority := expectedHealthy/2 + 1
-			if len(evalResults) >= majority {
-				cancel()
-				break
-			}
-		}
-
-		if g.Mode == "loose" && healthyReceived >= expectedHealthy {
-			grace := time.NewTimer(2 * time.Millisecond)
-		drainLoop:
-			for i < n-1 {
-				select {
-				case extra := <-ch:
-					results = append(results, extra)
-					if extra.up.isHealthy() {
-						healthyReceived++
+		if g.Mode == "loose" && healthyReceived >= expectedHealthy && len(evalResults) > 0 {
+			if i < n-1 {
+				grace := time.NewTimer(2 * time.Millisecond)
+			drainLoop:
+				for i < n-1 {
+					select {
+					case extra := <-ch:
+						results = append(results, extra)
+						if extra.wasHealthy {
+							healthyReceived++
+						}
+						if extra.err == nil && extra.msg != nil {
+							extra.up.recordSuccess()
+							g.updateRTT(extra.up, extra.rtt)
+						} else if extra.err != nil && !errors.Is(extra.err, context.Canceled) {
+							extra.up.recordFailure()
+							g.penalizeRTT(extra.up)
+						}
+						if !evaluateResult(extra) {
+							grace.Stop()
+							cancel()
+							fbMsg, fbAddr := pickFallback()
+							return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
+						}
+						i++
+					case <-grace.C:
+						break drainLoop
 					}
-					if extra.err == nil && extra.msg != nil {
-						extra.up.recordSuccess()
-						g.updateRTT(extra.up, extra.rtt)
-					} else if extra.err != nil && !errors.Is(extra.err, context.Canceled) {
-						extra.up.recordFailure()
-						g.penalizeRTT(extra.up)
-					}
-					if !evaluateResult(extra) {
-						grace.Stop()
-						cancel()
-						fbMsg, fbAddr := pickFallback()
-						return synthesizeConsensusBlock(req, consensusAddr, fbMsg, fbAddr)
-					}
-					i++
-				case <-grace.C:
-					break drainLoop
 				}
+				grace.Stop()
 			}
-			grace.Stop()
 			cancel()
 			break
 		}
@@ -704,8 +747,15 @@ func (g *UpstreamGroup) exchangeSecure(ctx context.Context, req *dns.Msg, client
 	var finalAddr string
 	var winningUpstream *Upstream
 
+	reqDO := g.RequireDNSSECAD
+	if !reqDO {
+		if opt := req.IsEdns0(); opt != nil && opt.Do() {
+			reqDO = true
+		}
+	}
+
 	qtype := req.Question[0].Qtype
-	if g.Preference == "consolidate" && len(evalResults) > 1 && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
+	if g.Preference == "consolidate" && !reqDO && len(evalResults) > 1 && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
 		baseMsg := evalResults[0].msg.Copy()
 		qName := req.Question[0].Name
 		if len(baseMsg.Question) > 0 {
@@ -1093,16 +1143,18 @@ func bootstrapResolve(host string, servers []*Upstream) []string {
 					}
 					if s != "" {
 						if addr, err := netip.ParseAddr(s); err == nil {
+							addr = addr.Unmap()
 							if ipVersionSupport == "ipv4" && !addr.Is4() {
 								continue
 							}
 							if ipVersionSupport == "ipv6" && !addr.Is6() {
 								continue
 							}
+							canon := addr.String()
 							harvested = true
-							if _, dup := seen[s]; !dup {
-								seen[s] = struct{}{}
-								ips = append(ips, s)
+							if _, dup := seen[canon]; !dup {
+								seen[canon] = struct{}{}
+								ips = append(ips, canon)
 							}
 						}
 					}

@@ -1,22 +1,24 @@
 /*
 File:    ratelimit.go
-Version: 1.20.0
-Last Updated: 04-Nov-2026 20:55 CET
+Version: 1.21.0
+Last Updated: 24-Nov-2026 12:56 CET
+
 Description:
-  High-performance, lock-free (sharded) Token Bucket Rate Limiter and Penalty Box.
-  Designed specifically to harden sdproxy when exposed to the public internet
-  as an Open Resolver. Defends against DNS amplification, reflection, and
-  volumetric DDoS attacks.
+  High-performance, sharded Token Bucket Rate Limiter and Penalty Box.
+  Defends against DNS amplification, reflection, and volumetric DDoS attacks.
 
 Changes:
-  1.20.0 - [FIX] Guarded all `[RATELIMIT]` startup and runtime security log lines
-           with `if logSystem` for consistency with `InitExfiltration`, `InitSubdomainLimit`,
-           and `logging.log_system` configuration semantics.
-  1.19.0 - [CLEANUP] Streamlined `groupIPFast` limit evaluation blocks 
-           to naturally deduce mask bounds without duplicate branching.
-  1.18.0 - [PERF] Eradicated `sync.Map` boxing allocations on the hot path natively. 
-           Replaced `fastPenaltyBox` with a dedicated 256-shard `sync.RWMutex` array.
-  1.17.0 - [SECURITY/PERF] Replaced the shard eviction policy.
+  1.21.0 - [SECURITY/FIX] Re-verified `nowNanos >= cur.expires.Load()` under
+           `fShard.Lock()` before deleting expired fast-path bans in `AllowClient`
+           to prevent TOCTOU deletion of concurrently refreshed bans.
+         - [FIX] Used ceiling division `(maxIPs + rlShardCount - 1) / rlShardCount`
+           for `rlMaxPerShard` so default `max_tracked_ips: 1000` allocates full
+           capacity across all 256 shards instead of truncating to 768, and
+           aligned fallback `maxIPs` with `validateConfig` (1000).
+  1.20.0 - [FIX] Guarded `[RATELIMIT]` log lines with `if logSystem`.
+  1.19.0 - [CLEANUP] Streamlined `groupIPFast`.
+  1.18.0 - [PERF] Replaced `fastPenaltyBox` `sync.Map` with 256-shard `RWMutex`.
+  1.17.0 - [SECURITY/PERF] 2-tier sampled shard eviction policy.
 */
 
 package main
@@ -31,7 +33,6 @@ import (
 )
 
 const rlShardCount = 256
-
 const rlEvictSampleSize = 32
 
 type rlBucket struct {
@@ -105,14 +106,11 @@ func InitRateLimiter() {
 
 	maxIPs := cfg.Server.RateLimit.MaxTrackedIPs
 	if maxIPs <= 0 {
-		maxIPs = 100000
+		maxIPs = 1000
 	}
 	cfg.Server.RateLimit.MaxTrackedIPs = maxIPs
 
-	rlMaxPerShard = maxIPs / rlShardCount
-	if rlMaxPerShard < 1 {
-		rlMaxPerShard = 1
-	}
+	rlMaxPerShard = max((maxIPs+rlShardCount-1)/rlShardCount, 1)
 
 	rlExempt = parseACL(cfg.Server.RateLimit.Exempt)
 
@@ -205,8 +203,7 @@ func evictOneLocked(shard *rlShard, now int64) {
 		bestRefill   int64
 		bestFound    bool
 		bestUnpunish bool
-
-		scanned int
+		scanned      int
 	)
 
 	for k, b := range shard.buckets {
@@ -266,9 +263,7 @@ func AllowClient(_ string, addr netip.Addr) (allowed bool, isBanned bool) {
 
 	key := groupIPFast(addr)
 
-	// -----------------------------------------------------------------------
-	// 1. LOCK-FREE FAST-PATH (Penalty Box)
-	// -----------------------------------------------------------------------
+	// 1. Fast-Path Penalty Box Check
 	fShard := getFastBanShard(key)
 	fShard.RLock()
 	banEntry, fastOk := fShard.bans[key]
@@ -288,16 +283,14 @@ func AllowClient(_ string, addr netip.Addr) (allowed bool, isBanned bool) {
 			return false, true
 		}
 		fShard.Lock()
-		if _, loaded := fShard.bans[key]; loaded {
+		if cur, loaded := fShard.bans[key]; loaded && nowNanos >= cur.expires.Load() {
 			delete(fShard.bans, key)
 			fastPenaltyBoxCount.Add(-1)
 		}
 		fShard.Unlock()
 	}
 
-	// -----------------------------------------------------------------------
-	// 2. EXEMPTIONS
-	// -----------------------------------------------------------------------
+	// 2. Exemptions
 	if isExempt(addr) {
 		return true, false
 	}
@@ -322,9 +315,7 @@ func AllowClient(_ string, addr netip.Addr) (allowed bool, isBanned bool) {
 		return true, false
 	}
 
-	// -----------------------------------------------------------------------
-	// Slow-Path Penalty Box Check (Fail-Safe)
-	// -----------------------------------------------------------------------
+	// 3. Slow-Path Penalty Box Check
 	if rlPenaltyEnabled && bucket.bannedUntil > 0 {
 		if bucket.bannedUntil > now {
 			if now-bucket.lastLog > int64(10*time.Second) {
@@ -334,12 +325,11 @@ func AllowClient(_ string, addr netip.Addr) (allowed bool, isBanned bool) {
 				}
 			}
 			return false, true
-		} else {
-			bucket.bannedUntil = 0
-			bucket.strikes = 0
-			if logSystem {
-				log.Printf("[RATELIMIT] SECURITY: Client/Subnet %s Penalty Box ban expired. Access restored.", key.String())
-			}
+		}
+		bucket.bannedUntil = 0
+		bucket.strikes = 0
+		if logSystem {
+			log.Printf("[RATELIMIT] SECURITY: Client/Subnet %s Penalty Box ban expired. Access restored.", key.String())
 		}
 	}
 
@@ -364,9 +354,7 @@ func AllowClient(_ string, addr netip.Addr) (allowed bool, isBanned bool) {
 		return true, false
 	}
 
-	// -----------------------------------------------------------------------
-	// Rate Limit Exceeded - Apply Strike or Drop
-	// -----------------------------------------------------------------------
+	// 4. Rate Limit Exceeded - Apply Strike or Drop
 	if rlPenaltyEnabled {
 		bucket.strikes++
 		if bucket.strikes >= rlStrikeThreshold {

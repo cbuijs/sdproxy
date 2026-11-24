@@ -1,18 +1,20 @@
-// File: server_udp_stub.go
-// Version: 1.4.0
-// Last Updated: 15-Oct-2026 18:55 CEST
-// Description: Non-Linux fallback UDP listener pool using a shared channel.
-// Changes:
-//   1.4.0 - [SECURITY/FIX] Wrapped non-Linux UDP listeners in `superviseListener`
-//           and tied server teardown to `shutdownCh` so transient socket errors
-//           do not call `log.Fatalf` at runtime.
-//   1.3.0 - [SECURITY/FIX] Same fail-open source-address extraction repaired in
-//           server_udp_linux.go 1.5.0: the worker asserted job.w.RemoteAddr()
-//           to *net.UDPAddr and left the IP empty on failure. Switched to the
-//           shared remoteIPFromAddr() helper (server.go 1.36.0) so both build
-//           variants derive the peer address identically. The "net" import is
-//           dropped with it — the type assertion was this file's only consumer.
-//   1.2.0 - [LOGGING] Attached binding events smoothly into `logSystem`.
+/*
+File:    server_udp_stub.go
+Version: 1.5.0
+Last Updated: 24-Nov-2026 12:56 CET
+
+Description:
+  Non-Linux fallback UDP listener pool using a shared channel.
+
+Changes:
+  1.5.0 - [FIX] Incremented `thr.droppedQueries` when `udpQueue` is full in
+          `handleUDP` so queue-saturation drops on non-Linux builds are recorded
+          in throttle diagnostics and persistent telemetry.
+  1.4.0 - [SECURITY/FIX] Wrapped non-Linux UDP listeners in `superviseListener`
+          and tied server teardown to `shutdownCh`.
+  1.3.0 - [SECURITY/FIX] Switched peer address extraction to `remoteIPFromAddr`.
+  1.2.0 - [LOGGING] Attached binding events to `logSystem`.
+*/
 
 //go:build !linux
 
@@ -49,7 +51,6 @@ func startUDPServers(addrs []string, workers int) {
 					if !ok {
 						return
 					}
-					// [SECURITY 1.3.0] Type-agnostic extraction — see header.
 					ip := remoteIPFromAddr(job.w.RemoteAddr())
 					ProcessDNS(job.w, job.r, ip, "UDP", "", "")
 				case <-shutdownCh:
@@ -98,6 +99,6 @@ func handleUDP(w dns.ResponseWriter, r *dns.Msg) {
 	case udpQueue <- udpJob{w: w, r: r}:
 	case <-shutdownCh:
 	default:
+		thr.droppedQueries.Add(1)
 	}
 }
-

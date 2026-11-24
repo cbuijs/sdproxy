@@ -1,46 +1,38 @@
 /*
 File:    cache_rw.go
-Version: 1.50.0 (Split)
-Last Updated: 23-Nov-2026 14:00 CET
+Version: 1.51.0 (Split)
+Last Updated: 24-Nov-2026 12:30 CET
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
   Handles packing/unpacking dns.Msg structures, TTL rewrites, background
   revalidation tracking, and strict RFC bailiwick security enforcement.
 
-  Extracted from cache.go to prioritize hot-path execution clarity.
-
 Changes:
+  1.51.0 - [SECURITY/FIX] Fixed `CacheSet` authority bailiwick validation so
+           parent TLD/eTLD and root `"."` `SOA` / `DS` / `NSEC` / `NSEC3` /
+           `RRSIG` authority records on `NXDOMAIN` and negative responses are
+           permitted while still rejecting out-of-bailiwick or root/public-suffix
+           `TypeNS` delegation records.
+         - [FIX] Stopped mutating `SOA.Minttl` RDATA during `CacheGet` and
+           `CacheGetExpired` per RFC 2308 §5, and synced CNAME head owner casing
+           in `syncQuestionCasing` when `!hasRRSIG`.
   1.50.0 - [SECURITY/FIX] Capped authority `Hdr.Ttl` and `SOA.Minttl` by
-           `targetTTL` inside `rewriteAuthorityTTLInPlace` so authority records
-           never advertise a wire TTL exceeding `targetTTL` (such as `minAnsTTL`
-           on short-TTL CNAME chains or `SOA.Minttl` per RFC 2308), and handled
-           0-TTL `Answer` records (`minAnsTTL == 0`) on non-`NOERROR` responses
-           in `applyRcodeOnlyWireTTL` and `CacheSet`.
-         - [PERF/FIX] Returned `isSynth` (`item.routeName == ""`) directly from
-           `CacheGet` in place of the unused `hits` parameter, eliminating
-           duplicate shard locks and `AA=1` guesswork in callers.
+           `targetTTL` inside `rewriteAuthorityTTLInPlace` and returned
+           `isSynth` directly from `CacheGet`.
   1.49.0 - [SECURITY/FIX] Excluded `dns.TypeRRSIG` records from `minAnsTTL`
-           and wire TTL clamping in `applyRcodeOnlyWireTTL` and `CacheSet`,
-           and preserved `RRSIG` records inside `rewriteAuthorityTTLInPlace`.
+           and wire TTL clamping in `applyRcodeOnlyWireTTL` and `CacheSet`.
   1.48.0 - [SECURITY/FIX] Aligned `applyRcodeOnlyWireTTL` with `CacheSet` and
-           `CacheSetSynth` when an unsigned non-`NOERROR` response contains
-           `Answer` records.
-  1.47.0 - [FIX] Clamped `targetTTL` by `minAnsTTL` in `applyRcodeOnlyWireTTL`
-           when `len(msg.Answer) > 0` on non-`NOERROR` responses.
+           `CacheSetSynth` on non-`NOERROR` responses with `Answer` records.
+  1.47.0 - [FIX] Clamped `targetTTL` by `minAnsTTL` in `applyRcodeOnlyWireTTL`.
   1.46.0 - [SECURITY/FIX] Clamped `ttl` on `isRcodeOnlyAfterClean` responses in
            `CacheSet` by the minimum `Answer` record TTL.
-  1.45.0 - [SECURITY/FIX] Extended `applyRcodeOnlyWireTTL` and `CacheSet` so
-           unsigned non-`NOERROR` responses containing `Answer` records clamp
-           their `Answer` record wire TTLs to `[min_ttl, max_ttl]`.
+  1.45.0 - [SECURITY/FIX] Extended `applyRcodeOnlyWireTTL` and `CacheSet` to
+           clamp `Answer` wire TTLs on unsigned non-`NOERROR` responses.
   1.44.0 - [SECURITY/FIX] Prevented `rcodeTTLBounds` and `computeRcodeOnlyTTL`
-           from applying `cfg.Cache.MinTTL` or `cfg.Cache.NegativeTTL` to
-           non-`NXDOMAIN` / non-`NOERROR` RCODEs.
-  1.43.0 - [SECURITY/FIX] Aligned `CacheSet` positive answer wire-TTL clamping
-           with `applyRcodeOnlyWireTTL` and `CacheSetSynth`.
+           from applying `MinTTL` or `NegativeTTL` to non-negative RCODEs.
+  1.43.0 - [SECURITY/FIX] Aligned `CacheSet` positive answer wire-TTL clamping.
   1.42.0 - [SECURITY/FIX] Aligned `applyRcodeOnlyWireTTL` with `CacheSet`.
-  1.41.0 - [SECURITY/FIX] Tightened `applyRcodeOnlyWireTTL`, `CacheSet`, and
-           `CacheSetSynth` authority wire TTL clamping.
 */
 
 package main
@@ -54,9 +46,7 @@ import (
 )
 
 // extractAuthorityTTL derives the RFC 2308 negative/RCODE caching TTL from the
-// Authority (`Ns`) section of msg. Prefers `min(SOA.Hdr.Ttl, SOA.Minttl)` when an
-// SOA record is present; otherwise falls back to the minimum non-zero TTL across
-// non-RRSIG authority records.
+// Authority (`Ns`) section of msg.
 func extractAuthorityTTL(ns []dns.RR) (ttl uint32, hasAuth bool) {
 	for _, rr := range ns {
 		if soa, ok := rr.(*dns.SOA); ok {
@@ -82,9 +72,7 @@ func extractAuthorityTTL(ns []dns.RR) (ttl uint32, hasAuth bool) {
 	return 0, false
 }
 
-// computeRcodeOnlyTTL computes the effective TTL for an RCODE-only response
-// (`len(Answer) == 0` or `rcode != dns.RcodeSuccess`), honoring `rcode_ttl`,
-// `rcode_min_ttl`, `rcode_max_ttl`, `negative_ttl`, and global `min_ttl`/`max_ttl` bounds.
+// computeRcodeOnlyTTL computes the effective TTL for an RCODE-only response.
 func computeRcodeOnlyTTL(authTTL uint32, hasAuth bool, rcode int) uint32 {
 	isNegRcode := rcode == dns.RcodeNameError || rcode == dns.RcodeSuccess
 	if !isNegRcode && cfg.Cache.RcodeTTL <= 0 && cfg.Cache.RcodeMinTTL <= 0 {
@@ -93,7 +81,6 @@ func computeRcodeOnlyTTL(authTTL uint32, hasAuth bool, rcode int) uint32 {
 
 	ttl := authTTL
 
-	// 1. Base TTL for responses without an Authority/SOA TTL
 	if !hasAuth || ttl == 0 {
 		switch {
 		case cfg.Cache.RcodeTTL > 0:
@@ -111,12 +98,10 @@ func computeRcodeOnlyTTL(authTTL uint32, hasAuth bool, rcode int) uint32 {
 		}
 	}
 
-	// 2. Hard override when `rcode_ttl` is set without `rcode_min_ttl` / `rcode_max_ttl`
 	if cfg.Cache.RcodeTTL > 0 && cfg.Cache.RcodeMinTTL == 0 && cfg.Cache.RcodeMaxTTL == 0 {
 		ttl = uint32(cfg.Cache.RcodeTTL)
 	}
 
-	// 3. Minimum floor & maximum ceiling clamping
 	minFloor, maxCeil := rcodeTTLBounds(rcode)
 	if ttl < minFloor {
 		ttl = minFloor
@@ -128,8 +113,6 @@ func computeRcodeOnlyTTL(authTTL uint32, hasAuth bool, rcode int) uint32 {
 	return ttl
 }
 
-// rcodeTTLBounds returns the configured [minFloor, maxCeil] bounds for an RCODE-only
-// response (`maxCeil == 0` when no upper ceiling is configured).
 func rcodeTTLBounds(rcode int) (minFloor, maxCeil uint32) {
 	isNegRcode := rcode == dns.RcodeNameError || rcode == dns.RcodeSuccess
 	switch {
@@ -149,8 +132,6 @@ func rcodeTTLBounds(rcode int) (minFloor, maxCeil uint32) {
 	return minFloor, maxCeil
 }
 
-// isHardRcodeTTLOverride reports whether the configured RCODE/negative TTL settings
-// mandate a hard override of authority wire TTLs rather than min/max clamping.
 func isHardRcodeTTLOverride(rcode int) bool {
 	if cfg.Cache.RcodeTTL > 0 && cfg.Cache.RcodeMinTTL == 0 && cfg.Cache.RcodeMaxTTL == 0 {
 		return true
@@ -161,10 +142,6 @@ func isHardRcodeTTLOverride(rcode int) bool {
 	return false
 }
 
-// rewriteAuthorityTTLInPlace clamps or overrides the wire TTL (and SOA.Minttl)
-// on an unsigned authority record. Under a hard override (or when the record had
-// a zero TTL), the TTL is set to targetTTL; otherwise it is clamped to
-// [minFloor, maxCeil] and capped at targetTTL.
 func rewriteAuthorityTTLInPlace(cp dns.RR, targetTTL uint32, rcode int) {
 	if cp == nil || cp.Header().Rrtype == dns.TypeRRSIG {
 		return
@@ -194,10 +171,6 @@ func rewriteAuthorityTTLInPlace(cp dns.RR, targetTTL uint32, rcode int) {
 	}
 }
 
-// applyRcodeOnlyWireTTL updates the wire TTLs on unsigned responses when
-// `rcode_ttl`, `rcode_min_ttl`, `rcode_max_ttl`, `negative_ttl`, `min_ttl`, or
-// `max_ttl` is configured, so downstream clients see consistent bounded TTLs on
-// both cache misses and cache hits.
 func applyRcodeOnlyWireTTL(msg *dns.Msg) {
 	if msg == nil || hasAnyRRSIG(msg) {
 		return
@@ -294,9 +267,7 @@ func hasDotSuffix(s, suffix string) bool {
 }
 
 // walkBailiwickChain builds the set of in-bailiwick owner names (lowercased FQDN)
-// starting from initialQName (or rrs[0] when initialQName is empty) by walking
-// CNAME and RFC 6672 DNAME chains up to maxDepth iterations into stackBuf.
-// Returns (validNames, minAliasTTL, exceededLimits).
+// by walking CNAME and RFC 6672 DNAME chains up to maxDepth iterations.
 func walkBailiwickChain(rrs []dns.RR, initialQName string, maxDepth int, stackBuf *[64]string) (validNames []string, minAliasTTL uint32, exceeded bool) {
 	validNames = stackBuf[:0]
 	minAliasTTL = ^uint32(0)
@@ -499,8 +470,7 @@ func syncQuestionCasing(out *dns.Msg, qName string) {
 	if qName == "" || len(out.Question) == 0 {
 		return
 	}
-	prevQName := out.Question[0].Name
-	if prevQName == qName {
+	if out.Question[0].Name == qName {
 		return
 	}
 	qCopy := make([]dns.Question, len(out.Question))
@@ -508,37 +478,25 @@ func syncQuestionCasing(out *dns.Msg, qName string) {
 	qCopy[0].Name = qName
 	out.Question = qCopy
 
-	hasRRSIG := false
-	hasCNAME := false
 	for _, rr := range out.Answer {
-		switch rr.Header().Rrtype {
-		case dns.TypeRRSIG:
-			hasRRSIG = true
-		case dns.TypeCNAME, dns.TypeDNAME:
-			hasCNAME = true
+		if rr.Header().Rrtype == dns.TypeRRSIG {
+			return
 		}
 	}
 	for _, rr := range out.Ns {
 		if rr.Header().Rrtype == dns.TypeRRSIG {
-			hasRRSIG = true
-			break
+			return
 		}
 	}
 	for _, rr := range out.Extra {
 		if rr.Header().Rrtype == dns.TypeRRSIG {
-			hasRRSIG = true
-			break
+			return
 		}
 	}
-	if hasRRSIG {
-		return
-	}
 
-	if !hasCNAME {
-		for _, rr := range out.Answer {
-			if strings.EqualFold(rr.Header().Name, qName) {
-				rr.Header().Name = qName
-			}
+	for _, rr := range out.Answer {
+		if strings.EqualFold(rr.Header().Name, qName) {
+			rr.Header().Name = qName
 		}
 	}
 	for _, rr := range out.Ns {
@@ -686,11 +644,6 @@ func CacheGet(key DNSCacheKey, qName string, out *dns.Msg) (isStale bool, isPref
 	}
 	for _, rr := range out.Ns {
 		rr.Header().Ttl = decayRR(rr.Header().Ttl)
-		if !hasRRSIG {
-			if soa, isSOA := rr.(*dns.SOA); isSOA && soa.Minttl > 0 {
-				soa.Minttl = decayRR(soa.Minttl)
-			}
-		}
 	}
 	for _, rr := range out.Extra {
 		if rr.Header().Rrtype != dns.TypeOPT {
@@ -769,11 +722,6 @@ func CacheGetExpired(key DNSCacheKey, qName string, out *dns.Msg) bool {
 		if rr.Header().Ttl == 0 || staleTTL < rr.Header().Ttl {
 			rr.Header().Ttl = staleTTL
 		}
-		if !hasRRSIG {
-			if soa, isSOA := rr.(*dns.SOA); isSOA && (soa.Minttl == 0 || staleTTL < soa.Minttl) {
-				soa.Minttl = staleTTL
-			}
-		}
 	}
 	for _, rr := range out.Extra {
 		if rr.Header().Rrtype != dns.TypeOPT {
@@ -791,11 +739,7 @@ func CacheGetExpired(key DNSCacheKey, qName string, out *dns.Msg) bool {
 }
 
 func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
-	if !cfg.Cache.Enabled || msg == nil {
-		return
-	}
-
-	if msg.Truncated {
+	if !cfg.Cache.Enabled || msg == nil || msg.Truncated {
 		return
 	}
 
@@ -815,9 +759,7 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 		}
 	}
 
-	// ---------------------------------------------------------------------------
-	// [SECURITY] Bailiwick & RRType Cache-Poisoning Prevention
-	// ---------------------------------------------------------------------------
+	// Bailiwick & RRType Cache-Poisoning Prevention
 	if len(msg.Question) != 1 {
 		if logCaching || logSystem {
 			log.Printf("[CACHE] SECURITY: Dropped suspicious upstream response for %q. Invalid Question count (%d).", key.Name, len(msg.Question))
@@ -886,18 +828,25 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 			}
 
 			ansName := strings.ToLower(rr.Header().Name)
-			isValid := false
-
-			for _, vn := range validNames {
-				if ansName == vn || hasDotSuffix(vn, ansName) {
-					isValid = true
-					break
+			isValid := ansName == "."
+			if !isValid {
+				for _, vn := range validNames {
+					if ansName == vn || hasDotSuffix(vn, ansName) {
+						isValid = true
+						break
+					}
 				}
 			}
 
 			cleanAnsName := strings.TrimSuffix(ansName, ".")
-			if isValid && cleanAnsName != key.Name && isPublicSuffix(cleanAnsName) {
-				isValid = false
+			if isValid && cleanAnsName != key.Name {
+				isDelegationNS := rr.Header().Rrtype == dns.TypeNS
+				if sig, ok := rr.(*dns.RRSIG); ok && sig.TypeCovered == dns.TypeNS {
+					isDelegationNS = true
+				}
+				if isDelegationNS && (ansName == "." || isPublicSuffix(cleanAnsName)) {
+					isValid = false
+				}
 			}
 
 			if !isValid {
@@ -1047,11 +996,7 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 }
 
 func CacheSetSynth(key DNSCacheKey, msg *dns.Msg) {
-	if !cfg.Cache.Enabled || msg == nil {
-		return
-	}
-
-	if msg.Truncated {
+	if !cfg.Cache.Enabled || msg == nil || msg.Truncated {
 		return
 	}
 

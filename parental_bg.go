@@ -1,24 +1,24 @@
 /*
 File:    parental_bg.go
-Version: 1.15.0
-Last Updated: 23-Nov-2026 14:16 CET
+Version: 1.16.0
+Last Updated: 24-Nov-2026 12:30 CET
 
 Description:
   Background sync and timer goroutines for the sdproxy parental subsystem.
   Extracted from parental.go to isolate cron-like behavior from the hot-path.
 
 Changes:
+  1.16.0 - [HYGIENE/FIX] Invoked `pruneOldSnapshots()` after `runMidnightReset`
+           rolls over daily budgets so outdated `parental-*-YYYY-MM-DD.json`
+           files do not accumulate indefinitely on disk.
   1.15.0 - [PERF/FIX] Clamped decremented `gs.remaining[cat]` at `0` in
            `runDebitTicker` and only flagged `dirty = true` when a positive
-           budget actually changed. Prevents negative remaining seconds in
-           snapshots and eliminates redundant 10s disk writes once a category
-           budget is already exhausted.
+           budget actually changed.
   1.14.0 - [SECURITY/FIX] Cleared `gs.untriggerUntil = time.Time{}` and persisted
            the reset budget counters to disk via `saveSnapshot` in `runMidnightReset`.
-  1.13.0 - [PERF/FIX] Eradicated massive disk I/O stalls organically. `runDebitTicker` 
-           now implements a localized `dirty` flag constraint.
-  1.12.0 - [SECURITY/FIX] Eradicated a persistent zombie goroutine organically.
-  1.11.0 - [BUG/FIX] Re-injected the missing `strings` import required for budget evaluation loops natively.
+  1.13.0 - [PERF/FIX] Implemented localized `dirty` flag constraint in `runDebitTicker`.
+  1.12.0 - [SECURITY/FIX] Bounded background loops to `shutdownCh`.
+  1.11.0 - [BUG/FIX] Added missing `strings` import.
 */
 
 package main
@@ -29,10 +29,6 @@ import (
 	"strings"
 	"time"
 )
-
-// ---------------------------------------------------------------------------
-// Background debit ticker
-// ---------------------------------------------------------------------------
 
 func runDebitTicker() {
 	interval := cfg.Parental.TickerInterval
@@ -128,10 +124,6 @@ func runDebitTicker() {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Background goroutines
-// ---------------------------------------------------------------------------
-
 func runWeeklyListRefresh() {
 	for {
 		now := time.Now().Local().Add(time.Duration(cfg.Parental.TimeOffsetHours) * time.Hour)
@@ -226,5 +218,7 @@ func runMidnightReset() {
 
 			saveSnapshot(sk, gs)
 		}
+
+		pruneOldSnapshots()
 	}
 }

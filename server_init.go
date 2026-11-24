@@ -1,40 +1,32 @@
 /*
 File:    server_init.go
-Version: 1.32.0 (Split)
-Last Updated: 05-Nov-2026 18:45 CET
+Version: 1.33.0 (Split)
+Last Updated: 24-Nov-2026 13:11 CET
 
 Description:
-  Listener initialization and OS binding orchestration.
-  Extracted from server.go to cleanly separate the setup of network listeners
-  (UDP, TCP, TLS, DoH, DoQ) from the runtime protocol payload handlers.
+  Listener initialization and OS binding orchestration for UDP, TCP, DoT,
+  DoH, DoH3, and DoQ.
 
 Changes:
-  1.32.0 - [CRITICAL/FIX] Separated `handshakeTimeout` (5s) from `idleTimeout` (15s)
-           on `tlsHandshakeListener` and `tlsHandshakeConn`, and fixed a mutex/atomic
-           ordering race in `ensureHandshake`: `SetReadDeadline` and `SetWriteDeadline`
-           are now applied to the underlying `tc.Conn` while `tc.mu` is held and
-           before `tc.hsDone.Store(true)`, preventing concurrent `SetReadDeadline`
-           calls from `dns.Server` or `http.Server` from being overwritten with a
-           stale deadline.
+  1.33.0 - [CRITICAL/SECURITY] Restricted Web UI HTTP multiplexing on DoH/DoH3
+           listeners (`mux.HandleFunc("/")`) strictly to DoH addresses also
+           configured in `webui.listen_https` (`sameListenAddr`). Previously,
+           enabling `webui` on `127.0.0.1:8080` silently exposed the admin Web UI
+           on public DoH/DoH3 (`0.0.0.0:443`) endpoints.
+  1.32.0 - [CRITICAL/FIX] Separated `handshakeTimeout` (5s) from `idleTimeout`
+           (15s) on `tlsHandshakeListener` and fixed mutex/atomic ordering in
+           `ensureHandshake`.
   1.31.0 - [CRITICAL/FIX] Fixed idle connection timeout regression in
-           `tlsHandshakeConn.ensureHandshake` and added HTTP security headers to
-           the DoH mux's `.well-known` endpoints.
+           `tlsHandshakeConn.ensureHandshake` and added security headers to
+           `.well-known` endpoints.
   1.30.0 - [CRITICAL/FIX] Set a 5-second initial read deadline on newly accepted
-           TCP sockets directly in `keepAliveListener.Accept`.
+           TCP sockets in `keepAliveListener.Accept`.
   1.29.0 - [CRITICAL/FIX] Removed `initialDeadlineConn` from `keepAliveListener`.
   1.28.0 - [CRITICAL/FIX] Added `initialDeadlineConn` in `keepAliveListener`.
-  1.27.0 - [CRITICAL/FIX] Fixed idle connection timeout regression in
-           `tlsHandshakeConn.ensureHandshake`.
-  1.26.0 - [CRITICAL/FIX] Fixed an infinite loop in `tlsHandshakeConn`:
-           `ConnectionState` triggers `ensureHandshake` safely before querying
-           `tc.Conn.ConnectionState()`.
-  1.25.0 - [CRITICAL/FIX] Fixed socket deadline lifecycle in `keepAliveListener`
-           and `tlsHandshakeConn`.
-  1.24.0 - [CRITICAL/FIX] Replaced `tls.NewListener` with `tlsHandshakeListener`
-           on DoT, DoH, and WebUI-HTTPS listeners, and injected
-           `http.LocalAddrContextKey` via `ConnContext` on `h2Server`.
-  1.23.0 - [CRITICAL/FIX] Replaced `netutil.LimitListener` on TCP and DoT `dns.Server`
-           listeners with an explicit TLS handshake timeout and TCP keepalive wrapper.
+  1.27.0 - [CRITICAL/FIX] Fixed idle connection timeout in `tlsHandshakeConn`.
+  1.26.0 - [CRITICAL/FIX] Triggered `ensureHandshake` inside `ConnectionState`.
+  1.25.0 - [CRITICAL/FIX] Fixed socket deadline lifecycle.
+  1.24.0 - [CRITICAL/FIX] Replaced `tls.NewListener` with `tlsHandshakeListener`.
 */
 
 package main
@@ -66,20 +58,40 @@ var (
 	shutdownOnce sync.Once
 )
 
-// Shutdown cleanly signals all active listeners and pools to terminate.
 func Shutdown() {
 	shutdownOnce.Do(func() {
 		close(shutdownCh)
 	})
 }
 
+// sameListenAddr reports whether two validated host:port listener strings
+// designate the same local bind endpoint.
+func sameListenAddr(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == b {
+		return true
+	}
+	h1, p1, err1 := net.SplitHostPort(a)
+	h2, p2, err2 := net.SplitHostPort(b)
+	if err1 != nil || err2 != nil || p1 != p2 {
+		return false
+	}
+	if strings.EqualFold(h1, h2) {
+		return true
+	}
+	ip1, e1 := netip.ParseAddr(h1)
+	ip2, e2 := netip.ParseAddr(h2)
+	if e1 == nil && e2 == nil {
+		return ip1.Unmap() == ip2.Unmap()
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // Hardened TCP / TLS Listener Wrappers
 // ---------------------------------------------------------------------------
 
-// keepAliveListener sets TCP keepalives and an initial 5-second read deadline on
-// newly accepted raw TCP sockets so silent/half-open connections cannot hold
-// slots in netutil.LimitListener indefinitely before the first Read or TLS handshake.
 type keepAliveListener struct {
 	net.Listener
 }
@@ -97,11 +109,6 @@ func (kl *keepAliveListener) Accept() (net.Conn, error) {
 	return c, nil
 }
 
-// tlsHandshakeConn wraps a *tls.Conn so the TLS handshake is bounded by a
-// strict deadline on the first Read/Write/ConnectionState (which happens inside
-// the per-conn worker goroutine in both net/http and miekg/dns, never blocking
-// the Accept loop), and restores the caller's read/write deadlines (or falls
-// back to idleTimeout if none was set yet) atomically under tc.mu.
 type tlsHandshakeConn struct {
 	*tls.Conn
 	timeout       time.Duration
@@ -314,7 +321,6 @@ func filterListeners(addrs []string) []string {
 	return out
 }
 
-// StartServers spins up all configured DNS protocol listeners independently.
 func StartServers(tlsConf *tls.Config) {
 	maxTCP := cfg.Server.MaxTCPConnections
 	if maxTCP <= 0 {
@@ -334,7 +340,7 @@ func StartServers(tlsConf *tls.Config) {
 
 	tcpIdleTimeout := 15 * time.Second
 
-	// 1. Classic UDP (Dispatches to Linux SO_REUSEPORT or fallback workers)
+	// 1. Classic UDP
 	startUDPServers(filterListeners(cfg.Server.ListenUDP), cfg.Server.UDPWorkers)
 
 	// 2. DNS over TCP
@@ -424,10 +430,21 @@ func StartServers(tlsConf *tls.Config) {
 	}
 
 	// 4. DNS over HTTPS (DoH/HTTP1.1 + HTTP/2) + DNS over HTTP/3 (DoH3/QUIC)
+	filteredWebUIHTTPS := filterListeners(cfg.WebUI.ListenHTTPS)
+
 	for _, addr := range filterListeners(cfg.Server.ListenDoH) {
 		addr := addr
-		mux := http.NewServeMux()
+		muxWebUI := false
+		if cfg.WebUI.Enabled && cfg.WebUI.Password != "" {
+			for _, uiAddr := range filteredWebUIHTTPS {
+				if sameListenAddr(uiAddr, addr) {
+					muxWebUI = true
+					break
+				}
+			}
+		}
 
+		mux := http.NewServeMux()
 		altSvc := buildAltSvc(addr)
 
 		mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
@@ -481,7 +498,7 @@ func StartServers(tlsConf *tls.Config) {
 				return
 			}
 
-			if WebUIMux != nil {
+			if muxWebUI && WebUIMux != nil {
 				WebUIMux.ServeHTTP(w, r)
 			} else {
 				http.Error(w, "Not Found", http.StatusNotFound)

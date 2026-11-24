@@ -1,34 +1,27 @@
 /*
 File:    webui_components.go
-Version: 1.37.0
-Last Updated: 04-Nov-2026 21:05 CET
+Version: 1.38.0
+Last Updated: 24-Nov-2026 14:40 CET
 
 Description:
   HTML String builders, template injection, and UI logic for the sdproxy web UI.
 
 Changes:
+  1.38.0 - [SECURITY] Escaped `durStr` in `collectBudgetRows` and `curMode` in
+           `buildGroupDetail` and `renderBudgetTable` so no raw configuration or
+           state string is ever interpolated into HTML without `esc()`.
   1.37.0 - [FIX] Updated `buildTopNTable` filter string for `top-groups` to use
-           raw `row.Name` instead of `"(" + row.Name + ")"` so clicking a group
-           in Top Groups matches Query Log lines in both Simple Logging Mode
-           (`Policy: Group (<group>)` / `Policy: Parental (<cat>)`) and Verbose
-           Logging Mode.
+           raw `row.Name`.
   1.36.0 - [FIX] Updated `buildTopNTable` filter string for `top-upstreams` and
-           `top-upstream-hosts` so clicking an entry in the Top-N tables matches
-           Query Log lines in both Simple Logging Mode (`Policy: <group>`) and
-           Verbose Logging Mode (`ROUTE: <group>`).
-  1.35.0 - [FIX] Wrapped the Desktop and Mobile `Group overrides` headers, tables,
-           and legend bars inside `buildGroupsSectionHTML()`.
+           `top-upstream-hosts`.
+  1.35.0 - [FIX] Wrapped Desktop and Mobile `Group overrides` inside
+           `buildGroupsSectionHTML()`.
   1.34.0 - [SECURITY] Hardened HTML escaping in `esc()` and `buildTopNTable`.
-  1.33.0 - [UI] Added a "Last Seen" column to the Known Clients & Blocking
-           table, rendered from ClientInfo.LastSeen.
-  1.32.0 - [UI] Sourced and injected `bulk-unknown-action` tools directly into the 
-           Client Tracking HTML array generation loop dynamically.
-  1.31.0 - [UI] Injected a real-time `clients-filter` search bounding box organically 
-           into the Client Tracking GUI Engine.
-  1.30.0 - [UI] Dynamically suppress the rendering of the `Group overrides` structural 
-           HTML entirely natively if no groups are configured.
-  1.29.0 - [UI] Injected dynamic visual tracking badges to explicitly highlight 
-           randomized/private MAC addresses natively.
+  1.33.0 - [UI] Added "Last Seen" column to Known Clients & Blocking table.
+  1.32.0 - [UI] Added `bulk-unknown-action` controls to Client Tracking.
+  1.31.0 - [UI] Added `clients-filter` search box.
+  1.30.0 - [UI] Suppressed `Group overrides` HTML when no groups are configured.
+  1.29.0 - [UI] Added randomized/private MAC visual badges.
 */
 
 package main
@@ -40,10 +33,6 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// HTML escaping
-// ---------------------------------------------------------------------------
-
 func esc(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")
 	s = strings.ReplaceAll(s, "<", "&lt;")
@@ -52,10 +41,6 @@ func esc(s string) string {
 	s = strings.ReplaceAll(s, "'", "&#39;")
 	return s
 }
-
-// ---------------------------------------------------------------------------
-// Stat card builders
-// ---------------------------------------------------------------------------
 
 func buildStatCardSub(id, val, subID, sub, label, subLabel string) string {
 	return `<div class="stat-card">` +
@@ -398,7 +383,7 @@ func buildGroupDetail(name string, grp GroupConfig, rulesCount int, curMode stri
 		}
 		if cls != "" {
 			b.WriteString(`<div class="override-banner ` + cls + `">`)
-			b.WriteString(`&#9888; <strong>OVERRIDE (` + curMode + `):</strong> ` + desc)
+			b.WriteString(`&#9888; <strong>OVERRIDE (` + esc(curMode) + `):</strong> ` + desc)
 			b.WriteString(`</div>`)
 		}
 	}
@@ -606,7 +591,7 @@ func collectBudgetRows(grp GroupConfig, liveRemaining map[string]int64) []budget
 				if durStr == "" {
 					durStr = "5m"
 				}
-				row.remaining = "trigger (" + durStr + ")"
+				row.remaining = "trigger (" + esc(durStr) + ")"
 			} else if liveRemaining != nil {
 				if rem, ok := liveRemaining[k]; ok {
 					if rem <= 0 {
@@ -635,22 +620,23 @@ func renderBudgetTable(rows []budgetRow, curMode string) string {
 	b.WriteString(`<table class="btable"><thead><tr>` +
 		`<th>Category</th><th>Limit</th><th>Remaining</th>` +
 		`</tr></thead><tbody>`)
+	escMode := esc(curMode)
 	for _, r := range rows {
 		remCls, cfgCls := "", ""
 		remStr := r.remaining
 
 		if !r.isAllow && !r.isBlock && !r.isFree && !r.isLog && !r.isUntrigger {
 			if curMode == "ALLOW" || curMode == "FREE" || curMode == "LOG" {
-				remStr = `<span class="muted">suspended (` + curMode + `)</span>`
+				remStr = `<span class="muted">suspended (` + escMode + `)</span>`
 				r.exhausted = false
 			} else if curMode == "BLOCK" {
-				remStr = `<span class="muted">blocked (` + curMode + `)</span>`
+				remStr = `<span class="muted">blocked (` + escMode + `)</span>`
 				r.exhausted = false
 			}
 		} else if r.isBlock && (curMode == "ALLOW" || curMode == "LOG") {
-			remStr = `<span class="muted">bypassed (` + curMode + `)</span>`
+			remStr = `<span class="muted">bypassed (` + escMode + `)</span>`
 		} else if r.isAllow && curMode == "BLOCK" {
-			remStr = `<span class="muted">blocked (` + curMode + `)</span>`
+			remStr = `<span class="muted">blocked (` + escMode + `)</span>`
 		}
 
 		switch {
@@ -820,7 +806,6 @@ func mainPage(title, body string) string {
 
 		`<div id="qlog-modal" class="modal">` +
 		`<div class="modal-content" id="qlog-modal-content">` +
-		`<!-- 8-way custom resize handles -->` +
 		`<div class="resizer n"></div><div class="resizer e"></div><div class="resizer s"></div><div class="resizer w"></div>` +
 		`<div class="resizer nw"></div><div class="resizer ne"></div><div class="resizer sw"></div><div class="resizer se"></div>` +
 		`<div class="modal-header" id="qlog-modal-header" title="Drag to move, double-click to maximize">` +

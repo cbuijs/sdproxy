@@ -1,26 +1,23 @@
 /*
 File:    stats.go
-Version: 3.4.0
-Last Updated: 17-Nov-2026 10:33 CET
+Version: 3.5.0
+Last Updated: 24-Nov-2026 13:11 CET
 
 Description:
   Lightweight DNS query statistics for sdproxy. Tracks totals since startup:
-  queries, cache hits, parental blocks, policy blocks, DGA interceptions, 
+  queries, cache lookups/hits, parental blocks, policy blocks, DGA interceptions,
   exfiltration mitigations, subdomain limits, and IDN homograph blocks.
   Feeds /api/stats in webui.go.
 
-  Related modules:
-    stats_topn.go     — Top-N tracker engine
-    stats_hourly.go   — 24h hourly ring buffer
-    stats_lastseen.go — per-client last-seen tracker
-
 Changes:
-  3.4.0  - [FEAT] Added `statIDNHomographBlocks` and `IncrIDNHomographBlock()`
-           to track and persist IDN homograph, Punycode/ACE, and lookalike
-           brand impersonation blocks across `GetStats`, `ResetStats`,
-           `SaveStats`, and `LoadStats`.
-  3.3.0  - [FEAT] Integrated `statSubdomainBlocks` organically to track and present 
-           analytical hits originating from the Subdomain Limit / Info-Stealer defense natively.
+  3.5.0 - [FIX] Added `statCacheLookups` (`IncrCacheLookup`) and persisted
+          `CacheLookups` in `SavedStats` so `GetStats()` computes `CacheHitRate`
+          against actual cache lookups (`hits / lookups`, bounded to `100.0%`)
+          instead of `total - blocked`, preventing `>100%` or missing hit rates
+          when cached synthetic blocks or `LOG`-mode rules increment both
+          `statCacheHits` and block counters.
+  3.4.0 - [FEAT] Added `statIDNHomographBlocks` and `IncrIDNHomographBlock()`.
+  3.3.0 - [FEAT] Integrated `statSubdomainBlocks` for Subdomain Limit defense.
 */
 
 package main
@@ -38,7 +35,6 @@ import (
 	"time"
 )
 
-// startTimeUnixNano tracks process uptime.
 var startTimeUnixNano atomic.Int64
 
 var (
@@ -51,6 +47,7 @@ var (
 )
 
 var (
+	statCacheLookups       atomic.Int64
 	statCacheHits          atomic.Int64
 	statParentalBlocks     atomic.Int64
 	statPolicyBlocks       atomic.Int64
@@ -62,6 +59,7 @@ var (
 	statIDNHomographBlocks atomic.Int64
 )
 
+func IncrCacheLookup()       { statCacheLookups.Add(1) }
 func IncrCacheHit()          { statCacheHits.Add(1) }
 func IncrParentalBlock()     { statParentalBlocks.Add(1) }
 func IncrPolicyBlock()       { statPolicyBlocks.Add(1) }
@@ -72,7 +70,6 @@ func IncrExfilBlock()        { statExfilBlocks.Add(1) }
 func IncrSubdomainBlock()    { statSubdomainBlocks.Add(1) }
 func IncrIDNHomographBlock() { statIDNHomographBlocks.Add(1) }
 
-// runQPSTicker computes current, low and high queries-per-second.
 func runQPSTicker() {
 	interval := 30 * time.Second
 	if cfg.WebUI.StatsRefreshSec >= 5 {
@@ -93,7 +90,6 @@ func runQPSTicker() {
 
 			qpsMu.Lock()
 			deltaTot := tot - qpsLastTot
-			// A negative delta means the counters were reset; rebase on the total.
 			if deltaTot < 0 {
 				deltaTot = tot
 			}
@@ -123,15 +119,14 @@ func runQPSTicker() {
 
 type GroupOverrideStat struct {
 	Mode       string `json:"mode"`
-	ExpiresAt  int64  `json:"expires_at"` // Unix timestamp, 0 if permanent
+	ExpiresAt  int64  `json:"expires_at"`
 	RevertMode string `json:"revert_mode"`
 }
 
-// StatsSnapshot is the JSON structure returned by /api/stats.
 type StatsSnapshot struct {
 	Uptime           string `json:"uptime"`
-	Since            string `json:"since"`      // "02-Jan-2006 15:04:05" in server TZ, kept for compat
-	SinceUnix        int64  `json:"since_unix"` // JS formats this in browser-local TZ
+	Since            string `json:"since"`
+	SinceUnix        int64  `json:"since_unix"`
 	TotalQueries     int64  `json:"total_queries"`
 	CacheHits        int64  `json:"cache_hits"`
 	CacheHitRate     string `json:"cache_hit_rate"`
@@ -170,13 +165,13 @@ type StatsSnapshot struct {
 	HourlyStats []HourlyPoint `json:"hourly_stats"`
 }
 
-// SavedStats is the on-disk persistence structure.
 type SavedStats struct {
 	StartTime          time.Time                   `json:"start_time"`
 	QueriesTotal       int64                       `json:"queries_total"`
 	UpstreamCalls      int64                       `json:"upstream_calls"`
 	DroppedQueries     int64                       `json:"dropped_queries"`
 	DroppedUpstream    int64                       `json:"dropped_upstream"`
+	CacheLookups       int64                       `json:"cache_lookups,omitempty"`
 	CacheHits          int64                       `json:"cache_hits"`
 	ParentalBlocks     int64                       `json:"parental_blocks"`
 	PolicyBlocks       int64                       `json:"policy_blocks"`
@@ -217,20 +212,22 @@ func statsPath() string {
 	return filepath.Join(dir, "webui_stats.json")
 }
 
-// GetStats assembles a snapshot from the live counters, top-N trackers and
-// hourly ring. Cheap enough for a 30-second poll.
 func GetStats() StatsSnapshot {
 	total := thr.queriesTotal.Load()
+	lookups := statCacheLookups.Load()
 	hits := statCacheHits.Load()
 	fwd := thr.upstreamCalls.Load()
 	blocked := statParentalBlocks.Load() + statPolicyBlocks.Load() + statRebindingBlocks.Load() + statDGABlocks.Load() + statExfilBlocks.Load() + statSubdomainBlocks.Load() + statIDNHomographBlocks.Load()
 	active := thr.activeQueries.Load()
 	coalesced := coalescedTotal.Load()
 
-	denom := total - blocked
 	var hitRate string
-	if denom > 0 {
-		hitRate = fmt.Sprintf("%.1f%%", float64(hits)/float64(denom)*100)
+	if lookups > 0 {
+		rate := float64(hits) / float64(lookups) * 100
+		if rate > 100.0 {
+			rate = 100.0
+		}
+		hitRate = fmt.Sprintf("%.1f%%", rate)
 	} else {
 		hitRate = "—"
 	}
@@ -276,10 +273,14 @@ func GetStats() StatsSnapshot {
 	groupOverrideMu.RUnlock()
 
 	pct := func(v int64) string {
-		if total == 0 {
+		if total <= 0 {
 			return "0.0% of total"
 		}
-		return fmt.Sprintf("%.1f%% of total", float64(v)/float64(total)*100)
+		p := float64(v) / float64(total) * 100
+		if p > 100.0 {
+			p = 100.0
+		}
+		return fmt.Sprintf("%.1f%% of total", p)
 	}
 
 	return StatsSnapshot{
@@ -320,7 +321,6 @@ func GetStats() StatsSnapshot {
 	}
 }
 
-// ResetStats clears all live counters, history buffers and top-lists.
 func ResetStats() {
 	if !cfg.WebUI.Enabled {
 		return
@@ -332,6 +332,7 @@ func ResetStats() {
 	thr.upstreamCalls.Store(0)
 	thr.droppedQueries.Store(0)
 	thr.droppedUpstream.Store(0)
+	statCacheLookups.Store(0)
 	statCacheHits.Store(0)
 	statParentalBlocks.Store(0)
 	statPolicyBlocks.Store(0)
@@ -377,7 +378,6 @@ func ResetStats() {
 	SaveStats()
 }
 
-// SaveStats flushes the historical state to disk organically.
 func SaveStats() {
 	if !cfg.WebUI.Enabled {
 		return
@@ -411,6 +411,7 @@ func SaveStats() {
 		UpstreamCalls:      thr.upstreamCalls.Load(),
 		DroppedQueries:     thr.droppedQueries.Load(),
 		DroppedUpstream:    thr.droppedUpstream.Load(),
+		CacheLookups:       statCacheLookups.Load(),
 		CacheHits:          statCacheHits.Load(),
 		ParentalBlocks:     statParentalBlocks.Load(),
 		PolicyBlocks:       statPolicyBlocks.Load(),
@@ -452,7 +453,6 @@ func SaveStats() {
 	}
 }
 
-// LoadStats restores the historical state written by SaveStats organically.
 func LoadStats() {
 	if !cfg.WebUI.Enabled {
 		return
@@ -492,6 +492,18 @@ func LoadStats() {
 	statSubdomainBlocks.Store(data.SubdomainBlocks)
 	statIDNHomographBlocks.Store(data.IDNHomographBlocks)
 	coalescedTotal.Store(data.CoalescedQueries)
+
+	if data.CacheLookups > 0 {
+		statCacheLookups.Store(data.CacheLookups)
+	} else if data.CacheHits > 0 {
+		allBlk := data.ParentalBlocks + data.PolicyBlocks + data.RebindingBlocks +
+			data.DGABlocks + data.ExfilBlocks + data.SubdomainBlocks + data.IDNHomographBlocks
+		estLookups := data.QueriesTotal - allBlk
+		if estLookups < data.CacheHits {
+			estLookups = data.CacheHits
+		}
+		statCacheLookups.Store(estLookups)
+	}
 
 	hourlyMu.Lock()
 	if data.HourlyRing != nil {
@@ -561,7 +573,6 @@ func LoadStats() {
 	}
 }
 
-// runHistorySaveTicker periodically flushes stats and logs to disk.
 func runHistorySaveTicker() {
 	if !cfg.WebUI.Enabled || historyDir() == "" {
 		return
@@ -587,8 +598,6 @@ func runHistorySaveTicker() {
 	}
 }
 
-// InitStats records the process start time (unless restored) and launches the
-// background tickers. All of them are skipped when the Web UI is disabled.
 func InitStats() {
 	if startTimeUnixNano.Load() == 0 {
 		startTimeUnixNano.Store(time.Now().UnixNano())

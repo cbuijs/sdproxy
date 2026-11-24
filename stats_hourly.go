@@ -1,19 +1,19 @@
 /*
 File:    stats_hourly.go
-Version: 1.9.0
-Last Updated: 17-Nov-2026 10:33 CET
+Version: 1.10.0
+Last Updated: 24-Nov-2026 13:11 CET
 
 Description:
   Hourly 24h Ring buffer tracking for sdproxy.
-  Extracted from stats.go to improve modularity and reduce token burn.
 
 Changes:
-  1.9.0 - [FEAT] Included `statIDNHomographBlocks` in hourly aggregate blocked
-          counters (`recordHourSlot` and `getHourlyStats`) so Web UI historical
-          activity charts align with total scalar block counters.
-  1.8.0 - [SECURITY] Natively integrated `statSubdomainBlocks` into the hourly aggregate 
-          blocked tracking buffers to correctly represent DNS tunneling drops inside 
-          the Web UI historical charts.
+  1.10.0 - [FIX] Clamped hourly ring deltas (`dTot`, `dBlk`, `dFwd`) at `>= 0`
+           inside `recordHourSlot` so counter rebases or partial history restores
+           never persist negative bar heights into `hourlyRing`.
+  1.9.0  - [FEAT] Included `statIDNHomographBlocks` in hourly aggregate blocked
+           counters (`recordHourSlot` and `getHourlyStats`).
+  1.8.0  - [SECURITY] Integrated `statSubdomainBlocks` into hourly aggregate
+           blocked tracking buffers.
 */
 
 package main
@@ -23,15 +23,13 @@ import (
 	"time"
 )
 
-// HourlyPoint is one bar in the activity graph returned by /api/stats.
 type HourlyPoint struct {
-	Label   string `json:"label"`   // "14:00" or "14:00…" for the current hour
-	Total   int64  `json:"total"`   // queries during this hour
-	Blocked int64  `json:"blocked"` // blocks during this hour
-	Fwd     int64  `json:"fwd"`     // forwarded queries during this hour
+	Label   string `json:"label"`
+	Total   int64  `json:"total"`
+	Blocked int64  `json:"blocked"`
+	Fwd     int64  `json:"fwd"`
 }
 
-// hourSlot is one completed-hour snapshot stored in the ring. Exported for JSON.
 type hourSlot struct {
 	EpochHour int64 `json:"epoch_hour"`
 	Total     int64 `json:"total"`
@@ -48,14 +46,12 @@ var (
 	prevFwd     int64
 )
 
-// runHourlyTicker waits until the next clock-hour boundary, then ticks every
-// hour to record the hourly delta into the ring.
 func runHourlyTicker() {
 	now := time.Now()
 	next := now.Truncate(time.Hour).Add(time.Hour)
 	sleepDur := next.Sub(now)
 	if sleepDur <= 0 {
-		sleepDur = time.Second // Prevent instant spin-loop
+		sleepDur = time.Second
 	}
 
 	timer := time.NewTimer(sleepDur)
@@ -80,21 +76,30 @@ func runHourlyTicker() {
 	}
 }
 
-// recordHourSlot reads the current cumulative counters, computes deltas since
-// the last tick, and writes them to the ring.
 func recordHourSlot() {
 	total := thr.queriesTotal.Load()
-	// Include all blocking mechanisms to guarantee graph alignment with total scalar counters
 	blocked := statParentalBlocks.Load() + statPolicyBlocks.Load() + statRebindingBlocks.Load() + statDGABlocks.Load() + statExfilBlocks.Load() + statSubdomainBlocks.Load() + statIDNHomographBlocks.Load()
 	fwd := thr.upstreamCalls.Load()
 
 	hourlyMu.Lock()
 	ep := time.Now().Add(-time.Minute).Unix() / 3600
+	dTot := total - prevTotal
+	dBlk := blocked - prevBlocked
+	dFwd := fwd - prevFwd
+	if dTot < 0 {
+		dTot = 0
+	}
+	if dBlk < 0 {
+		dBlk = 0
+	}
+	if dFwd < 0 {
+		dFwd = 0
+	}
 	hourlyRing[ep] = hourSlot{
 		EpochHour: ep,
-		Total:     total - prevTotal,
-		Blocked:   blocked - prevBlocked,
-		Fwd:       fwd - prevFwd,
+		Total:     dTot,
+		Blocked:   dBlk,
+		Fwd:       dFwd,
 	}
 	prevTotal = total
 	prevBlocked = blocked
@@ -126,7 +131,6 @@ func recordHourSlot() {
 	statClientSeen.Prune(clientSeenMaxAge)
 }
 
-// getHourlyStats assembles the series returned by /api/stats.
 func getHourlyStats() []HourlyPoint {
 	now := time.Now()
 	curEpoch := now.Unix() / 3600

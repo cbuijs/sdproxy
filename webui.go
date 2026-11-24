@@ -1,38 +1,35 @@
 /*
 File:    webui.go
-Version: 1.68.0 (Split)
-Last Updated: 05-Nov-2026 18:45 CET
+Version: 1.69.0 (Split)
+Last Updated: 24-Nov-2026 14:40 CET
 
 Description:
   Password-protected single-page web admin interface for sdproxy.
-  This file handles the HTTP server initialization, session authentication,
-  and embedded static assets. 
+  Handles HTTP/HTTPS server initialization, session authentication, security
+  middleware, and embedded static assets.
 
 Changes:
-  1.68.0 - [FIX] Passed explicit `idleTimeout: 30 * time.Second` to `tlsHandshakeListener`
-           on dedicated WebUI-HTTPS listeners to match `server_init.go` 1.32.0.
+  1.69.0 - [SECURITY/FIX] Matched `webui.listen_https` against `server.listen_doh`
+           via `sameListenAddr` (`server_init.go` 1.33.0) so canonicalized IPv6/IPv4
+           listener pairs never double-bind, and guarded `ForceHTTPS` redirects
+           against empty `r.Host` headers to prevent open/malformed redirects.
+  1.68.0 - [FIX] Passed explicit `idleTimeout: 30 * time.Second` to
+           `tlsHandshakeListener` on dedicated WebUI-HTTPS listeners.
   1.67.0 - [SECURITY/FIX] Wrapped dedicated HTTP and HTTPS Web UI listeners in
-           `keepAliveListener`, `netutil.LimitListener`, and `tlsHandshakeListener`
-           so slowloris or half-open TLS handshakes against the Web UI port cannot
-           exhaust file descriptors or stall the listener.
-  1.66.0 - [FIX] Enabled `[WEBUI]` startup status messages in `StartWebUI` when
-           `logSystem` or `logWebUI` is active, and cleared `sessExp` on logout.
-  1.65.0 - [SECURITY/FIX] Hardened `isSameOriginPost` to fail closed when a
-           state-changing `POST` request omits `Origin`, `Referer`, and a
-           trusted `Sec-Fetch-Site` (`same-origin` / `none`).
-  1.64.0 - [SECURITY/FIX] Enforced CSRF origin validation (`isSameOriginPost`) on all
-           state-changing `POST` requests in `webUIMiddleware`.
-  1.63.0 - [SECURITY/FIX] Wrapped dedicated HTTP and HTTPS Web UI listeners in
-           `superviseListener` and bound their teardown to `shutdownCh`.
-  1.62.0 - [SECURITY/FIX] Hardened `webUIMiddleware` source IP normalization and ACL
-           enforcement.
-  1.61.0 - [SECURITY/FIX] isAuthed compared both credentials with `==`.
-         - [SECURITY/FIX] Scoped the API token to SAFE methods.
-         - [SECURITY] Documented, and warned once at startup about, the
-           `?token=` query-parameter form.
-         - [SECURITY/FIX] Added WriteTimeout to both admin servers.
-  1.60.0 - [FEAT] Orchestrated routing multiplexer bindings natively for the 
-           `/api/clients/bulk_block` endpoint.
+           `keepAliveListener`, `netutil.LimitListener`, and `tlsHandshakeListener`.
+  1.66.0 - [FIX] Enabled `[WEBUI]` startup status messages when `logSystem` or
+           `logWebUI` is active, and cleared `sessExp` on logout.
+  1.65.0 - [SECURITY/FIX] Hardened `isSameOriginPost` to fail closed when origin
+           headers are absent.
+  1.64.0 - [SECURITY/FIX] Enforced CSRF origin validation (`isSameOriginPost`) on
+           state-changing `POST` requests.
+  1.63.0 - [SECURITY/FIX] Wrapped Web UI listeners in `superviseListener` and
+           bound teardown to `shutdownCh`.
+  1.62.0 - [SECURITY/FIX] Hardened `webUIMiddleware` source IP normalization and
+           ACL enforcement.
+  1.61.0 - [SECURITY/FIX] Constant-time credential checks, read-only API token
+           scoping, and `WriteTimeout` enforcement.
+  1.60.0 - [FEAT] Added `/api/clients/bulk_block` route registration.
 */
 
 package main
@@ -106,8 +103,6 @@ func isSafeMethod(m string) bool {
 	return false
 }
 
-// isSameOriginPost verifies that a state-changing request originated from the
-// same origin, failing closed if no positive same-origin proof is present.
 func isSameOriginPost(r *http.Request) bool {
 	if isSafeMethod(r.Method) {
 		return true
@@ -141,7 +136,7 @@ func isSameOriginPost(r *http.Request) bool {
 }
 
 func isAuthed(r *http.Request) bool {
-	// ── API Token (READ-ONLY) ────────────────────────────────────────────
+	// API Token (READ-ONLY)
 	if cfg.WebUI.APIToken != "" && isSafeMethod(r.Method) {
 		authHdr := r.Header.Get("Authorization")
 		if strings.HasPrefix(authHdr, "Bearer ") {
@@ -154,7 +149,7 @@ func isAuthed(r *http.Request) bool {
 		}
 	}
 
-	// ── Session cookie ───────────────────────────────────────────────────
+	// Session cookie
 	c, err := r.Cookie(cookieName)
 	if err != nil {
 		return false
@@ -176,9 +171,6 @@ func isAuthed(r *http.Request) bool {
 
 func webUIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// ---------------------------------------------------------------------------
-		// Security Response Headers
-		// ---------------------------------------------------------------------------
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
@@ -190,9 +182,6 @@ func webUIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}
 
-		// ---------------------------------------------------------------------------
-		// IP Identification for ACL and Brute-Force Lockout
-		// ---------------------------------------------------------------------------
 		ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			ipStr = r.RemoteAddr
@@ -204,13 +193,11 @@ func webUIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			ipStr = parsedAddr.String()
 		}
 
-		// ---------------------------------------------------------------------------
-		// Brute-Force Lockout Check (Public Resolver Hardening)
-		// ---------------------------------------------------------------------------
+		// Brute-Force Lockout Check
 		loginStatesMu.Lock()
 		if state, exists := loginStates[ipStr]; exists && cfg.WebUI.LoginRatelimit.Enabled && state.attempts >= cfg.WebUI.LoginRatelimit.MaxAttempts {
 			if time.Now().After(state.lockoutExpires) {
-				state.attempts = 0
+				delete(loginStates, ipStr)
 				if logWebUI || logSystem {
 					log.Printf("[WEBUI] SECURITY: IP %s lockout expired. Access restored.", ipStr)
 				}
@@ -227,13 +214,16 @@ func webUIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		loginStatesMu.Unlock()
 
-		// ---------------------------------------------------------------------------
 		// HTTPS Redirection
-		// ---------------------------------------------------------------------------
 		if cfg.WebUI.ForceHTTPS && r.TLS == nil {
 			host, _, err := net.SplitHostPort(r.Host)
 			if err != nil {
 				host = r.Host
+			}
+			host = strings.TrimSpace(host)
+			if host == "" {
+				http.Error(w, "Bad Request - Missing Host", http.StatusBadRequest)
+				return
 			}
 
 			httpsPort := "443"
@@ -258,14 +248,17 @@ func webUIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 				targetHost = net.JoinHostPort(host, httpsPort)
 			}
 
-			targetURL := "https://" + targetHost + r.URL.RequestURI()
+			reqURI := r.URL.RequestURI()
+			if !strings.HasPrefix(reqURI, "/") || strings.HasPrefix(reqURI, "//") {
+				reqURI = "/"
+			}
+
+			targetURL := "https://" + targetHost + reqURI
 			http.Redirect(w, r, targetURL, http.StatusMovedPermanently)
 			return
 		}
 
-		// ---------------------------------------------------------------------------
 		// Access Control List (ACL) Check
-		// ---------------------------------------------------------------------------
 		if hasWebUIACL {
 			if !parsedAddr.IsValid() {
 				http.Error(w, "Forbidden - Invalid Source IP", http.StatusForbidden)
@@ -294,9 +287,7 @@ func webUIMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		// ---------------------------------------------------------------------------
-		// CSRF Origin Validation (State-Changing Requests)
-		// ---------------------------------------------------------------------------
+		// CSRF Origin Validation
 		if !isSameOriginPost(r) {
 			http.Error(w, "Forbidden - Cross-Origin Request Blocked", http.StatusForbidden)
 			return
@@ -410,7 +401,7 @@ func StartWebUI(tlsConf *tls.Config) {
 
 		isDoH := false
 		for _, dAddr := range filteredDoH {
-			if dAddr == addr {
+			if sameListenAddr(dAddr, addr) {
 				isDoH = true
 				break
 			}

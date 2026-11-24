@@ -1,7 +1,7 @@
 /*
 File:    config_yaml.go
-Version: 1.1.0 (Split)
-Last Updated: 23-Nov-2026 14:35 CET
+Version: 1.2.0 (Split)
+Last Updated: 24-Nov-2026 12:46 CET
 
 Description:
   YAML AST transformation engine powering `--update-config` (`-U`),
@@ -9,14 +9,17 @@ Description:
   Handles reference-comment preservation, legacy alias normalization,
   default-value pruning, and canonical section/key ordering.
 
-  Extracted from config.go 2.0.0 to isolate CLI YAML AST serialization.
-
 Changes:
+  1.2.0 - [FIX] Stopped `CleanConfigYAML` from stripping explicit
+          `server.rate_limit.max_tracked_ips: 100000` configurations (default is
+          1000), preventing a 100x capacity reduction on `--clean-config` output.
+        - [FIX] Normalized non-default enum values (`support_ip_version`,
+          `upstream_selection`, `use_upstream_ech`, `hostname_ech`,
+          `ddr.hostname_source`, `cache.answer_sort`, `budget_tracking`) to
+          lowercase in `CleanConfigYAML` when operating on raw pre-validated structs.
   1.1.0 - [FIX] Dropped empty `webui.listen: ""` scalars in
-          `normalizeUserConfigAliases` instead of converting them into invalid
-          `listen_http: [""]` lists, and normalized non-default `upstreams`
-          enum fields (`strategy`, `preference`, `mode`, `ecs.action`) to
-          lowercase in `CleanConfigYAML`.
+          `normalizeUserConfigAliases` and normalized non-default `upstreams`
+          enum fields to lowercase in `CleanConfigYAML`.
   1.0.0 - [REFACTOR] Extracted `UpdateConfigYAML`, `FullCleanConfigYAML`,
           `CleanConfigYAML`, and YAML AST helper routines from `config.go`.
 */
@@ -609,6 +612,8 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 	}
 	if strings.EqualFold(c.Server.SupportIPVersion, "both") {
 		c.Server.SupportIPVersion = ""
+	} else if c.Server.SupportIPVersion != "" {
+		c.Server.SupportIPVersion = strings.ToLower(strings.TrimSpace(c.Server.SupportIPVersion))
 	}
 	if strings.EqualFold(c.Server.BlockAction, "NULL") {
 		c.Server.BlockAction = ""
@@ -656,6 +661,8 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 	}
 	if strings.EqualFold(c.Server.UpstreamSelection, "stagger") {
 		c.Server.UpstreamSelection = ""
+	} else if c.Server.UpstreamSelection != "" {
+		c.Server.UpstreamSelection = strings.ToLower(strings.TrimSpace(c.Server.UpstreamSelection))
 	}
 	if c.Server.MaxSecureUpstreams == 5 {
 		c.Server.MaxSecureUpstreams = 0
@@ -665,9 +672,13 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 	}
 	if strings.EqualFold(c.Server.UseUpstreamECH, "disable") {
 		c.Server.UseUpstreamECH = ""
+	} else if c.Server.UseUpstreamECH != "" {
+		c.Server.UseUpstreamECH = strings.ToLower(strings.TrimSpace(c.Server.UseUpstreamECH))
 	}
 	if strings.EqualFold(c.Server.HostnameECH, "strict") {
 		c.Server.HostnameECH = ""
+	} else if c.Server.HostnameECH != "" {
+		c.Server.HostnameECH = strings.ToLower(strings.TrimSpace(c.Server.HostnameECH))
 	}
 	if c.Server.DoH3FallbackThreshold <= 0 {
 		c.Server.DoH3FallbackThreshold = 0
@@ -708,6 +719,8 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 		c.Server.DDR.IPv6 = nil
 	} else if strings.EqualFold(c.Server.DDR.HostnameSource, "strict") {
 		c.Server.DDR.HostnameSource = ""
+	} else if c.Server.DDR.HostnameSource != "" {
+		c.Server.DDR.HostnameSource = strings.ToLower(strings.TrimSpace(c.Server.DDR.HostnameSource))
 	}
 
 	if !c.Server.RateLimit.Enabled {
@@ -733,7 +746,7 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 		if c.Server.RateLimit.IPv6PrefixLength == 128 {
 			c.Server.RateLimit.IPv6PrefixLength = 0
 		}
-		if c.Server.RateLimit.MaxTrackedIPs == 1000 || c.Server.RateLimit.MaxTrackedIPs == 100000 {
+		if c.Server.RateLimit.MaxTrackedIPs == 1000 {
 			c.Server.RateLimit.MaxTrackedIPs = 0
 		}
 		if !c.Server.RateLimit.PenaltyBox.Enabled {
@@ -813,6 +826,7 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 		mergedSDL.Exempt = append([]string(nil), mergedSDL.Exempt...)
 	}
 	mergeSubdomainLimitConfig(&mergedSDL, c.Server.SubdomainLimiter)
+	mergeSubdomainLimitConfig(&mergedSDL, c.Server.SubdomainLimit)
 	mergeSubdomainLimitConfig(&mergedSDL, c.Server.SubnetLimiter)
 	mergeSubdomainLimitConfig(&mergedSDL, c.Server.SubnetLimit)
 	c.Server.SubdomainLimit = mergedSDL
@@ -912,6 +926,8 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 		}
 		if strings.EqualFold(c.Cache.AnswerSort, "none") {
 			c.Cache.AnswerSort = ""
+		} else if c.Cache.AnswerSort != "" {
+			c.Cache.AnswerSort = strings.ToLower(strings.TrimSpace(c.Cache.AnswerSort))
 		}
 	}
 
@@ -996,7 +1012,8 @@ func CleanConfigYAML(c Config, userYAMLBytes ...[]byte) ([]byte, error) {
 
 		cleanGroups := make(map[string]GroupConfig, len(c.Groups))
 		for k, g := range c.Groups {
-			if strings.EqualFold(g.BudgetTracking, "group") {
+			g.BudgetTracking = strings.ToLower(strings.TrimSpace(g.BudgetTracking))
+			if g.BudgetTracking == "group" {
 				g.BudgetTracking = ""
 			}
 			if g.BlockTTL == effParentalBlockTTL {

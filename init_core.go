@@ -1,38 +1,32 @@
 /*
 File:    init_core.go
-Version: 1.121.0
-Last Updated: 18-Nov-2026 11:20 CET
+Version: 1.122.0
+Last Updated: 24-Nov-2026 12:46 CET
 
 Description:
   High-level initialization orchestrator and general IO helpers for sdproxy.
   Dispatches specific tasks to init_routing, init_policy, and init_upstreams.
 
 Changes:
-  1.121.0 - [PERF] Pre-initialized static `net.IP` block-IP templates (`globalBlockIPv4`
-            and `globalBlockIPv6`) in `initBlockAction` with exact 4-byte and 16-byte
-            canonical slices so `generateBlockMsg` (`policy.go` 1.16.0) can construct
-            synthetic A/AAAA records without per-query `cloneIP` heap allocations.
-  1.120.0 - [FEAT] Added `initProximityAddrs` to harvest explicit listener IPs,
-            DDR IPs, local outbound source IPs toward configured upstreams, and
-            active network interface unicast IPs to populate `proximityRefV4` and
+  1.122.0 - [FIX] Filtered DDR listener port discovery (`pickDDRPort`) through
+            `filterListeners` so listeners skipped by `support_ip_version` are
+            not advertised in DDR SVCB records, preferred non-loopback listener
+            ports over loopback ports when multiple addresses are configured,
+            and canonicalized `ddrIPv4` / `ddrIPv6` slices.
+  1.121.0 - [PERF] Pre-initialized static `net.IP` block-IP templates
+            (`globalBlockIPv4` and `globalBlockIPv6`) in `initBlockAction`.
+  1.120.0 - [FEAT] Added `initProximityAddrs` to populate `proximityRefV4` and
             `proximityRefV6` for `answer_sort: "proximity"`.
-  1.119.0 - [SECURITY/FIX] Validated non-empty `spoofRecord` values (`rec.CNAME != ""`
-            or `len(rec.IPs) > 0`) in `initRRs` before registering exact or regex
-            entries so empty or malformed `rrs:` targets are skipped with a warning
-            rather than blackholing matching domains.
-  1.118.0 - [FEAT] Supported comma-separated domain and regex tokens in `initRRs`
-            via `splitDomainPolicyKeys` for parity with `domain_policy:`.
-  1.117.0 - [FEAT] Added regex domain key support (`/pattern/`) in `initRRs` for
-            global `rrs:` and per-group `groups.<group>.rrs:`, with deterministic
-            ordering and startup compilation validation.
+  1.119.0 - [SECURITY/FIX] Validated non-empty `spoofRecord` values in `initRRs`.
+  1.118.0 - [FEAT] Supported comma-separated domain and regex tokens in `initRRs`.
+  1.117.0 - [FEAT] Added regex domain key support (`/pattern/`) in `initRRs`.
   1.116.0 - [FEAT/FIX] Registered `ednsMACRoutes` and `ednsMACWildRoutes` in
             `initRouteIndex`.
-  1.115.0 - [FEAT/FIX] Registered `ecsIPRoutes` and `ecsCIDRRoutes` in `initRouteIndex`.
-  1.114.0 - [SECURITY/FIX] Eradicated a critical Cache Persistence Corruption vulnerability natively.
-  1.113.0 - [SECURITY/FIX] initRouteIndex() didn't register upstream group
-            names referenced ONLY via a `port:` route (portRoutes) or a
-            `force-and` compound route (compoundRouteMappings).
-  1.112.0 - [DEAD-CODE/CLEANUP] Removed the orphaned readConfigListURL fetcher.
+  1.115.0 - [FEAT/FIX] Registered `ecsIPRoutes` and `ecsCIDRRoutes` in
+            `initRouteIndex`.
+  1.114.0 - [SECURITY/FIX] Fixed Cache Persistence route index consistency.
+  1.113.0 - [SECURITY/FIX] Registered `portRoutes` and `compoundRouteMappings`
+            in `initRouteIndex`.
 */
 
 package main
@@ -52,7 +46,6 @@ import (
 
 const maxRemoteListBytes = 10 * 1024 * 1024
 
-// readConfigListFile reads a file line by line, stripping whitespace and inline comments.
 func readConfigListFile(filePath string) ([]string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -77,7 +70,6 @@ func readConfigListFile(filePath string) ([]string, error) {
 	return lines, scanner.Err()
 }
 
-// initBlockAction parses the global 'BLOCK' definition.
 func initBlockAction() {
 	globalBlockIPv4 = nil
 	globalBlockIPv6 = nil
@@ -121,7 +113,6 @@ func initBlockAction() {
 	}
 }
 
-// initDGA parses the ML classification definitions for Domain Generation Algorithms.
 func initDGA() {
 	if cfg.Server.DGA.Enabled {
 		hasDGA = true
@@ -137,7 +128,6 @@ func initDGA() {
 	}
 }
 
-// initRouteIndex constructs the numerical lookup map required by the cache architecture.
 func initRouteIndex() {
 	routeIdxByName = make(map[string]uint16, len(cfg.Upstreams)+4)
 	routeIdxByName["local"] = routeIdxLocal
@@ -217,7 +207,6 @@ func initRouteIndex() {
 	routeIdxDefault = routeIdxByName["default"]
 }
 
-// initRRs parses global and per-group spoofed records (including regex domain keys).
 func initRRs() {
 	globalRRs = make(map[string]spoofRecord)
 	globalRRRegexes = nil
@@ -307,8 +296,31 @@ func initRRs() {
 	hasRRs = len(globalRRs) > 0 || len(globalRRRegexes) > 0 || hasGroupRRs
 }
 
-// initDDR maps RFC 9462 Discovery of Designated Resolvers endpoints.
+func pickDDRPort(addrs []string, defaultPort uint16) uint16 {
+	active := filterListeners(addrs)
+	if len(active) == 0 {
+		return 0
+	}
+	var fallback uint16
+	for _, addr := range active {
+		p := extractPort(addr, defaultPort)
+		if fallback == 0 {
+			fallback = p
+		}
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return p
+		}
+		if a, pErr := netip.ParseAddr(host); pErr == nil && a.Unmap().IsLoopback() {
+			continue
+		}
+		return p
+	}
+	return fallback
+}
+
 func initDDR() {
+	ddrECHConfig = nil
 	if cfg.Server.ECHConfigList != "" {
 		if b, err := os.ReadFile(cfg.Server.ECHConfigList); err == nil {
 			ddrECHConfig = b
@@ -316,6 +328,10 @@ func initDDR() {
 	}
 	if cfg.Server.DDR.Enabled {
 		ddrHostnames = make(map[string]bool)
+		ddrHostnamesList = nil
+		ddrIPv4 = nil
+		ddrIPv6 = nil
+
 		source := cfg.Server.DDR.HostnameSource
 		if source == "" {
 			source = "strict"
@@ -328,7 +344,7 @@ func initDDR() {
 			raw = append(raw, tlsAuthorizedNames...)
 		}
 		for _, h := range raw {
-			clean := strings.ToLower(strings.TrimSuffix(h, "."))
+			clean := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(h), "."))
 			if clean != "" && !strings.Contains(clean, "*") && net.ParseIP(clean) == nil {
 				if !ddrHostnames[clean] {
 					ddrHostnames[clean] = true
@@ -336,32 +352,32 @@ func initDDR() {
 				}
 			}
 		}
-		for _, s := range cfg.Server.DDR.IPv4 {
-			if ip := net.ParseIP(s); ip != nil {
-				ddrIPv4 = append(ddrIPv4, ip)
+		if ipVersionSupport != "ipv6" {
+			for _, s := range cfg.Server.DDR.IPv4 {
+				if addr, err := netip.ParseAddr(strings.TrimSpace(s)); err == nil && addr.Unmap().Is4() {
+					b4 := addr.Unmap().As4()
+					ip4 := make(net.IP, net.IPv4len)
+					copy(ip4, b4[:])
+					ddrIPv4 = append(ddrIPv4, ip4)
+				}
 			}
 		}
-		for _, s := range cfg.Server.DDR.IPv6 {
-			if ip := net.ParseIP(s); ip != nil {
-				ddrIPv6 = append(ddrIPv6, ip)
+		if ipVersionSupport != "ipv4" {
+			for _, s := range cfg.Server.DDR.IPv6 {
+				if addr, err := netip.ParseAddr(strings.TrimSpace(s)); err == nil && addr.Is6() && !addr.Is4In6() {
+					b16 := addr.As16()
+					ip6 := make(net.IP, net.IPv6len)
+					copy(ip6, b16[:])
+					ddrIPv6 = append(ddrIPv6, ip6)
+				}
 			}
 		}
-		ddrDoHPort, ddrDoTPort, ddrDoQPort = 0, 0, 0
-		for _, addr := range cfg.Server.ListenDoH {
-			ddrDoHPort = extractPort(addr, 443)
-		}
-		for _, addr := range cfg.Server.ListenDoT {
-			ddrDoTPort = extractPort(addr, 853)
-		}
-		for _, addr := range cfg.Server.ListenDoQ {
-			ddrDoQPort = extractPort(addr, 853)
-		}
+		ddrDoHPort = pickDDRPort(cfg.Server.ListenDoH, 443)
+		ddrDoTPort = pickDDRPort(cfg.Server.ListenDoT, 853)
+		ddrDoQPort = pickDDRPort(cfg.Server.ListenDoQ, 853)
 	}
 }
 
-// initProximityAddrs harvests all local listener IP addresses, local interface
-// addresses (when listening on 0.0.0.0 / ::), and local source IP addresses
-// used for outbound upstream queries to populate proximityRefV4 and proximityRefV6.
 func initProximityAddrs() {
 	seen := make(map[netip.Addr]struct{})
 	var v4s []uint32
@@ -430,7 +446,7 @@ func initProximityAddrs() {
 		cfg.Server.ListenDoH,
 		cfg.Server.ListenDoQ,
 	} {
-		for _, raw := range list {
+		for _, raw := range filterListeners(list) {
 			if addAddrStr(raw) {
 				hasWildcardListener = true
 			}
@@ -491,8 +507,6 @@ func initProximityAddrs() {
 		}
 	}
 
-	// Probe OS routing table via zero-packet UDP socket binds to discover exact
-	// local source IP addresses used for associated outgoing upstream queries.
 	for target := range probeTargets {
 		conn, err := net.Dial("udp", target)
 		if err != nil {

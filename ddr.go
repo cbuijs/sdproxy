@@ -1,43 +1,29 @@
 /*
 File:    ddr.go
-Version: 1.13.0
-Last Updated: 18-Nov-2026 16:50 CET
+Version: 1.14.0
+Last Updated: 24-Nov-2026 12:30 CET
 
 Description:
   Discovery of Designated Resolvers (DDR) — RFC 9462 / RFC 9461.
-  Intercepts two query shapes and returns synthetic responses without
-  forwarding to any upstream:
-
-    1a. _dns.resolver.arpa SVCB — DDR service discovery (RFC 9462).
-        Advertises DoH, DoT, and DoQ endpoints via SVCB records with
-        IP hints and port parameters. Automatically advertises ECHConfigList
-        if configured securely at startup.
-
-    1b. Resolver hostname A / AAAA / HTTPS — RFC 9461.
-        Answers address queries for our own resolver hostnames (the ones
-        listed under server.ddr.hostnames: or authorized TLS SANs) so clients
-        can verify and upgrade to encrypted transport.
+  Intercepts `_dns.resolver.arpa` SVCB and resolver-hostname A/AAAA/HTTPS
+  queries locally without upstream forwarding.
 
 Changes:
-  1.13.0 - [FIX] Applied `applyRcodeOnlyWireTTL` (`cache_rw.go` 1.42.0) to all
-           DDR responses (both positive answers and `NODATA`) so `min_ttl` and
-           `max_ttl` bounds are applied consistently.
-  1.12.0 - [FEAT] Applied `applyRcodeOnlyWireTTL` (`cache_rw.go` 1.36.0) on
-           DDR `NODATA` responses so negative SOA wire TTLs honor `rcode_ttl`,
-           `rcode_min_ttl`, and `rcode_max_ttl`.
+  1.14.0 - [SECURITY/FIX] Enforced `ipVersionSupport` (`ipv4` / `ipv6`) in
+           `ddrAddrs` and `handleDDR` so disabled address families are never
+           synthesized or leaked via SVCB `ipv4hint`/`ipv6hint` or `A`/`AAAA` answers.
+  1.13.0 - [FIX] Applied `applyRcodeOnlyWireTTL` to all DDR responses so
+           `min_ttl` and `max_ttl` bounds apply consistently.
+  1.12.0 - [FEAT] Applied `applyRcodeOnlyWireTTL` on DDR `NODATA` responses.
   1.11.0 - [SECURITY/FIX] Replaced `PreserveEDNS0` with `enforceUDPDefenses` and
-           added `IncrReturnCode` telemetry across all DDR responses so UDP
-           fragmentation bounds (1232B) and EDNS0 option sanitization are
-           strictly enforced on DDR answers.
+           added `IncrReturnCode` telemetry across all DDR responses.
   1.10.0 - [FEAT] Added `clientIP` and `protoEndpoint` to `handleDDR` and emitted
            concise query/answer logs via `logQuerySimple` when `logSimple` is enabled.
   1.9.0  - [SECURITY/FIX] Added RFC 2308 negative SOA record on DDR NODATA responses
-           and prevented emitting a broken `HTTPS` SVCB record with `Port: 0` when
-           no DoH listener is configured.
-  1.8.0  - [TIER 2] Collapsed the three near-identical DoH/DoT/DoQ SVCB builders
-           into one table-driven loop over ddrServices().
-  1.7.0  - [REFACTOR] Applied PreserveEDNS0 and RcodeStr to deduplicate telemetry.
-  1.6.0  - [LOGGING] Bound DDR intercepts to logDDR rather than logQueries.
+           and prevented emitting `HTTPS` SVCB with `Port: 0` when DoH is disabled.
+  1.8.0  - [TIER 2] Collapsed DoH/DoT/DoQ SVCB builders into `ddrServices()`.
+  1.7.0  - [REFACTOR] Applied `PreserveEDNS0` and `RcodeStr`.
+  1.6.0  - [LOGGING] Bound DDR intercepts to `logDDR`.
 */
 
 package main
@@ -50,14 +36,12 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ddrService describes one advertised encrypted endpoint.
 type ddrService struct {
 	alpn    []string
 	port    uint16
-	dohPath string // empty for DoT/DoQ
+	dohPath string
 }
 
-// ddrServices returns the enabled endpoints in advertisement order.
 func ddrServices() []ddrService {
 	var out []ddrService
 	if ddrDoHPort > 0 {
@@ -76,14 +60,11 @@ func ddrServices() []ddrService {
 	return out
 }
 
-// handleDDR intercepts _dns.resolver.arpa SVCB and resolver-hostname queries
-// when DDR is enabled. Returns true when the query was fully handled.
 func handleDDR(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTrimmed, clientIP, clientID, protocol, protoEndpoint string) bool {
 	if !cfg.Server.DDR.Enabled {
 		return false
 	}
 
-	// 1a. _dns.resolver.arpa SVCB — service discovery per RFC 9462.
 	if qNameTrimmed == "_dns.resolver.arpa" && q.Qtype == dns.TypeSVCB {
 		ipv4s, ipv6s := ddrAddrs(w)
 
@@ -129,14 +110,17 @@ func handleDDR(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTrimmed, c
 		msgPool.Put(resp)
 
 		if logQueries && logSimple {
-			logQuerySimple(protoEndpoint, clientIP, q.Name, "SVCB", "NOERROR", "DDR", false)
+			rcStr := "NOERROR"
+			if len(services) == 0 {
+				rcStr = "NOERROR (NODATA)"
+			}
+			logQuerySimple(protoEndpoint, clientIP, q.Name, "SVCB", rcStr, "DDR", false)
 		} else if logDDR {
 			log.Printf("[DDR] [%s] %s -> _dns.resolver.arpa SVCB | DDR DISCOVERY | NOERROR", protocol, clientID)
 		}
 		return true
 	}
 
-	// 1b. Resolver hostname A / AAAA / HTTPS — RFC 9461.
 	if !ddrHostnames[qNameTrimmed] {
 		return false
 	}
@@ -151,22 +135,30 @@ func handleDDR(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTrimmed, c
 	switch q.Qtype {
 	case dns.TypeA:
 		label = "DDR A"
-		resp.Answer = make([]dns.RR, 0, len(ipv4s))
-		for _, ip := range ipv4s {
-			resp.Answer = append(resp.Answer, &dns.A{
-				Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: syntheticTTL},
-				A:   ip.To4(),
-			})
+		if ipVersionSupport != "ipv6" && len(ipv4s) > 0 {
+			resp.Answer = make([]dns.RR, 0, len(ipv4s))
+			for _, ip := range ipv4s {
+				if v4 := ip.To4(); v4 != nil {
+					resp.Answer = append(resp.Answer, &dns.A{
+						Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: syntheticTTL},
+						A:   v4,
+					})
+				}
+			}
 		}
 
 	case dns.TypeAAAA:
 		label = "DDR AAAA"
-		resp.Answer = make([]dns.RR, 0, len(ipv6s))
-		for _, ip := range ipv6s {
-			resp.Answer = append(resp.Answer, &dns.AAAA{
-				Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: syntheticTTL},
-				AAAA: ip.To16(),
-			})
+		if ipVersionSupport != "ipv4" && len(ipv6s) > 0 {
+			resp.Answer = make([]dns.RR, 0, len(ipv6s))
+			for _, ip := range ipv6s {
+				if ip.To4() == nil {
+					resp.Answer = append(resp.Answer, &dns.AAAA{
+						Hdr:  dns.RR_Header{Name: q.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: syntheticTTL},
+						AAAA: ip.To16(),
+					})
+				}
+			}
 		}
 
 	case dns.TypeHTTPS:
@@ -218,10 +210,6 @@ func handleDDR(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTrimmed, c
 	return true
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 func appendIPHints(svcb *dns.SVCB, ipv4s, ipv6s []net.IP) {
 	if len(ipv4s) > 0 {
 		svcb.Value = append(svcb.Value, &dns.SVCBIPv4Hint{Hint: ipv4s})
@@ -259,21 +247,25 @@ func localAddrIP(w dns.ResponseWriter) net.IP {
 }
 
 func ddrAddrs(w dns.ResponseWriter) (ipv4s, ipv6s []net.IP) {
-	ipv4s = ddrIPv4
-	ipv6s = ddrIPv6
-	if len(ipv4s) > 0 && len(ipv6s) > 0 {
+	if ipVersionSupport != "ipv6" {
+		ipv4s = ddrIPv4
+	}
+	if ipVersionSupport != "ipv4" {
+		ipv6s = ddrIPv6
+	}
+	if (ipVersionSupport == "ipv6" || len(ipv4s) > 0) && (ipVersionSupport == "ipv4" || len(ipv6s) > 0) {
 		return
 	}
 	local := localAddrIP(w)
 	if local == nil {
 		return
 	}
-	if len(ipv4s) == 0 {
+	if ipVersionSupport != "ipv6" && len(ipv4s) == 0 {
 		if v4 := local.To4(); v4 != nil {
 			ipv4s = []net.IP{v4}
 		}
 	}
-	if len(ipv6s) == 0 {
+	if ipVersionSupport != "ipv4" && len(ipv6s) == 0 {
 		if local.To4() == nil {
 			ipv6s = []net.IP{local}
 		}

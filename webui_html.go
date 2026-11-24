@@ -1,30 +1,29 @@
 /*
 File:    webui_html.go
-Version: 1.30.0
-Last Updated: 04-Nov-2026 20:25 CET
+Version: 1.31.0
+Last Updated: 24-Nov-2026 14:40 CET
 
 Description:
   HTTP Request Handlers and authentication logic for the sdproxy web UI.
 
 Changes:
+  1.31.0 - [SECURITY/FIX] Eliminated `GET /login` map-churn and unlocked pointer
+           orphaning in `handleLogin`: `loginStates[ipStr]` is now looked up and
+           allocated strictly inside the `POST` mutex critical section after
+           `r.ParseForm()` completes, and cleared via `delete` upon valid login.
   1.30.0 - [SECURITY/FIX] Zeroed `sessExp` alongside `sessToken` in `handleLogout`,
            and ensured failed login and lockout security logs are emitted when
            `logWebUI` or `logSystem` is active.
   1.29.0 - [CLEANUP] Suppressed routine successful-login log lines when `logSimple`
-           is enabled unless preceded by failed login attempts (`state.attempts > 0`),
-           while keeping all failed login and lockout security warnings active.
-  1.28.0 - [SECURITY/FIX] Validated that `key` exists in `cfg.Groups` in `handleSet`
-           before calling `SetGroupOverride`.
+           is enabled unless preceded by failed login attempts.
+  1.28.0 - [SECURITY/FIX] Validated that `key` exists in `cfg.Groups` in `handleSet`.
   1.27.0 - [FIX] Delegated `Group overrides` HTML rendering in `handleRoot` to
-           `buildGroupsSectionHTML()` so empty group configurations completely
-           omit the Group overrides tables and headers on initial load.
-  1.26.0 - [SECURITY/FIX] Replaced blind random map eviction in `loginStates` with a
-           2-tier sampled eviction policy (`evictLoginStateLocked`).
-  1.25.0 - [SECURITY/FIX] Re-applied `http.MaxBytesReader` (32KB limit) inside
-           `handleLogin` and `handleSet`, and enforced `POST`-only method checks
-           on `/set` and `/logout`.
-  1.24.0 - [SECURITY/FIX] Leveraged the centralized `secretsEqual` primitive for password verification.
-  1.23.0 - [FEAT] Injected the `clientBlockPanel` natively into the `handleRoot` HTML layout.
+           `buildGroupsSectionHTML()`.
+  1.26.0 - [SECURITY/FIX] 2-tier sampled eviction (`evictLoginStateLocked`).
+  1.25.0 - [SECURITY/FIX] Enforced `http.MaxBytesReader` (32KB) and `POST`-only
+           method checks on `/set` and `/logout`.
+  1.24.0 - [SECURITY/FIX] Constant-time password verification via `secretsEqual`.
+  1.23.0 - [FEAT] Injected `clientBlockPanel` into `handleRoot`.
 */
 
 package main
@@ -204,17 +203,6 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	var errHTML string
 
-	loginStatesMu.Lock()
-	state, exists := loginStates[ipStr]
-	if !exists {
-		if len(loginStates) >= 10000 {
-			evictLoginStateLocked(time.Now())
-		}
-		state = &loginState{}
-		loginStates[ipStr] = state
-	}
-	loginStatesMu.Unlock()
-
 	if r.Method == http.MethodPost {
 		r.Body = http.MaxBytesReader(w, r.Body, 32*1024)
 		if err := r.ParseForm(); err != nil {
@@ -223,15 +211,20 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		if secretsEqual(r.FormValue("password"), cfg.WebUI.Password) {
 			loginStatesMu.Lock()
+			var prevAttempts int
+			if st, exists := loginStates[ipStr]; exists {
+				prevAttempts = st.attempts
+				delete(loginStates, ipStr)
+			}
+			loginStatesMu.Unlock()
+
 			if logWebUI || logSystem {
-				if state.attempts > 0 {
-					log.Printf("[WEBUI] Successful login from %s after %d failed attempt(s).", ipStr, state.attempts)
+				if prevAttempts > 0 {
+					log.Printf("[WEBUI] Successful login from %s after %d failed attempt(s).", ipStr, prevAttempts)
 				} else if !logSimple && logWebUI {
 					log.Printf("[WEBUI] Successful login from %s.", ipStr)
 				}
 			}
-			state.attempts = 0
-			loginStatesMu.Unlock()
 
 			tok := newSession()
 			http.SetCookie(w, &http.Cookie{
@@ -248,6 +241,19 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 
 		loginStatesMu.Lock()
+		now := time.Now()
+		state, exists := loginStates[ipStr]
+		if !exists {
+			if len(loginStates) >= 10000 {
+				evictLoginStateLocked(now)
+			}
+			state = &loginState{}
+			loginStates[ipStr] = state
+		} else if !state.lockoutExpires.IsZero() && now.After(state.lockoutExpires) {
+			state.attempts = 0
+			state.lockoutExpires = time.Time{}
+		}
+
 		if cfg.WebUI.LoginRatelimit.Enabled {
 			state.attempts++
 			if state.attempts >= cfg.WebUI.LoginRatelimit.MaxAttempts {
@@ -255,18 +261,17 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 				if mins <= 0 {
 					mins = 15
 				}
-				state.lockoutExpires = time.Now().Add(time.Duration(mins) * time.Minute)
+				state.lockoutExpires = now.Add(time.Duration(mins) * time.Minute)
 				if logWebUI || logSystem {
 					log.Printf("[WEBUI] SECURITY: IP %s locked out for %d minutes due to %d consecutive failed login attempts.", ipStr, mins, state.attempts)
 				}
 				loginStatesMu.Unlock()
 				panic(http.ErrAbortHandler)
-			} else {
-				if logWebUI || logSystem {
-					log.Printf("[WEBUI] WARNING: Failed login attempt from %s (%d/%d before lockout).", ipStr, state.attempts, cfg.WebUI.LoginRatelimit.MaxAttempts)
-				}
-				errHTML = `<p class="err">Wrong password.</p>`
 			}
+			if logWebUI || logSystem {
+				log.Printf("[WEBUI] WARNING: Failed login attempt from %s (%d/%d before lockout).", ipStr, state.attempts, cfg.WebUI.LoginRatelimit.MaxAttempts)
+			}
+			errHTML = `<p class="err">Wrong password.</p>`
 		} else {
 			if logWebUI || logSystem {
 				log.Printf("[WEBUI] WARNING: Failed login attempt from %s (Rate limiting disabled).", ipStr)

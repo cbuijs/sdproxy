@@ -1,35 +1,30 @@
 /*
 File:    parental.go
-Version: 3.54.0 (Split)
-Last Updated: 17-Nov-2026 15:45 CET
+Version: 3.55.0 (Split)
+Last Updated: 24-Nov-2026 12:56 CET
 
 Description:
   Parental control hot-path runtime for sdproxy.
 
 Changes:
+  3.55.0 - [SECURITY/HYGIENE] Protected group-wide states (`budget_tracking: group`,
+           where `sk` contains no `/`) from dynamic device-state cap eviction in
+           `CheckParental`, and invoked `pruneOldSnapshots()` in `InitParental` so
+           stale daily snapshot files are reclaimed on boot.
   3.54.0 - [FIX] Normalized fallback `path` `deviceID` in `ResolveStateKeyAndGroup`
-           and `CheckParental` using `cleanPath` so `/dns-query/` and `/dns-query`
-           never create duplicate device budget states.
-  3.53.0 - [FIX] Removed premature `if !wg.force { break }` / `if !cr.force { break }`
-           exits inside `macWildToGroup`, `ednsMACWildToGroup`, `cidrToGroup`, and
-           `ecsCIDRToGroup` loops in `ResolveStateKeyAndGroup` so a more-general
-           subnet or later glob rule with `force: true` is not skipped after an
-           unforced match.
-  3.52.0 - [FIX] Enabled configuration warnings, invalid budget/route warnings,
-           and startup initialization summary in `newGroupState` and `InitParental`
-           when `logSystem` or `logParental` is active so Simple Logging Mode
-           (`logSimple: true`) retains all startup messages and warnings.
-  3.51.0 - [FIX] Preserved the exact matched identifier (`matchedDeviceID`) in
-           `ResolveStateKeyAndGroup` across all route types and added a `force`
-           priority tier matching `resolveClientRoute`.
-  3.50.0 - [FIX] Preserved the matched route origin (`matchedEDNSMAC`, `matchedECS`)
-           when constructing `deviceID` in `ResolveStateKeyAndGroup` and `CheckParental`.
-  3.49.0 - [FEAT] Added `ednsMACToStateKey` and `ednsMACWildToGroup` in `InitParental`,
-           `ResolveStateKeyAndGroup`, and `CheckParental`.
+           and `CheckParental` using `cleanPath`.
+  3.53.0 - [FIX] Removed premature loop breaks inside `macWildToGroup`,
+           `ednsMACWildToGroup`, `cidrToGroup`, and `ecsCIDRToGroup` in
+           `ResolveStateKeyAndGroup` so later `force: true` rules are honored.
+  3.52.0 - [FIX] Enabled configuration and startup warnings when `logSystem` or
+           `logParental` is active.
+  3.51.0 - [FIX] Preserved `matchedDeviceID` in `ResolveStateKeyAndGroup` and
+           added a `force` priority tier matching `resolveClientRoute`.
+  3.50.0 - [FIX] Preserved matched route origin when constructing `deviceID`.
+  3.49.0 - [FEAT] Added `ednsMACToStateKey` and `ednsMACWildToGroup`.
   3.48.0 - [FIX] Skipped `rkInvalid` route keys in `InitParental`.
   3.47.0 - [FIX] Passed `ecsAddr` into `CheckParental`.
   3.46.0 - [FEAT] Added `ecsIPToStateKey` and `ecsCIDRToGroup`.
-  3.45.0 - [FIX] Passed `portStr` to `CheckParental`.
 */
 
 package main
@@ -512,6 +507,7 @@ func InitParental() {
 
 	hasParental = true
 
+	pruneOldSnapshots()
 	loadCatCache()
 
 	go loadAllCategoryLists(forceRefreshStartup)
@@ -912,6 +908,9 @@ func CheckParental(sk, groupName, clientMAC, ednsMAC, clientIP string, clientAdd
 					var found bool
 
 					for evictKey, evictState := range groupStates {
+						if strings.IndexByte(evictKey, '/') < 0 {
+							continue
+						}
 						if evictState.mu.TryLock() {
 							ls := evictState.lastSeen["total"]
 							evictState.mu.Unlock()

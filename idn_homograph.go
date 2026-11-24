@@ -1,67 +1,35 @@
 /*
 File:    idn_homograph.go
-Version: 1.9.0
-Last Updated: 17-Nov-2026 15:10 CET
+Version: 1.10.0
+Last Updated: 24-Nov-2026 12:46 CET
 
 Description:
   IDN Homograph, Punycode/ACE, Mixed-Script, and Confusable Skeleton detection
   engine for sdproxy.
 
-  Defends against:
-    1. Full IDN / ACE (`xn--`) and raw non-ASCII domain blocking (`block_all_idn`).
-    2. Malformed Punycode / ACE labels (`xn--` that fail RFC 5891 / IDNA decoding).
-    3. Unicode TR39 Mixed-Script labels (e.g. mixing Latin + Cyrillic or Greek
-       within a single label, or combining non-ASCII marks).
-    4. Whole-Script & Confusable Skeleton Homograph impersonation of built-in
-       high-value brands (`vendorMap`, `dgaSafeDomains`, financial/crypto/cloud
-       targets) and user-configured `protect` domains.
-    5. Pure-ASCII visual lookalike impersonation (`ascii_lookalikes`: `paypa1`,
-       `g00gle`, `rnicrosoft`, `vvhatsapp`, `clropbox`, `pay-pa1`) against
-       protected brands.
-
 Changes:
-  1.9.0 - [SECURITY/FIX] Removed the blanket `if isCanonicalApex { continue }`
-          exemption on non-SLD subdomain labels in Step 2 of `AnalyzeIDNHomograph`.
-          Because `dgaSafeDomains` (including shared cloud/CDN domains such as
-          `cloudfront.net` and `amazonaws.com`) is registered in `idnProtectedDomains`,
-          blanket-skipping Step 2 whenever `isCanonicalApex` was true previously
-          allowed lookalike subdomain labels impersonating unrelated brands
-          (e.g. `paypa1.d123.cloudfront.net` or `g00gle.s3.amazonaws.com`) to
-          bypass `ascii_lookalikes` detection.
-  1.8.1 - [FIX] Fixed double-quoted `"ģ"` typo back to rune literal `'ģ'` in
-          `confusableRuneMap`, and ensured exact canonical brand subdomain labels
-          (where `brand.isAllowedSLD(label)` is true) are not falsely flagged as
-          lookalike impersonations on non-SLD labels while non-ASCII IDN
-          homographs and misspelled/hyphenated lookalikes on subdomain labels
-          continue to be blocked.
-  1.8.0 - [SECURITY/FIX] Removed the `idnProtectedSLDs[label] == ""` condition on
-          non-SLD subdomain labels in Step 2 of `AnalyzeIDNHomograph` so a
-          brand's hyphenated SLD variant (e.g. `apple-dns` from `apple-dns.net`)
-          cannot be used as a subdomain label under an attacker apex to evade
-          impersonation checks against the primary brand (`apple.com`).
-  1.7.0 - [SECURITY/FIX] Tracked all canonical and unhyphenated SLD variants in
-          `protectedBrand.allowedSLDs` (`registerProtectedDomain`) so multiple
-          protected brands that collapse to the same confusable skeleton
-          never overwrite each other's canonical SLD whitelist, and guarded
-          Step 2 non-SLD subdomain lookalike checks when `idnProtectedDomains[qname]`
-          is true.
-  1.6.0 - [SECURITY/FIX] Removed the unhyphenated-SLD insertion from
-          `idnProtectedSLDs` in `registerProtectedDomain` (introduced in 1.5.0).
-  1.5.0 - [SECURITY/FIX] Indexed both hyphenated and unhyphenated brand SLD forms
-          in `idnProtectedSLDs` (`registerProtectedDomain`) and skipped pure-ASCII
-          subdomain lookalike checks when the queried domain is already under a
-          protected canonical brand apex (`isCanonicalApex`).
-  1.4.0 - [SECURITY/FIX] Separated exact full-domain whitelisting (`idnProtectedDomains`)
-          from canonical brand SLD tracking (`idnProtectedSLDs`).
-  1.3.0 - [SECURITY/FIX] Validated non-SLD subdomain labels for pure-ASCII
-          confusable lookalike impersonation (`idnASCIILookalikes`) and rejected
-          whole-script non-Latin IDN labels that confusably impersonate a
-          protected brand even when the brand's exact TLD matches.
-        - [FIX] Added `cacheHit` parameter to `applyIDNHomographVerdict`.
-  1.2.0 - [SECURITY/FIX] Stripped hyphens (`-`) inside `computeConfusableSkeleton`
-          and added `enforceIDNHomographCheck` on `queryCtx`.
-  1.1.0 - [FEAT] Added `InitIDNHomograph()` startup initializer and wired
-          `cfg.Server.IDNHomograph` configuration options.
+  1.10.0 - [SECURITY/FIX] Closed a forged-ASCII Punycode bypass (`xn--paypal-`)
+           via `decodeStrictPunycode`: every `xn--` label must decode cleanly,
+           contain at least one non-ASCII Unicode code point, and round-trip
+           canonically through `idna.ToASCII` (RFC 5890 / RFC 5891).
+         - [SECURITY/FIX] Validated Punycode syntax and mixed-script rules across
+           all labels of `qname` (including IDN eTLD labels), while scoping
+           confusable brand-skeleton matching to non-eTLD labels.
+         - [CLEANUP] Removed unreachable ASCII `'z': "z"` entry from
+           `confusableRuneMap`.
+  1.9.0  - [SECURITY/FIX] Removed blanket `isCanonicalApex` exemption on non-SLD
+           subdomain labels in Step 2 of `AnalyzeIDNHomograph`.
+  1.8.1  - [FIX] Restored rune literal `'ģ'` in `confusableRuneMap` and exempted
+           exact canonical brand subdomain labels.
+  1.8.0  - [SECURITY/FIX] Tightened non-SLD subdomain label checks in Step 2.
+  1.7.0  - [SECURITY/FIX] Tracked all canonical and unhyphenated SLD variants in
+           `protectedBrand.allowedSLDs`.
+  1.6.0  - [SECURITY/FIX] Removed unhyphenated-SLD insertion from `idnProtectedSLDs`.
+  1.5.0  - [SECURITY/FIX] Indexed hyphenated and unhyphenated brand SLD forms.
+  1.4.0  - [SECURITY/FIX] Separated `idnProtectedDomains` from `idnProtectedSLDs`.
+  1.3.0  - [SECURITY/FIX] Validated non-SLD subdomain labels for pure-ASCII
+           confusable lookalike impersonation.
+  1.2.0  - [SECURITY/FIX] Stripped hyphens inside `computeConfusableSkeleton`.
 */
 
 package main
@@ -75,7 +43,6 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// scriptMask represents Unicode script categories in a bitmask per label.
 type scriptMask uint16
 
 const (
@@ -95,11 +62,8 @@ const (
 	scriptGeorgian   scriptMask = 1 << 12
 	scriptOther      scriptMask = 1 << 15
 
-	// scriptJapaneseMask permits standard Japanese script combinations (Han + Hiragana + Katakana)
-	// within a single IDN label per UTS #39 Highly Restrictive profile.
 	scriptJapaneseMask = scriptHan | scriptHiragana | scriptKatakana
-	// scriptKoreanMask permits standard Korean script combinations (Han + Hangul).
-	scriptKoreanMask = scriptHan | scriptHangul
+	scriptKoreanMask   = scriptHan | scriptHangul
 )
 
 type protectedBrand struct {
@@ -128,20 +92,12 @@ var (
 	idnMixedScript     bool
 	idnASCIILookalikes bool
 
-	// idnProtectedSkeletons maps a confusable skeleton string -> canonical brand info.
 	idnProtectedSkeletons map[string]protectedBrand
-	// idnProtectedDomains holds exact canonical full domains (e.g. "paypal.com") so
-	// queries for the genuine brand apex or its subdomains return in O(1).
-	idnProtectedDomains map[string]bool
-	// idnProtectedSLDs maps a canonical brand SLD (e.g. "paypal") -> its primary
-	// canonical domain ("paypal.com").
-	idnProtectedSLDs map[string]string
-	// idnExemptDomains holds user-configured exempted domains/suffixes.
-	idnExemptDomains map[string]bool
+	idnProtectedDomains   map[string]bool
+	idnProtectedSLDs      map[string]string
+	idnExemptDomains      map[string]bool
 )
 
-// defaultProtectedDomains supplements vendorMap and dgaSafeDomains with high-value
-// phishing targets (banking, payments, crypto, email, password managers, cloud/auth).
 var defaultProtectedDomains = []string{
 	// Payments & Banking
 	"abnamro.nl",
@@ -277,11 +233,7 @@ var defaultProtectedDomains = []string{
 	"usps.com",
 }
 
-// confusableRuneMap maps Unicode confusable code points (Cyrillic, Greek,
-// Latin-Extended/diacritics, Fullwidth, IPA, and symbols) to their ASCII
-// visual equivalents per Unicode UTS #39 confusables.
 var confusableRuneMap = map[rune]string{
-	// Cyrillic lowercase & uppercase visual lookalikes
 	'а': "a", 'А': "a",
 	'ă': "a", 'Ă': "a",
 	'ä': "a", 'Ä': "a",
@@ -459,7 +411,6 @@ var confusableRuneMap = map[rune]string{
 	'ŷ': "y", 'Ŷ': "y",
 	'γ': "y",
 
-	'z': "z",
 	'ź': "z", 'Ź': "z",
 	'ż': "z", 'Ż': "z",
 	'ž': "z", 'Ž': "z",
@@ -473,8 +424,36 @@ func init() {
 	idnExemptDomains = make(map[string]bool)
 }
 
-// InitIDNHomograph initializes the IDN Homograph, Punycode/ACE, Mixed-Script,
-// and Confusable Skeleton protection subsystem from `cfg.Server.IDNHomograph`.
+// decodeStrictPunycode decodes an ACE `xn--` label and enforces RFC 5890 / 5891
+// canonical A-label invariants: non-empty Unicode output, at least one non-ASCII
+// code point (blocking forged pure-ASCII Bootstring labels like `xn--paypal-`),
+// and exact lowercase Punycode round-tripping.
+func decodeStrictPunycode(label string) (string, bool) {
+	if len(label) <= 4 || !strings.HasPrefix(label, "xn--") {
+		return "", false
+	}
+	uLabel, err := idna.ToUnicode(label)
+	if err != nil || uLabel == "" || uLabel == label {
+		return "", false
+	}
+	hasNonASCII := false
+	for _, r := range uLabel {
+		if r > 0x7F {
+			hasNonASCII = true
+			break
+		}
+	}
+	if !hasNonASCII {
+		return "", false
+	}
+	decoded := strings.ToLower(uLabel)
+	reEnc, err := idna.ToASCII(decoded)
+	if err != nil || !strings.EqualFold(reEnc, label) {
+		return "", false
+	}
+	return decoded, true
+}
+
 func InitIDNHomograph() {
 	act := strings.ToUpper(strings.TrimSpace(cfg.Server.IDNHomograph.Action))
 	switch act {
@@ -527,13 +506,12 @@ func InitIDNHomograph() {
 	}
 }
 
-// runeScript classifies a Unicode code point into its script bitmask.
 func runeScript(r rune) scriptMask {
 	if r <= 0x7F {
 		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
 			return scriptLatin
 		}
-		return scriptNone // digits, hyphen, underscore, dot are Common/Inherited
+		return scriptNone
 	}
 	switch {
 	case unicode.Is(unicode.Latin, r):
@@ -572,8 +550,6 @@ func runeScript(r rune) scriptMask {
 	}
 }
 
-// isMixedScriptMask reports whether a label's script bitmask violates UTS #39
-// Highly Restrictive mixed-script rules.
 func isMixedScriptMask(m scriptMask) bool {
 	if m == scriptNone {
 		return false
@@ -593,8 +569,6 @@ func isMixedScriptMask(m scriptMask) bool {
 	return true
 }
 
-// computeConfusableSkeleton normalizes a label (either decoded Unicode or ASCII)
-// into its canonical confusable skeleton for homograph comparison.
 func computeConfusableSkeleton(label string) string {
 	if label == "" {
 		return ""
@@ -644,8 +618,6 @@ func computeConfusableSkeleton(label string) string {
 	return s
 }
 
-// registerProtectedDomain adds a domain (e.g. "paypal.com") to the protected
-// brand tables so its SLD ("paypal") is indexed by its confusable skeleton.
 func registerProtectedDomain(raw string, skeletons map[string]protectedBrand, domains map[string]bool, slds map[string]string) {
 	for _, part := range strings.Split(raw, ",") {
 		clean := lowerTrimDot(strings.TrimSpace(part))
@@ -667,8 +639,8 @@ func registerProtectedDomain(raw string, skeletons map[string]protectedBrand, do
 		}
 
 		if strings.HasPrefix(sld, "xn--") {
-			if dec, err := idna.ToUnicode(sld); err == nil && dec != "" {
-				sld = strings.ToLower(dec)
+			if dec, ok := decodeStrictPunycode(sld); ok {
+				sld = dec
 			}
 		}
 
@@ -719,8 +691,6 @@ func registerProtectedDomain(raw string, skeletons map[string]protectedBrand, do
 	}
 }
 
-// buildProtectedBrandTables compiles the built-in protected domain lists
-// (vendorMap, dgaSafeDomains, defaultProtectedDomains) plus custom userDomains.
 func buildProtectedBrandTables(userDomains []string, exemptList []string) {
 	skeletons := make(map[string]protectedBrand, 512)
 	domains := make(map[string]bool, 512)
@@ -756,7 +726,6 @@ func buildProtectedBrandTables(userDomains []string, exemptList []string) {
 	idnExemptDomains = exempt
 }
 
-// isIDNExempt performs a zero-allocation label-by-label suffix walk against idnExemptDomains.
 func isIDNExempt(qname string) bool {
 	if len(idnExemptDomains) == 0 || qname == "" {
 		return false
@@ -775,9 +744,6 @@ func isIDNExempt(qname string) bool {
 	return false
 }
 
-// hasIDNOrNonASCII performs a fast O(N) byte scan to detect whether qname
-// contains any `xn--` Punycode label prefix or any non-ASCII byte (>= 0x80).
-// Zero allocations.
 func hasIDNOrNonASCII(qname string) (hasPunycode bool, hasNonASCII bool) {
 	n := len(qname)
 	labelStart := true
@@ -803,9 +769,6 @@ func hasIDNOrNonASCII(qname string) (hasPunycode bool, hasNonASCII bool) {
 	return
 }
 
-// AnalyzeIDNHomograph inspects a normalized domain name (lowercased, no trailing dot)
-// for IDN/Punycode blocks, malformed ACE labels, mixed-script attacks, and
-// confusable homograph impersonation of protected brands.
 func AnalyzeIDNHomograph(qname string) (bool, string) {
 	if !hasIDNHomograph || qname == "" {
 		return false, ""
@@ -844,26 +807,35 @@ func AnalyzeIDNHomograph(qname string) (bool, string) {
 		}
 	}
 
-	// 2. Inspect each non-eTLD label for Punycode validity, Mixed-Script, and Confusables
-	scanPart := qname
+	// 2. Inspect all labels for Punycode validity and Mixed-Script, and non-eTLD labels for Confusables
+	scanEnd := len(qname)
 	if eTLD != "" && len(qname) > len(eTLD)+1 && strings.HasSuffix(qname, "."+eTLD) {
-		scanPart = qname[:len(qname)-len(eTLD)-1]
+		scanEnd = len(qname) - len(eTLD) - 1
+	} else if apex == eTLD {
+		scanEnd = 0
 	}
 
-	rem := scanPart
-	for rem != "" {
-		label := rem
-		if dot := strings.IndexByte(rem, '.'); dot >= 0 {
-			label = rem[:dot]
-			rem = rem[dot+1:]
+	pos := 0
+	for pos < len(qname) {
+		var label string
+		dot := strings.IndexByte(qname[pos:], '.')
+		var nextPos int
+		if dot >= 0 {
+			label = qname[pos : pos+dot]
+			nextPos = pos + dot + 1
 		} else {
-			rem = ""
+			label = qname[pos:]
+			nextPos = len(qname)
 		}
+
+		inETLD := pos >= scanEnd
+		isSLD := !inETLD && (pos+len(label) == scanEnd)
+		pos = nextPos
+
 		if label == "" {
 			continue
 		}
 
-		isSLD := rem == ""
 		isLabelACE := len(label) >= 4 && strings.HasPrefix(label, "xn--")
 		hasLabelNonASCII := false
 		for i := 0; i < len(label); i++ {
@@ -879,11 +851,11 @@ func AnalyzeIDNHomograph(qname string) (bool, string) {
 				if len(label) == 4 {
 					return true, "IDN Malformed Empty Punycode (" + label + ")"
 				}
-				uLabel, err := idna.ToUnicode(label)
-				if err != nil || uLabel == "" || uLabel == label {
+				uLabel, ok := decodeStrictPunycode(label)
+				if !ok {
 					return true, "IDN Malformed Punycode (" + label + ")"
 				}
-				decoded = strings.ToLower(uLabel)
+				decoded = uLabel
 			}
 
 			var mask scriptMask
@@ -895,13 +867,15 @@ func AnalyzeIDNHomograph(qname string) (bool, string) {
 				return true, "IDN Mixed-Script Attack (" + label + " -> " + decoded + ")"
 			}
 
-			skel := computeConfusableSkeleton(decoded)
-			if brand, ok := idnProtectedSkeletons[skel]; ok {
-				if !brand.isAllowedSLD(decoded) {
-					return true, "IDN Homograph Impersonation (" + label + " [" + decoded + "] impersonates " + brand.canonicalDomain + ")"
+			if !inETLD {
+				skel := computeConfusableSkeleton(decoded)
+				if brand, ok := idnProtectedSkeletons[skel]; ok {
+					if !brand.isAllowedSLD(decoded) {
+						return true, "IDN Homograph Impersonation (" + label + " [" + decoded + "] impersonates " + brand.canonicalDomain + ")"
+					}
 				}
 			}
-		} else if idnASCIILookalikes && len(label) >= 4 {
+		} else if !inETLD && idnASCIILookalikes && len(label) >= 4 {
 			if isSLD && (isCanonicalApex || idnProtectedSLDs[label] != "") {
 				continue
 			}
@@ -932,8 +906,8 @@ func AnalyzeIDNHomograph(qname string) (bool, string) {
 
 	decodedSLD := sld
 	if strings.HasPrefix(sld, "xn--") {
-		if uSLD, err := idna.ToUnicode(sld); err == nil && uSLD != "" {
-			decodedSLD = strings.ToLower(uSLD)
+		if uSLD, ok := decodeStrictPunycode(sld); ok {
+			decodedSLD = uSLD
 		}
 	}
 
@@ -952,8 +926,6 @@ func AnalyzeIDNHomograph(qname string) (bool, string) {
 	return false, ""
 }
 
-// applyIDNHomographVerdict executes the configured action (`LOG`, `BLOCK`, `DROP`, or RCODE)
-// once an IDN homograph or lookalike violation has been identified.
 func (qc *queryCtx) applyIDNHomographVerdict(reason string, cacheHit bool) bool {
 	IncrIDNHomographBlock()
 	RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, reason)
@@ -1007,8 +979,6 @@ func (qc *queryCtx) applyIDNHomographVerdict(reason string, cacheHit bool) bool 
 	return true
 }
 
-// enforceIDNHomographCheck evaluates `originalQNameTrimmed` and `qNameTrimmed`
-// against `AnalyzeIDNHomograph`, respecting `bypassPolicies` and `bypassGlobal`.
 func (qc *queryCtx) enforceIDNHomographCheck() bool {
 	if !hasIDNHomograph || qc.bypassPolicies || qc.bypassGlobal {
 		return false

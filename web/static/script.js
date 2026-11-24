@@ -1,54 +1,29 @@
 /*
 File:    web/static/script.js
-Version: 1.39.0
-Last Updated: 17-Nov-2026 10:33 CET
+Version: 1.40.0
+Last Updated: 24-Nov-2026 14:40 CET
 Description:
   Extracted static JavaScript for the sdproxy admin web UI.
   Compiled directly into the Go binary via //go:embed.
 
 Changes:
-  1.39.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight `IDN HOMOGRAPH BLOCK`, `IDN HOMOGRAPH DROP`,
-           `IDN HOMOGRAPH BLOCK TARGET`, `IDN HOMOGRAPH DROP TARGET`,
-           `IDN HOMOGRAPH (LOG ONLY)`, `IDN HOMOGRAPH TARGET (LOG ONLY)`,
-           and `IDN HOMOGRAPH DETECTION (LOG ONLY)`.
-  1.38.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight verbose `(LOG ONLY)` audit tokens (`FOR-SALE DETECTION (LOG ONLY)`,
-           `PARKED DETECTION (LOG ONLY)`, `RFC COMPLIANCE DETECTION (LOG ONLY)`,
-           `DGA DETECTION (LOG ONLY)`, `EXFILTRATION DETECTION (LOG ONLY)`,
-           `SUBDOMAIN LIMIT DETECTION (LOG ONLY)`, `PARENTAL IP FILTERED (LOG ONLY)`,
-           `POLICY IP FILTERED (LOG ONLY)`, and `(LOG ONLY)`).
-  1.37.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight `CUSTOM RULE BLOCK (LOG ONLY)`, `PARENTAL BLOCK (LOG ONLY)`,
-           `PARENTAL BLOCK TARGET (LOG ONLY)`, `POLICY BLOCK (LOG ONLY)`,
-           `POLICY BLOCK TARGET (LOG ONLY)`, `IP FILTERED (LOG ONLY)`,
-           `REBINDING BLOCK (LOG ONLY)`, and `CONSENSUS BLOCK (LOG ONLY)`
-           Simple Logging Mode audit notices.
-  1.36.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight `DGA (LOG ONLY)`, `EXFILTRATION (LOG ONLY)`,
-           `SUBDOMAIN LIMIT (LOG ONLY)`, `WEBUI CLIENT BLOCK (LOG ONLY)`, and
-           `SEARCH LEAK (LOG ONLY)` Simple Logging Mode notices.
-  1.35.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight `FOR-SALE (LOG ONLY)` and `PARKED (LOG ONLY)` Simple
-           Logging Mode notices alongside `RFC COMPLIANCE (LOG ONLY)`.
-  1.34.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight `FOR-SALE BLOCK`, `FOR-SALE DROP`, `PARKED BLOCK`,
-           `PARKED DROP`, `RFC COMPLIANCE BLOCK`, `RFC COMPLIANCE DROP`,
-           `CONSENSUS BLOCK`, `CONSENSUS DROP`, `SUBDOMAIN LIMIT INTERCEPT`,
-           `SUBDOMAIN LIMIT DROP`, `DGA INTERCEPT`, `DGA DROP`, `EXFIL INTERCEPT`,
-           and `EXFIL DROP`.
-  1.33.0 - [FIX] Updated `top10()` filter string for `top-groups` to use raw
-           `r.name` instead of `'(' + rawName + ')'` so clicking a group in
-           Top Groups matches Query Log lines in both Simple Logging Mode and
-           Verbose Logging Mode.
+  1.40.0 - [SECURITY] Switched group override timer badge rendering from
+           `innerHTML` to `textContent` and HTML-escaped hourly graph `title`
+           and `label` fragments in `drawGraph()`.
+  1.39.0 - [FEAT] Extended `colorizeLog()` to highlight IDN homograph log tokens.
+  1.38.0 - [FEAT] Extended `colorizeLog()` for verbose `(LOG ONLY)` audit tokens.
+  1.37.0 - [FEAT] Extended `colorizeLog()` for Simple Logging Mode `(LOG ONLY)`
+           policy/parental/consensus notices.
+  1.36.0 - [FEAT] Extended `colorizeLog()` for DGA/Exfiltration/Subdomain/Leak
+           `(LOG ONLY)` notices.
+  1.35.0 - [FEAT] Extended `colorizeLog()` for `FOR-SALE (LOG ONLY)` and
+           `PARKED (LOG ONLY)`.
+  1.34.0 - [FEAT] Extended `colorizeLog()` for For-Sale, Parked, RFC Compliance,
+           Consensus, and ML intercept blocks/drops.
+  1.33.0 - [FIX] Updated `top10()` filter string for `top-groups`.
   1.32.0 - [FIX] Updated `top10()` filter string for `top-upstreams` and
-           `top-upstream-hosts` so clicking an entry in the Top-N tables matches
-           Query Log lines in both Simple Logging Mode (`Policy: <group>`) and
-           Verbose Logging Mode (`ROUTE: <group>`).
-  1.31.0 - [FEAT] Extended `colorizeLog()` in the Live Query Log viewer to
-           highlight Simple Logging Mode fields (`Policy: ...`, `Cache: HIT`,
-           `Cache: MISS`, `DROP`, `FORMERR`, `NODATA`, `CUSTOM-IP`).
-  1.30.0 - [FIX] Shipped the browser half of the "Last Seen" column.
+           `top-upstream-hosts`.
+  1.31.0 - [FEAT] Highlighted Simple Logging Mode fields in `colorizeLog()`.
 */
 
 (function(){
@@ -56,9 +31,9 @@ Changes:
 
 window.addEventListener('DOMContentLoaded', function() {
     var sp = sessionStorage.getItem('sdp_scroll');
-    if(sp) { 
-        window.scrollTo(0, parseInt(sp, 10)); 
-        sessionStorage.removeItem('sdp_scroll'); 
+    if(sp) {
+        window.scrollTo(0, parseInt(sp, 10));
+        sessionStorage.removeItem('sdp_scroll');
     }
 });
 
@@ -94,13 +69,6 @@ function reloadPage() {
 })();
 
 // ── Section 1: radio instant-apply & temporary timers ─────────────────────
-var bm={
-  DEFAULT:{c:'st-ok',   l:'Default (normal)'},
-  LOG:    {c:'st-log',  l:'Override: LOG \u2014 log-only bypass'},
-  ALLOW:  {c:'st-allow',l:'Override: ALLOW \u2014 bypass all restrictions'},
-  FREE:   {c:'st-free', l:'Override: FREE \u2014 suspend time/sched limits'},
-  BLOCK:  {c:'st-block',l:'Override: BLOCK \u2014 internet cut'}
-};
 var toast=document.getElementById('sdp-toast'),toastT;
 function show(msg,ok){
   clearTimeout(toastT);
@@ -124,7 +92,7 @@ document.addEventListener('change',function(e){
   var el=e.target;
   if(el.type!=='radio')return;
   var g=el.name.replace(/^m_/,''),m=el.value,fd=new URLSearchParams();
-  
+
   var container = el.closest('tr') || el.closest('.card');
   var durEl = container ? container.querySelector('.dur-sel') : null;
   var dur = durEl ? durEl.value : "0";
@@ -140,11 +108,11 @@ document.addEventListener('change',function(e){
         var msg = '\u2713 '+d.group+' \u2192 '+d.mode;
         if(d.duration > 0) msg += ' (' + d.duration + 'm)';
         show(msg,true);
-        
+
         if (window.refreshGroupsUI) {
             setTimeout(window.refreshGroupsUI, 400);
         } else {
-            setTimeout(reloadPage, 400); 
+            setTimeout(reloadPage, 400);
         }
       }else{show('\u2717 '+(d.error||'failed'),false);}
     })
@@ -178,11 +146,11 @@ document.addEventListener('click', function(e){
 }, true);
 
 var activeTimers = {};
-var expiredNotified = {}; 
+var expiredNotified = {};
 
 setInterval(function(){
   var now = Math.floor(Date.now()/1000);
-  
+
   Object.keys(activeTimers).forEach(function(g) {
       var t = activeTimers[g];
       if (t && t.expires_at > 0 && t.expires_at <= now) {
@@ -193,7 +161,7 @@ setInterval(function(){
               if (window.refreshGroupsUI) {
                   setTimeout(window.refreshGroupsUI, 1500);
               } else {
-                  setTimeout(reloadPage, 1500); 
+                  setTimeout(reloadPage, 1500);
               }
           }
       }
@@ -209,9 +177,9 @@ setInterval(function(){
         var m = Math.floor((left % 3600) / 60);
         var s = left % 60;
         var str = (h > 0 ? h + ':' : '') + (h > 0 && m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
-        
+
         var revertTo = t.revert_mode || 'DEFAULT';
-        el.innerHTML = t.mode + ' (' + str + ' until ' + revertTo + ')';
+        el.textContent = t.mode + ' (' + str + ' until ' + revertTo + ')';
         el.classList.remove('hidden');
      } else {
         el.classList.add('hidden');
@@ -224,7 +192,7 @@ setInterval(function(){
 window.refreshGroupsUI = function(isBackground) {
     var btnDesk = document.getElementById('btn-refresh-groups');
     var btnMob = document.getElementById('btn-refresh-groups-mob');
-    
+
     if(isBackground !== true) {
         if(btnDesk) btnDesk.classList.add('spin');
         if(btnMob) btnMob.classList.add('spin');
@@ -244,7 +212,7 @@ window.refreshGroupsUI = function(isBackground) {
         .then(function(d) {
             var tbody = document.getElementById('desk-groups-tbody');
             if(tbody && d.desktop) tbody.innerHTML = d.desktop;
-            
+
             var cards = document.getElementById('mob-groups-cards');
             if(cards && d.mobile) cards.innerHTML = d.mobile;
 
@@ -298,6 +266,10 @@ if(document.getElementById('btn-refresh-groups-mob')) {
     'st-cache':'cache_hit_rate', 'st-cache-sub':null
   };
 
+  function escAttr(s){
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
   var months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   function formatSince(unix){
     if(!unix)return'';
@@ -334,17 +306,17 @@ if(document.getElementById('btn-refresh-groups-mob')) {
           }
           filterStr = filterStr + '.';
       }
-      
-      var fTerm = filterStr.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g, '&quot;');
-      var n = rawName.replace(/&/g,'&amp;').replace(/</g,'&lt;');
-      var rawEsc = rawName.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g, '&quot;');
-      
+
+      var fTerm = escAttr(filterStr);
+      var n = escAttr(rawName);
+      var rawEsc = escAttr(rawName);
+
       if(id==='top-categories' && r.name==='unknown'){
         n='<span class="muted" style="font-style:italic">unknown</span>';
       }
       var hintHtml='';
       if(r.hint){
-        var h=String(r.hint).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+        var h=escAttr(r.hint);
         if(id==='top-talkers'){
           n=h+' ('+n+')';
         }else if(id==='top-blocked' || id==='top-tlds' || id==='top-block-reasons' || id==='top-filtered-ips'){
@@ -358,7 +330,8 @@ if(document.getElementById('btn-refresh-groups-mob')) {
           addBtn = '<button class="top10-add-rule" data-domain="' + rawEsc + '" title="Add to Custom Rules">+</button>';
       }
 
-      return '<tr><td class="top10-rank">'+(i+1)+'</td><td class="top10-name">'+n+hintHtml+'</td><td class="top10-cnt">'+r.count+addBtn+'</td></tr>';
+      var cnt = Number(r.count) || 0;
+      return '<tr><td class="top10-rank">'+(i+1)+'</td><td class="top10-name">'+n+hintHtml+'</td><td class="top10-cnt">'+cnt+addBtn+'</td></tr>';
     }).join('');
   }
 
@@ -385,7 +358,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       yEl.innerHTML='<span>0</span><span>'+fmt(Math.round(max/2))+'</span><span>'+fmt(max)+'</span>';
     }
     var html='';
-    var skip = Math.max(1, Math.floor(pts.length / 8)); 
+    var skip = Math.max(1, Math.floor(pts.length / 8));
     for(i=0;i<pts.length;i++){
       p=pts[i];
       var tot=p.total||0,blk=p.blocked||0,fwd=p.fwd||0;
@@ -393,8 +366,8 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       if(fwd>tot-blk)fwd=tot-blk;
       var fwdPx=Math.round(fwd/max*100);
       var blkPx=Math.round(blk/max*100);
-      var lbl=(i%skip===0||i===pts.length-1)?p.label:'';
-      var tip=p.label+': '+tot+' total, '+blk+' blocked';
+      var lbl=(i%skip===0||i===pts.length-1)?escAttr(p.label||''):'';
+      var tip=escAttr((p.label||'')+': '+tot+' total, '+blk+' blocked');
       html+='<div class="hbar-wrap" title="'+tip+'">'
         +'<div class="hbar">'
         +'<div class="hbar-fwd" style="height:'+fwdPx+'px"></div>'
@@ -411,7 +384,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       .then(function(r){return r.json();})
       .then(function(d){
         activeTimers = d.group_overrides || {};
-        
+
         Object.keys(expiredNotified).forEach(function(g) {
             if (!activeTimers[g] || activeTimers[g].expires_at === 0) {
                 delete expiredNotified[g];
@@ -509,10 +482,10 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       zRes=document.getElementById('qlog-zoom-reset'),
       es=null,
       autoScroll=true,
-      maxLines=500, 
+      maxLines=500,
       baseZoom=0.72,
       curZoom=0.72;
-      
+
   if(!btn)return;
 
   var limitInput = document.getElementById('qlog-limit'),
@@ -555,10 +528,10 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       }
       var first = children[0].dataset.raw;
       var last = children[children.length - 1].dataset.raw;
-      
+
       var start = first && first.length >= 19 ? first.substring(5, 19) : '';
       var end = last && last.length >= 19 ? last.substring(5, 19) : '';
-      
+
       if (start && end) {
           rangeEl.textContent = '(' + start + ' \u2192 ' + end + ')';
       }
@@ -575,7 +548,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
     modalHeader.addEventListener('dblclick', function(e) {
       var tag = e.target.tagName.toLowerCase();
       if (tag === 'button' || tag === 'input' || tag === 'label' || e.target.closest('.zoom-controls') || e.target.closest('.filter-box') || e.target.closest('.log-meta') || e.target.closest('.filter-invert')) return;
-      
+
       isMaximized = !isMaximized;
       if (isMaximized) {
         preMaxState.top = modalContent.style.top;
@@ -621,7 +594,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
     if (isDragging) {
       var dx = e.clientX - startX;
       var dy = e.clientY - startY;
-      var newT = Math.max(0, startT + dy); 
+      var newT = Math.max(0, startT + dy);
       modalContent.style.left = (startL + dx) + 'px';
       modalContent.style.top  = newT + 'px';
     } else if (isResizing) {
@@ -658,7 +631,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
   });
 
   function updateZoom(newZoom) {
-      curZoom = Math.max(0.4, Math.min(2.0, newZoom)); 
+      curZoom = Math.max(0.4, Math.min(2.0, newZoom));
       lines.style.fontSize = curZoom.toFixed(2) + 'em';
       if (autoScroll) {
           lines.scrollTop = lines.scrollHeight;
@@ -669,8 +642,8 @@ if(document.getElementById('btn-refresh-groups-mob')) {
   zIn.addEventListener('click',  function() { updateZoom(curZoom + 0.08); });
   zRes.addEventListener('click', function() { updateZoom(baseZoom); });
 
-  function escHtml(s){ 
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); 
+  function escHtml(s){
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   function colorizeLog(txt) {
@@ -745,10 +718,10 @@ if(document.getElementById('btn-refresh-groups-mob')) {
     mod.classList.add('modal-show');
     lines.innerHTML='';
     filt.value = filterTerm || '';
-    
+
     if(filt.value.length > 0) clr.classList.remove('hidden');
     else clr.classList.add('hidden');
-    
+
     autoScroll=true;
     tail.classList.add('hidden');
     if(es){es.close();es=null;}
@@ -761,7 +734,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       var invert = invQlog ? invQlog.checked : false;
       var hasMatch = ev.data.toLowerCase().indexOf(f) !== -1;
       var showLine = f ? (invert ? !hasMatch : hasMatch) : true;
-      
+
       if(!showLine) {
         d.style.display = 'none';
         d.innerHTML = renderLine(ev.data, '');
@@ -769,9 +742,9 @@ if(document.getElementById('btn-refresh-groups-mob')) {
         d.style.display = '';
         d.innerHTML = renderLine(ev.data, invert ? '' : f);
       }
-      
+
       lines.appendChild(d);
-      
+
       while(lines.children.length > maxLines){
         lines.removeChild(lines.firstElementChild);
       }
@@ -810,7 +783,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
 
   cls.addEventListener('click',closeLog);
   mod.addEventListener('click',function(e){if(e.target===mod)closeLog();});
-  
+
   filt.addEventListener('input', applyQlogFilter);
   if(invQlog) {
       invQlog.addEventListener('change', applyQlogFilter);
@@ -836,15 +809,11 @@ if(document.getElementById('btn-refresh-groups-mob')) {
     modRules.classList.remove('modal-show');
   }
 
-  function escHtml(s){ 
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); 
-  }
-
   function renderRules() {
     tbody.innerHTML = '';
     currentRules.forEach(function(r, i) {
       var tr = document.createElement('tr');
-      
+
       var tdDom = document.createElement('td');
       var inpDom = document.createElement('input');
       inpDom.type = 'text';
@@ -938,7 +907,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
           setTimeout(function() { var wrap = tbody.closest('.table-wrap'); if(wrap) wrap.scrollTop = wrap.scrollHeight; }, 10);
         }
       })
-      .catch(function(err) { show('Failed to fetch rules', false); });
+      .catch(function() { show('Failed to fetch rules', false); });
   }
 
   btnRules.addEventListener('click', function(e){
@@ -994,8 +963,8 @@ if(document.getElementById('btn-refresh-groups-mob')) {
 
 // ── Cache Inspector Modal ──────────────────────────────────────────
 (function(){
-  function escHtml(s){ 
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); 
+  function escHtml(s){
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
   var cachedData = [];
@@ -1009,7 +978,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
       if (!cacheFilter || !cacheFilter.value) return cachedData;
       var f = cacheFilter.value.toLowerCase();
       var invert = invCache ? invCache.checked : false;
-      
+
       return cachedData.filter(function(e) {
           var match = (e.qname && e.qname.toLowerCase().indexOf(f) !== -1) ||
                  (e.qtype && e.qtype.toLowerCase().indexOf(f) !== -1) ||
@@ -1030,7 +999,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
           var fTerm = '-> ' + e.qname + '.';
           var qnameLink = '<a href="#" class="qlog-link" data-filter="'+escHtml(fTerm)+'" title="View in Query Log">'+escHtml(e.qname)+'</a>';
           var addBtn = '<button class="top10-add-rule" data-domain="'+escHtml(e.qname)+'" title="Add to Custom Rules">+</button>';
-          
+
           var respFormatted = escHtml(e.response).replace(/\n/g, '<br>');
 
           html += '<tr>' +
@@ -1038,7 +1007,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
               '<td style="text-align:center;">' + escHtml(e.qtype) + '</td>' +
               '<td style="text-align:center; word-break:break-word;">' + escHtml(e.upstream_group) + '</td>' +
               '<td style="font-family:monospace; font-size:0.9em; word-break:break-all; white-space:normal; text-align:left;">' + respFormatted + '</td>' +
-              '<td style="text-align:center;">' + e.hits + '</td>' +
+              '<td style="text-align:center;">' + (Number(e.hits) || 0) + '</td>' +
               '<td style="text-align:center; white-space:nowrap;">' + escHtml(e.timestamp) + '</td>' +
               '<td style="text-align:center; white-space:nowrap;">' + escHtml(e.time_left) + '</td>' +
               '<td style="text-align:center;">' + addBtn + '</td>' +
@@ -1072,7 +1041,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
               case 'response': valA = a.response; valB = b.response; break;
               case 'hits': valA = a.hits; valB = b.hits; break;
               case 'cachedat': valA = a.timestamp; valB = b.timestamp; break;
-              case 'ttl': 
+              case 'ttl':
                   valA = parseInt(a.time_left.replace(/[^0-9-]/g, ''), 10) || 0;
                   if(a.time_left.indexOf("Expired") !== -1 && valA > 0) valA = -valA;
                   valB = parseInt(b.time_left.replace(/[^0-9-]/g, ''), 10) || 0;
@@ -1110,7 +1079,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
               applySort();
               modCache.classList.add('modal-show');
           })
-          .catch(function(){ 
+          .catch(function(){
               var toast = document.getElementById('sdp-toast');
               if (toast) {
                   clearTimeout(window.toastT);
@@ -1145,7 +1114,7 @@ if(document.getElementById('btn-refresh-groups-mob')) {
               }
           });
       }
-      
+
       if (cacheFilter && cacheClear) {
           cacheFilter.addEventListener('input', function() {
               if (this.value.length > 0) {
@@ -1161,21 +1130,21 @@ if(document.getElementById('btn-refresh-groups-mob')) {
               cacheFilter.focus();
           });
       }
-      
+
       if (invCache) {
           invCache.addEventListener('change', applySort);
       }
   }
 })();
 
-// Global Delegated Listener for qlog-link and add-rule clicks outside specific modules
+// Global Delegated Listener for qlog-link and add-rule clicks
 document.addEventListener('click', function(e){
   var link = e.target.closest('.qlog-link');
   if(link) {
     e.preventDefault();
     var cMod = document.getElementById('cache-modal');
-    if(cMod) cMod.classList.remove('modal-show'); 
-    
+    if(cMod) cMod.classList.remove('modal-show');
+
     if(window.openQueryLog) {
       window.openQueryLog(link.getAttribute('data-filter'));
     }
@@ -1185,8 +1154,8 @@ document.addEventListener('click', function(e){
   if(addRuleBtn) {
     e.preventDefault();
     var caMod = document.getElementById('cache-modal');
-    if(caMod) caMod.classList.remove('modal-show'); 
-    
+    if(caMod) caMod.classList.remove('modal-show');
+
     if(window.addCustomRuleForDomain) {
       window.addCustomRuleForDomain(addRuleBtn.getAttribute('data-domain'));
     }
@@ -1242,7 +1211,7 @@ document.addEventListener('click', function(e){
     var tbody = document.getElementById('clients-tbody');
     var refBtn = document.getElementById('btn-refresh-clients');
     var cFilt = document.getElementById('clients-filter');
-    
+
     function escHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
     function fmtLastSeenAgo(ts) {
@@ -1299,7 +1268,7 @@ document.addEventListener('click', function(e){
     window.refreshClientsUI = function(isBackground) {
         if(!tbody) return;
         if(!isBackground && refBtn) refBtn.classList.add('spin');
-        
+
         fetch('/api/clients')
             .then(function(r){ return r.json(); })
             .then(function(data){
@@ -1310,17 +1279,17 @@ document.addEventListener('click', function(e){
                     data.forEach(function(c) {
                         var trClass = c.is_blocked ? ' class="blocked-row"' : '';
                         var ipStr = c.ip ? escHtml(c.ip) : '<span class="muted">—</span>';
-                        
+
                         var macStr = c.mac ? escHtml(c.mac) : '<span class="muted">—</span>';
                         if (c.is_rand_mac) {
                             macStr += ' <span class="reason-badge" title="Randomized / Private MAC Address">Rand</span>';
                         }
-                        
+
                         var nameStr = c.name ? escHtml(c.name) : '<span class="muted">—</span>';
-                        
+
                         var btnClass = c.is_blocked ? "btn-cancel" : "btn-clear";
                         var btnText = c.is_blocked ? "UNBLOCK" : "BLOCK";
-                        
+
                         html += '<tr data-id="'+escHtml(c.id)+'"'+trClass+'>'+
                             '<td style="font-family:monospace; text-align:left;">'+ipStr+'</td>'+
                             '<td style="font-family:monospace; text-align:left;">'+macStr+'</td>'+
@@ -1341,7 +1310,7 @@ document.addEventListener('click', function(e){
 
     if(refBtn) {
         refBtn.addEventListener('click', function(){ window.refreshClientsUI(false); });
-        setInterval(function(){ window.refreshClientsUI(true); }, 60000); 
+        setInterval(function(){ window.refreshClientsUI(true); }, 60000);
     }
 
     if(tbody) {
@@ -1353,13 +1322,13 @@ document.addEventListener('click', function(e){
         tbody.addEventListener('click', function(e) {
             var btn = e.target.closest('.client-block-btn');
             if(!btn) return;
-            
+
             var id = btn.getAttribute('data-id');
             var action = btn.getAttribute('data-action');
             var fd = new URLSearchParams();
             fd.append('id', id);
             fd.append('action', action);
-            
+
             btn.disabled = true;
             btn.style.opacity = '0.5';
 
@@ -1387,7 +1356,7 @@ document.addEventListener('click', function(e){
         });
     }
 
-    // ── Bulk Actions for Unknown/Privacy MAC Clients ──
+    // Bulk Actions for Unknown/Privacy MAC Clients
     var btnBulkUnknown = document.getElementById('btn-bulk-unknown');
     var selBulkUnknown = document.getElementById('bulk-unknown-action');
     if(btnBulkUnknown && selBulkUnknown) {
@@ -1395,7 +1364,7 @@ document.addEventListener('click', function(e){
             var action = selBulkUnknown.value;
             var fd = new URLSearchParams();
             fd.append('action', action);
-            
+
             btnBulkUnknown.disabled = true;
             btnBulkUnknown.style.opacity = '0.5';
 

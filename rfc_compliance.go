@@ -1,43 +1,33 @@
 /*
 File:    rfc_compliance.go
-Version: 1.17.0
-Last Updated: 23-Nov-2026 14:16 CET
+Version: 1.18.0
+Last Updated: 24-Nov-2026 13:11 CET
 
 Description:
   RFC Compliance & CNAME Indirection validation engine for sdproxy.
-
-  Enforces DNS protocol and RR-type structural invariants across:
-    - NS  (RFC 2181 §10.3, RFC 1035 §3.3.11)
-    - MX  (RFC 2181 §10.3, RFC 5321 §5.1, RFC 7505)
-    - SRV (RFC 2782)
-    - SOA (RFC 1035 / RFC 2181)
-    - PTR (RFC 2181 §10.2)
-    - CNAME (RFC 1034 §3.6.2, RFC 2181 §10.1)
+  Enforces DNS protocol and RR-type structural invariants across NS, MX, SRV,
+  SOA, PTR, CNAME, and DNAME records.
 
 Changes:
-  1.17.0 - [SECURITY/FIX] Used the `isSynth` return flag from `CacheGet`
-           (`cache_rw.go` 1.50.0) instead of `!pooled.Authoritative` in
-           `probeTargetHasCNAME` and `probeDomainNSIndirection` so authoritative
-           (`AA=1`) upstream cache entries are inspected accurately, and added
-           nil `group` guards before launching upstream probes.
-  1.16.0 - [SECURITY/FIX] Checked `exceeded` returned by `walkBailiwickChain` in
-           `chainBufInit`, `probeTargetHasCNAME`, and `probeDomainNSIndirection`.
-  1.15.0 - [REFACTOR/PERF] Switched `rfc_compliance.go` to the shared
-           `probeVerdictCache` and `walkBailiwickChain`.
+  1.18.0 - [SECURITY/CONCURRENCY] Isolated sub-probes inside `probeDomainNSIndirection`
+           SingleFlight (`rfcSFGroup.DoChan`) from caller-scoped `parentCtx`
+           cancellation, and tracked transient probe failures (`matchedTag: "fail"`)
+           in `probeTargetHasCNAME` so canceled or failed sub-probes use
+           `rfcFailTTL` (60s) instead of poisoning `rfcCache` for `rfcNegTTL` (15m).
+  1.17.0 - [SECURITY/FIX] Used `isSynth` from `CacheGet` instead of
+           `!pooled.Authoritative` in `probeTargetHasCNAME` and
+           `probeDomainNSIndirection`, and added nil `group` guards.
+  1.16.0 - [SECURITY/FIX] Checked `exceeded` returned by `walkBailiwickChain`.
+  1.15.0 - [REFACTOR/PERF] Switched to shared `probeVerdictCache` and
+           `walkBailiwickChain`.
   1.14.0 - [PERF/FIX] Guarded `CacheSetSynth` in `applyRFCComplianceVerdict` with
            `!cacheHit`.
   1.13.0 - [PERF/FIX] Added `allowNetworkProbe` to `probeTargetHasCNAME` and
            `inspectMsgRFCCompliance`.
-  1.12.0 - [FIX] Recorded `IncrPolicyBlock()` and `RecordBlockEvent()` in
-           `applyRFCComplianceVerdict` when `rfc_compliance.action: "LOG"` or
-           `block_action: "LOG"` is active.
-  1.11.0 - [SECURITY/FIX] Added multi-hop DNAME cycle detection and end-to-end
-           chain target resolution (`resolveCNAMEChainTarget`) on `dns.DNAME`.
-  1.10.0 - [SECURITY/FIX] Expanded `resolveCNAMEChainTarget` to accept in-packet
-           `DNAME` rules.
-  1.9.0  - [SECURITY/FIX] Added RFC 6672 `DNAME` exclusivity and single-DNAME-per-owner
-           validation in `inspectMsgRFCCompliance`.
-  1.8.0  - [SECURITY/FIX] Extended in-packet `DNAME` synthesis.
+  1.12.0 - [FIX] Recorded `IncrPolicyBlock()` and `RecordBlockEvent()` in `LOG` mode.
+  1.11.0 - [SECURITY/FIX] Added multi-hop DNAME cycle detection and chain resolution.
+  1.10.0 - [SECURITY/FIX] Expanded `resolveCNAMEChainTarget` for in-packet `DNAME`.
+  1.9.0  - [SECURITY/FIX] Added RFC 6672 `DNAME` exclusivity validation.
 */
 
 package main
@@ -78,7 +68,6 @@ var (
 	rfcSFGroup singleflight.Group
 )
 
-// InitRFCCompliance initializes the RFC compliance validation subsystem.
 func InitRFCCompliance() {
 	act := strings.ToUpper(strings.TrimSpace(cfg.Server.RFCCompliance.Action))
 	switch act {
@@ -268,38 +257,38 @@ func resolveCNAMEChainTarget(cnames map[string]string, dnames [][2]string, start
 	return last, true, false
 }
 
-func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeIdx uint16, target, clientID, clientName string, clientAddr, ecsAddr netip.Addr, ecsPrefix netip.Prefix, doBit, cdBit, bypassLocal, bypassGlobal, bypassPolicies, allowNetworkProbe bool) (hasCNAME bool, cnameTarget string) {
+func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeIdx uint16, target, clientID, clientName string, clientAddr, ecsAddr netip.Addr, ecsPrefix netip.Prefix, doBit, cdBit, bypassLocal, bypassGlobal, bypassPolicies, allowNetworkProbe bool) (hasCNAME bool, cnameTarget string, probeOK bool) {
 	cleanTarget := lowerTrimDot(target)
 	if cleanTarget == "" || len(cleanTarget) > 253 {
-		return false, ""
+		return false, "", true
 	}
 
 	now := time.Now().UnixNano()
 	ck := probeCacheKey{routeIdx: routeIdx, kind: 2, domain: cleanTarget}
 	if entry, ok := getRFCCache(ck, now); ok {
-		return entry.positive, entry.secondary
+		return entry.positive, entry.secondary, entry.matchedTag != "fail"
 	}
 
 	if parentCtx.Err() != nil {
-		return false, ""
+		return false, "", false
 	}
 
 	fqdn := dns.Fqdn(cleanTarget)
 	cNameKey, ecsKey := probeCacheKeyPartitions(group, clientName, clientAddr, ecsAddr, ecsPrefix)
 	effectiveDo := doBit || (group != nil && group.RequireDNSSECAD)
 
-	extractAlias := func(msg *dns.Msg) (bool, string, time.Duration) {
+	extractAlias := func(msg *dns.Msg) (bool, string, time.Duration, bool) {
 		if msg == nil {
-			return false, "", rfcFailTTL
+			return false, "", rfcFailTTL, false
 		}
 		if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
-			return false, "", rfcFailTTL
+			return false, "", rfcFailTTL, false
 		}
 
 		var chainBuf [64]string
 		validNames, _, exceeded := walkBailiwickChain(msg.Answer, fqdn, 8, &chainBuf)
 		if exceeded {
-			return false, "", rfcFailTTL
+			return false, "", rfcFailTTL, false
 		}
 
 		minTTL := uint32(3600)
@@ -336,9 +325,9 @@ func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeI
 			} else if ttl > rfcMaxTTL {
 				ttl = rfcMaxTTL
 			}
-			return true, resolved, ttl
+			return true, resolved, ttl, true
 		}
-		return false, "", rfcNegTTL
+		return false, "", rfcNegTTL, true
 	}
 
 	if !allowNetworkProbe || group == nil {
@@ -361,15 +350,20 @@ func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeI
 				pooled := msgPool.Get().(*dns.Msg)
 				*pooled = dns.Msg{}
 				if _, _, cacheOK, isSynth := CacheGet(mainKey, fqdn, pooled); cacheOK && !isSynth {
-					isAlias, aliasTarg, ttl := extractAlias(pooled)
+					isAlias, aliasTarg, ttl, valid := extractAlias(pooled)
 					msgPool.Put(pooled)
+					tag := ""
+					if !valid {
+						tag = "fail"
+					}
 					entry := probeCacheEntry{
 						positive:   isAlias,
+						matchedTag: tag,
 						secondary:  aliasTarg,
 						expireNano: time.Now().Add(ttl).UnixNano(),
 					}
 					setRFCCache(ck, entry, now)
-					return entry.positive, entry.secondary
+					return entry.positive, entry.secondary, valid
 				}
 				msgPool.Put(pooled)
 				if !effectiveDo {
@@ -377,7 +371,7 @@ func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeI
 				}
 			}
 		}
-		return false, ""
+		return false, "", false
 	}
 
 	sfKey := "t|" + itoa64(int64(routeIdx)) + "|" + cleanTarget
@@ -406,10 +400,15 @@ func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeI
 				pooled := msgPool.Get().(*dns.Msg)
 				*pooled = dns.Msg{}
 				if _, _, cacheOK, isSynth := CacheGet(mainKey, fqdn, pooled); cacheOK && !isSynth {
-					isAlias, aliasTarg, ttl := extractAlias(pooled)
+					isAlias, aliasTarg, ttl, valid := extractAlias(pooled)
 					msgPool.Put(pooled)
+					tag := ""
+					if !valid {
+						tag = "fail"
+					}
 					entry := probeCacheEntry{
 						positive:   isAlias,
+						matchedTag: tag,
 						secondary:  aliasTarg,
 						expireNano: time.Now().Add(ttl).UnixNano(),
 					}
@@ -440,12 +439,18 @@ func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeI
 		if err != nil || resp == nil || strings.HasPrefix(uAddr, "consensus(") || strings.HasPrefix(uAddr, "consensus-log(") {
 			entry = probeCacheEntry{
 				positive:   false,
+				matchedTag: "fail",
 				expireNano: time.Now().Add(rfcFailTTL).UnixNano(),
 			}
 		} else {
-			isAlias, aliasTarg, ttl := extractAlias(resp)
+			isAlias, aliasTarg, ttl, valid := extractAlias(resp)
+			tag := ""
+			if !valid {
+				tag = "fail"
+			}
 			entry = probeCacheEntry{
 				positive:   isAlias,
+				matchedTag: tag,
 				secondary:  aliasTarg,
 				expireNano: time.Now().Add(ttl).UnixNano(),
 			}
@@ -456,12 +461,12 @@ func probeTargetHasCNAME(parentCtx context.Context, group *UpstreamGroup, routeI
 
 	select {
 	case <-parentCtx.Done():
-		return false, ""
+		return false, "", false
 	case r := <-resCh:
 		if res, ok := r.Val.(probeCacheEntry); ok {
-			return res.positive, res.secondary
+			return res.positive, res.secondary, res.matchedTag != "fail"
 		}
-		return false, ""
+		return false, "", false
 	}
 }
 
@@ -851,7 +856,7 @@ func (qc *queryCtx) inspectMsgRFCCompliance(msg *dns.Msg, allowNetworkProbe bool
 		if isDGASafeDomain(t.target) || isVerifiedAWSDNS(t.target) {
 			continue
 		}
-		hasCNAME, cnameTarg := probeTargetHasCNAME(
+		hasCNAME, cnameTarg, _ := probeTargetHasCNAME(
 			context.Background(),
 			qc.group,
 			qc.route.routeIdx,
@@ -1185,12 +1190,17 @@ func probeDomainNSIndirection(parentCtx context.Context, group *UpstreamGroup, r
 			}
 		}
 
+		// Isolate SingleFlight target sub-probes from any individual waiter's parentCtx.
+		subCtx, subCancel := context.WithTimeout(WithBypassUpstreamThrottle(context.Background()), rfcProbeBudget)
+		defer subCancel()
+
+		allProbesOK := true
 		for _, item := range nsTargets {
 			if isDGASafeDomain(item.host) || isVerifiedAWSDNS(item.host) {
 				continue
 			}
-			hasCNAME, cnameTarg := probeTargetHasCNAME(
-				parentCtx,
+			hasCNAME, cnameTarg, probeOK := probeTargetHasCNAME(
+				subCtx,
 				group,
 				routeIdx,
 				item.host,
@@ -1206,6 +1216,9 @@ func probeDomainNSIndirection(parentCtx context.Context, group *UpstreamGroup, r
 				bypassPolicies,
 				true,
 			)
+			if !probeOK {
+				allProbesOK = false
+			}
 			if hasCNAME {
 				if isIndirectionActionable(item.owner, cnameTarg) || isIndirectionActionable(item.host, cnameTarg) {
 					ttl := time.Duration(minTTL) * time.Second
@@ -1230,9 +1243,13 @@ func probeDomainNSIndirection(parentCtx context.Context, group *UpstreamGroup, r
 			}
 		}
 
+		negTTL := rfcNegTTL
+		if !allProbesOK {
+			negTTL = rfcFailTTL
+		}
 		entry := probeCacheEntry{
 			positive:   false,
-			expireNano: time.Now().Add(rfcNegTTL).UnixNano(),
+			expireNano: time.Now().Add(negTTL).UnixNano(),
 		}
 		setRFCCache(ck, entry, time.Now().UnixNano())
 		return entry, nil
@@ -1311,7 +1328,6 @@ func checkRFCDomainNS(group *UpstreamGroup, routeIdx uint16, qname, clientID, cl
 	return false, ""
 }
 
-// applyRFCComplianceVerdict executes the configured action (`LOG` or `BLOCK`).
 func (qc *queryCtx) applyRFCComplianceVerdict(reason string, cacheHit bool) bool {
 	IncrPolicyBlock()
 	RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, reason)

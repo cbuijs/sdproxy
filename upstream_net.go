@@ -1,33 +1,31 @@
 /*
 File:    upstream_net.go
-Version: 1.45.0
-Last Updated: 18-Nov-2026 12:00 CET
+Version: 1.46.0
+Last Updated: 24-Nov-2026 14:30 CET
 
 Description:
   TCP, DoT, HTTP, and QUIC stream network dialers and protocol implementations.
-  Extracted from upstream.go to isolate network transport bounds.
 
 Changes:
+  1.46.0 - [PERF/CONCURRENCY] Replaced per-query cancellation goroutines and
+           channels in `exchangeStream` and `exchangeHTTP` with zero-goroutine
+           `context.AfterFunc` hooks, and registered a `context.AfterFunc` stream
+           aborter in `doqStreamExchange` so canceled loser DoQ streams abort
+           immediately instead of blocking up to `streamTimeout` (5s).
   1.45.0 - [SECURITY/FIX] Used `u.lockNo0RTT()` and `u.revertUnverifiedNo0RTT()`
-           in `exchangeHTTP` and `exchangeDoQ` so concurrent failing QUIC
-           goroutines can never revert `u.no0RTT` back to `false` once any
-           peer goroutine has verified 1-RTT (`Allow0RTT: false`) success.
+           in `exchangeHTTP` and `exchangeDoQ`.
   1.44.0 - [FEAT/FIX] Implemented sticky `Allow0RTT` disabling (`u.no0RTT`) in
            `exchangeHTTP` and `exchangeDoQ`.
   1.43.0 - [FEAT] Guarded dynamic `Alt-Svc: h3=` auto-upgrade in `exchangeHTTP`
-           with `!u.dohSticky.Load()` so an upstream that has permanently
-           downgraded to standard DoH never re-upgrades to DoH3.
+           with `!u.dohSticky.Load()`.
   1.42.0 - [CRITICAL/FIX] Replaced `closer.Close()` with `CloseIdleConnections()`
-           on `client.Transport` inside the `exchangeHTTP` retry path.
-  1.41.0 - [SECURITY/FIX] Closed idle HTTP/3 QUIC connections in addition to
-           HTTP/2 inside the `exchangeHTTP` retry path.
-  1.40.0 - [CRITICAL/FIX] Eliminated a silent stall in `exchangeHTTP` and `exchangeDoQ`.
+           on `client.Transport` inside `exchangeHTTP` retry path.
+  1.41.0 - [SECURITY/FIX] Closed idle HTTP/3 QUIC connections on retry.
+  1.40.0 - [CRITICAL/FIX] Eliminated stalls in `exchangeHTTP` and `exchangeDoQ`.
   1.39.0 - [SECURITY/FIX] Enforced `u.validateUpstreamResponse` across all stream
            and encrypted transports.
   1.38.0 - [FIX/CLEANUP] Added `conn == nil` defensive check in `doqStreamExchange`.
-  1.37.0 - [SECURITY/FIX] Removed destructive `closer.Close()` call in `exchangeHTTP`
-           retry path and added zero-progress read guard (`maxZeroReads = 64`).
-  1.36.0 - [SECURITY/FIX] Fixed stale QUIC connection flush in `exchangeHTTP` retry path.
+  1.37.0 - [SECURITY/FIX] Added zero-progress read guard (`maxZeroReads = 64`).
 */
 
 package main
@@ -53,10 +51,6 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
-
-// ---------------------------------------------------------------------------
-// TCP / DoT connection reuse (Multiplexing Pool)
-// ---------------------------------------------------------------------------
 
 const (
 	maxIdleStreamConns = 10
@@ -171,33 +165,27 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 	check0x20 := u.DNS0x20 && u.Proto != "dot"
 
 	executeExchange := func(conn *dns.Conn) (*dns.Msg, bool, error) {
-		var connReturned atomic.Bool
-		doneReading := make(chan struct{})
-
-		go func(c *dns.Conn) {
-			select {
-			case <-doneReading:
-				return
-			case <-ctx.Done():
-				if connReturned.CompareAndSwap(false, true) {
-					c.Close()
-				}
+		var connClosed atomic.Bool
+		closeOnce := func() {
+			if connClosed.CompareAndSwap(false, true) {
+				_ = conn.Close()
 			}
-		}(conn)
+		}
+		stopCancel := context.AfterFunc(ctx, closeOnce)
 
 		conn.SetDeadline(deadline)
 
 		if err := conn.WriteMsg(req); err != nil {
-			close(doneReading)
-			conn.Close()
+			stopCancel()
+			closeOnce()
 			return nil, false, fmt.Errorf("write msg: %w", err)
 		}
 
 		resp, err := conn.ReadMsg()
-		close(doneReading)
 
 		if err != nil || resp == nil {
-			conn.Close()
+			stopCancel()
+			closeOnce()
 			if err == nil {
 				err = errors.New("empty response")
 			} else {
@@ -207,7 +195,8 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 		}
 
 		if valErr := u.validateUpstreamResponse(req, resp, true, check0x20, false); valErr != nil {
-			conn.Close()
+			stopCancel()
+			closeOnce()
 			return nil, false, valErr
 		}
 
@@ -216,16 +205,11 @@ func (u *Upstream) exchangeStream(ctx context.Context, req *dns.Msg, dialAddr, t
 			echAccepted = tlsConn.ConnectionState().ECHAccepted
 		}
 
-		if ctx.Err() == nil {
-			if connReturned.CompareAndSwap(false, true) {
-				u.putStreamConn(poolKey, conn)
-			} else {
-				conn.Close()
-			}
+		// Return to pool only if AfterFunc was stopped before firing and ctx is still live.
+		if stopCancel() && ctx.Err() == nil && connClosed.CompareAndSwap(false, true) {
+			u.putStreamConn(poolKey, conn)
 		} else {
-			if connReturned.CompareAndSwap(false, true) {
-				conn.Close()
-			}
+			closeOnce()
 		}
 
 		return resp, echAccepted, nil
@@ -338,22 +322,15 @@ func (u *Upstream) exchangeHTTP(ctx context.Context, req *dns.Msg, targetURL str
 			return nil, false, doErr
 		}
 
-		doneBody := make(chan struct{})
 		var bodyClosed atomic.Bool
 		closeBody := func() {
 			if bodyClosed.CompareAndSwap(false, true) {
 				_ = resp.Body.Close()
 			}
 		}
-		go func() {
-			select {
-			case <-doneBody:
-			case <-reqCtx.Done():
-				closeBody()
-			}
-		}()
+		stopBodyCancel := context.AfterFunc(reqCtx, closeBody)
 		defer func() {
-			close(doneBody)
+			stopBodyCancel()
 			closeBody()
 		}()
 
@@ -662,6 +639,13 @@ func (u *Upstream) doqStreamExchange(ctx context.Context, conn *quic.Conn, req *
 		return nil, fmt.Errorf("open stream: %w", err)
 	}
 	defer stream.CancelRead(0)
+
+	stopStreamCancel := context.AfterFunc(streamCtx, func() {
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		_ = stream.SetDeadline(time.Now())
+	})
+	defer stopStreamCancel()
 
 	deadline, ok := streamCtx.Deadline()
 	if !ok {

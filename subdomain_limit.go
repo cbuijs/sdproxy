@@ -1,28 +1,23 @@
 /*
 File:    subdomain_limit.go
-Version: 1.5.0
-Last Updated: 25-Oct-2026 16:05 CET
+Version: 1.6.0
+Last Updated: 24-Nov-2026 12:56 CET
 
 Description:
   Subdomain Rate Limiting engine for sdproxy.
-  Tracks unique subdomains queried per (client/subnet, apex domain) natively.
-  Mitigates DNS tunneling and info-stealer exfiltration where sensitive 
-  data is smuggled via dynamically generated label prefixes, while preventing
-  cross-client denial of service.
+  Tracks unique subdomains queried per (client/subnet, apex domain) to mitigate
+  DNS tunneling and info-stealer exfiltration without cross-client DoS.
 
 Changes:
+  1.6.0 - [FIX/PERF] Precomputed `sdlMaxPerShard` with ceiling division once in
+          `InitSubdomainLimit`, and guarded `windowStart` comparisons against
+          backward NTP wall-clock jumps (`now < bucket.windowStart`).
   1.5.0 - [SECURITY/FIX] Partitioned subdomain limiter tracking by `(client subnet, apex)`
-          via `sdlKey` instead of `apex` alone. Prevents a single malicious or infected
-          client from triggering an apex block that denies service to all other clients
-          sharing the resolver. IPv6 clients are grouped by `/64` prefix to prevent
-          SLAAC privacy-address rotation bypasses.
-  1.4.0 - [SECURITY/FIX] Fixed `exempt:` domain matching in `AnalyzeSubdomainLimit`
-          and `addSDLExempt` via a label-by-label suffix walk (`isSDLExempt`).
-  1.3.0 - [FEAT] Added support for `cfg.Server.SubdomainLimit.ExemptSharedHosting`.
-  1.2.0 - [SECURITY/FIX] Prevented newly created `sdlBucket` entries from evicting
-          active or blocked buckets before `bucket.blocked` expires.
-  1.1.0 - [SECURITY/FIX] Replaced sliding `lastUpdate` window checks with a fixed 
-          `windowStart` anchor.
+          via `sdlKey` and `/64` IPv6 grouping.
+  1.4.0 - [SECURITY/FIX] Fixed `exempt:` domain matching via `isSDLExempt` suffix walk.
+  1.3.0 - [FEAT] Added `cfg.Server.SubdomainLimit.ExemptSharedHosting`.
+  1.2.0 - [SECURITY/FIX] Protected blocked buckets from premature eviction.
+  1.1.0 - [SECURITY/FIX] Replaced sliding `lastUpdate` window with fixed `windowStart`.
   1.0.0 - Initial implementation.
 */
 
@@ -39,8 +34,6 @@ import (
 
 const sdlShardCount = 64
 
-// sdlKey isolates subdomain tracking per client/subnet and apex domain so one
-// client cannot DoS an apex domain for other clients on the network.
 type sdlKey struct {
 	client netip.Addr
 	apex   string
@@ -59,12 +52,12 @@ type sdlShard struct {
 }
 
 var (
-	sdlShards   [sdlShardCount]*sdlShard
-	sdlHashSeed maphash.Seed
-	sdlExempt   map[string]bool
+	sdlShards      [sdlShardCount]*sdlShard
+	sdlHashSeed    maphash.Seed
+	sdlExempt      map[string]bool
+	sdlMaxPerShard int
 )
 
-// addSDLExempt registers one or more comma-separated domain suffixes in sdlExempt.
 func addSDLExempt(raw string) {
 	for _, part := range strings.Split(raw, ",") {
 		clean := strings.ToLower(strings.Trim(strings.TrimSpace(part), "."))
@@ -76,8 +69,6 @@ func addSDLExempt(raw string) {
 	}
 }
 
-// isSDLExempt performs a zero-allocation label-by-label suffix walk over qname
-// and also checks the extracted apex.
 func isSDLExempt(qname, apex string) bool {
 	if len(sdlExempt) == 0 {
 		return false
@@ -99,9 +90,6 @@ func isSDLExempt(qname, apex string) bool {
 	return false
 }
 
-// groupSDLIP normalizes the client address for subdomain limit tracking.
-// IPv4 addresses are tracked per /32; IPv6 addresses are masked to /64 so
-// SLAAC privacy-extension address rotation cannot evade per-client limits.
 func groupSDLIP(addr netip.Addr) netip.Addr {
 	if !addr.IsValid() {
 		return addr
@@ -115,14 +103,18 @@ func groupSDLIP(addr netip.Addr) netip.Addr {
 	return addr
 }
 
-// InitSubdomainLimit initializes the trackers and bounds needed to defend against
-// DNS tunneling across dynamic subdomains organically.
 func InitSubdomainLimit() {
 	if !cfg.Server.SubdomainLimit.Enabled {
 		return
 	}
 	hasSubdomainLimit = true
 	sdlHashSeed = maphash.MakeSeed()
+
+	maxKeys := cfg.Server.SubdomainLimit.MaxTrackedApexes
+	if maxKeys <= 0 {
+		maxKeys = 10000
+	}
+	sdlMaxPerShard = max((maxKeys+sdlShardCount-1)/sdlShardCount, 1)
 
 	for i := 0; i < sdlShardCount; i++ {
 		sdlShards[i] = &sdlShard{
@@ -148,13 +140,12 @@ func InitSubdomainLimit() {
 
 	if logSystem {
 		log.Printf("[SUBDOMAIN-LIMIT] Active: Threshold %d unique subdomains per %d mins | Max Tracked Keys: %d | Exempt Rules: %d (User: %d) | Exempt Shared Hosting: %v | Action: %s",
-			cfg.Server.SubdomainLimit.Threshold, cfg.Server.SubdomainLimit.WindowMinutes, cfg.Server.SubdomainLimit.MaxTrackedApexes, len(sdlExempt), len(cfg.Server.SubdomainLimit.Exempt), cfg.Server.SubdomainLimit.ExemptSharedHosting, cfg.Server.SubdomainLimit.Action)
+			cfg.Server.SubdomainLimit.Threshold, cfg.Server.SubdomainLimit.WindowMinutes, maxKeys, len(sdlExempt), len(cfg.Server.SubdomainLimit.Exempt), cfg.Server.SubdomainLimit.ExemptSharedHosting, cfg.Server.SubdomainLimit.Action)
 	}
 
 	go runSubdomainLimitSweeper()
 }
 
-// getSDLShard calculates the O(1) lock boundary for the provided (client, apex) key.
 func getSDLShard(key sdlKey) *sdlShard {
 	h := maphash.String(sdlHashSeed, key.apex)
 	if key.client.IsValid() {
@@ -164,8 +155,6 @@ func getSDLShard(key sdlKey) *sdlShard {
 	return sdlShards[h&(sdlShardCount-1)]
 }
 
-// AnalyzeSubdomainLimit evaluates if a specific client/subnet has exceeded
-// its allotted unique subdomains threshold for the target apex domain.
 func AnalyzeSubdomainLimit(clientAddr netip.Addr, qname string) (bool, string) {
 	apex, _ := extractETLDPlusOne(qname)
 	if apex == "" || apex == qname {
@@ -203,11 +192,7 @@ func AnalyzeSubdomainLimit(clientAddr netip.Addr, qname string) (bool, string) {
 
 	bucket, exists := shard.buckets[key]
 	if !exists {
-		maxPerShard := cfg.Server.SubdomainLimit.MaxTrackedApexes / sdlShardCount
-		if maxPerShard < 1 {
-			maxPerShard = 1
-		}
-		if len(shard.buckets) >= maxPerShard {
+		if len(shard.buckets) >= sdlMaxPerShard {
 			var (
 				bestKey       sdlKey
 				bestTS        int64
@@ -216,7 +201,7 @@ func AnalyzeSubdomainLimit(clientAddr netip.Addr, qname string) (bool, string) {
 				sampled       int
 			)
 			for k, b := range shard.buckets {
-				unblocked := !b.blocked || (now-b.windowStart > windowNanos)
+				unblocked := !b.blocked || now < b.windowStart || (now-b.windowStart > windowNanos)
 				better := !bestFound ||
 					(unblocked && !bestUnblocked) ||
 					(unblocked == bestUnblocked && b.lastUpdate < bestTS)
@@ -241,7 +226,7 @@ func AnalyzeSubdomainLimit(clientAddr netip.Addr, qname string) (bool, string) {
 		shard.buckets[key] = bucket
 	}
 
-	if now-bucket.windowStart > windowNanos {
+	if now < bucket.windowStart || now-bucket.windowStart > windowNanos {
 		clear(bucket.subs)
 		bucket.blocked = false
 		bucket.windowStart = now
@@ -264,8 +249,6 @@ func AnalyzeSubdomainLimit(clientAddr netip.Addr, qname string) (bool, string) {
 	return true, ""
 }
 
-// runSubdomainLimitSweeper ensures inactive tracking objects are garbage collected
-// natively without waiting for arbitrary access operations.
 func runSubdomainLimitSweeper() {
 	windowNanos := int64(cfg.Server.SubdomainLimit.WindowMinutes) * 60 * 1e9
 	ticker := time.NewTicker(5 * time.Minute)
@@ -281,7 +264,7 @@ func runSubdomainLimitSweeper() {
 				shard := sdlShards[i]
 				shard.Lock()
 				for k, b := range shard.buckets {
-					if b.lastUpdate < horizon && (!b.blocked || now-b.windowStart > windowNanos) {
+					if (now < b.lastUpdate || b.lastUpdate < horizon) && (!b.blocked || now < b.windowStart || now-b.windowStart > windowNanos) {
 						delete(shard.buckets, k)
 					}
 				}

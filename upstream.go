@@ -1,45 +1,32 @@
 /*
 File:    upstream.go
-Version: 2.58.0 (Split)
-Last Updated: 18-Nov-2026 12:00 CET
+Version: 2.59.0 (Split)
+Last Updated: 24-Nov-2026 14:30 CET
 
 Description:
-  Core data structures, contexts, and lightweight hot-path utilities for 
+  Core data structures, contexts, and lightweight hot-path utilities for
   external DNS upstream providers.
 
 Changes:
+  2.59.0 - [CONCURRENCY/FIX] Added `lastProbeNano` and `claimRecoveryProbe` on
+           `Upstream` to support throttled non-blocking health recovery probes
+           for unhealthy pool members, capped `consFails` growth to prevent
+           integer overflow, and extended `SweepUpstreamConns` to also reap
+           idle connections on `globalBootstrapServers`.
   2.58.0 - [SECURITY/FIX] Added `no0RTTVerified` atomic latch and `lockNo0RTT()` /
-           `revertUnverifiedNo0RTT()` helpers on `Upstream` so a concurrent
-           failing goroutine can never revert `no0RTT` back to `false` once any
-           peer goroutine has verified that 1-RTT (`Allow0RTT: false`) succeeded.
-  2.57.0 - [FEAT/FIX] Unified `doqNo0RTT` into `no0RTT` across all QUIC-based
-           upstream protocols (`doq`, `doh3`, and upgraded `doh`) and added
-           `dialQUIC` so QUIC upstreams dynamically disable `Allow0RTT`
-           (switching from `quic.DialAddrEarly` to `quic.DialAddr`) and keep it
-           disabled for that upstream when 0-RTT / H3 frame errors occur.
-  2.56.0 - [FEAT] Added `DoH3FallbackThreshold` (`doh3_fallback_threshold`),
-           `dohAvailable`, and `dohSticky` fields to `Upstream` / `UpstreamGroup`
-           and updated `getUpstreamURL` to reflect sticky downgrade to `doh`
-           when an upgraded `doh://` or explicit `doh3://` upstream latches onto
-           standard DoH.
-  2.55.0 - [SECURITY/FIX] Enforced RFC 7873 §5.2.2 length and hex-character
-           validation on received `EDNS0_COOKIE` payloads in `validateUpstreamResponse`,
-           rejecting malformed or odd-length cookie options.
-  2.54.0 - [SECURITY/FIX] Closed idle HTTP/3 QUIC sessions (`CloseIdleConnections`)
-           on `h3Client` and `h3ClientNoECH` in `SweepUpstreamConns` so stale
-           QUIC connections after WAN/NAT rebindings are periodically reaped.
-  2.53.0 - [SECURITY/FIX] Set `fwd.Id = 0` in `prepareForwardQuery` for DoQ
-           (RFC 9250 §4.2.1 mandatory `ID=0`), DoH, and DoH3 (RFC 8484 §4.1
-           recommended `ID=0`) upstreams, and tightened RFC 7873 Server Cookie
-           validation in `validateUpstreamResponse`.
-  2.52.0 - [SECURITY/FIX] Added `stripEDNS0Cookie` helper so UDP `TC=1` -> TCP
-           fallback queries strip UDP-only `EDNS0_COOKIE` options before
-           transmitting over TCP.
+           `revertUnverifiedNo0RTT()` helpers on `Upstream`.
+  2.57.0 - [FEAT/FIX] Unified `no0RTT` across all QUIC-based upstream protocols
+           and added `dialQUIC`.
+  2.56.0 - [FEAT] Added `DoH3FallbackThreshold`, `dohAvailable`, and `dohSticky`
+           fields to `Upstream` / `UpstreamGroup`.
+  2.55.0 - [SECURITY/FIX] Enforced RFC 7873 §5.2.2 length and hex validation on
+           received `EDNS0_COOKIE` payloads in `validateUpstreamResponse`.
+  2.54.0 - [SECURITY/FIX] Closed idle HTTP/3 QUIC sessions in `SweepUpstreamConns`.
+  2.53.0 - [SECURITY/FIX] Set `fwd.Id = 0` for DoQ, DoH, and DoH3 upstreams.
+  2.52.0 - [SECURITY/FIX] Added `stripEDNS0Cookie` helper for UDP->TCP fallback.
   2.51.0 - [SECURITY/FEAT] Implemented Transport & Protocol Cache-Poisoning Defenses.
   2.50.0 - [SECURITY/FIX] Set `SourceScope: 255` internal pre-validated marker in
-           `injectPassedECS` and used `CloseIdleConnections()` in `SweepUpstreamConns`.
-  2.49.0 - [SECURITY/FIX] Removed the `!clientAddr.IsValid()` exemption in
-           `prepareForwardQuery` when `action == "pass"`.
+           `injectPassedECS`.
 */
 
 package main
@@ -157,22 +144,33 @@ type Upstream struct {
 	doqMu        sync.Mutex
 	doqDialGroup singleflight.Group
 
-	consFails atomic.Int32
+	consFails     atomic.Int32
+	lastProbeNano atomic.Int64
 
 	emaRTT atomic.Int64
 
-	// no0RTT disables QUIC 0-RTT (Allow0RTT = false, using quic.DialAddr instead
-	// of quic.DialAddrEarly) for this upstream. Once a 1-RTT retry succeeds,
-	// no0RTTVerified latches permanently so concurrent callers cannot revert it.
 	no0RTT         atomic.Bool
 	no0RTTVerified atomic.Bool
 }
 
 func (u *Upstream) recordSuccess() { u.consFails.Store(0) }
-func (u *Upstream) recordFailure() { u.consFails.Add(1) }
+
+func (u *Upstream) recordFailure() {
+	if u.consFails.Load() < 1000 {
+		u.consFails.Add(1)
+	}
+}
+
 func (u *Upstream) isHealthy() bool { return u.consFails.Load() < healthThreshold }
 
-// lockNo0RTT permanently latches no0RTT to true once a 1-RTT retry succeeds.
+func (u *Upstream) claimRecoveryProbe(nowNano, cooldownNano int64) bool {
+	last := u.lastProbeNano.Load()
+	if nowNano-last < cooldownNano {
+		return false
+	}
+	return u.lastProbeNano.CompareAndSwap(last, nowNano)
+}
+
 func (u *Upstream) lockNo0RTT() {
 	if u == nil {
 		return
@@ -181,8 +179,6 @@ func (u *Upstream) lockNo0RTT() {
 	u.no0RTT.Store(true)
 }
 
-// revertUnverifiedNo0RTT reverts no0RTT to false only if no peer goroutine has
-// permanently verified 1-RTT success.
 func (u *Upstream) revertUnverifiedNo0RTT() {
 	if u == nil || u.no0RTTVerified.Load() {
 		return
@@ -193,9 +189,6 @@ func (u *Upstream) revertUnverifiedNo0RTT() {
 	}
 }
 
-// dialQUIC dials a QUIC connection to targetAddr, using 0-RTT (quic.DialAddrEarly
-// with Allow0RTT = true) when u.no0RTT is false, and standard 1-RTT (quic.DialAddr
-// with Allow0RTT = false) when u.no0RTT is true.
 func (u *Upstream) dialQUIC(ctx context.Context, targetAddr string, tlsCfg *tls.Config, qCfg *quic.Config) (*quic.Conn, error) {
 	var cfgCopy quic.Config
 	if qCfg != nil {
@@ -208,10 +201,6 @@ func (u *Upstream) dialQUIC(ctx context.Context, targetAddr string, tlsCfg *tls.
 	cfgCopy.Allow0RTT = true
 	return quic.DialAddrEarly(ctx, targetAddr, tlsCfg, &cfgCopy)
 }
-
-// ---------------------------------------------------------------------------
-// newUpstreamCtx — per-exchange context factory
-// ---------------------------------------------------------------------------
 
 func newUpstreamCtx() (context.Context, context.CancelFunc) {
 	timeout := upstreamTimeout
@@ -249,9 +238,9 @@ func randomizeCase0x20(s string) string {
 				bitIdx = 0
 			}
 			if (r>>bitIdx)&1 == 1 {
-				b[i] = c &^ 0x20 // Uppercase
+				b[i] = c &^ 0x20
 			} else {
-				b[i] = c | 0x20 // Lowercase
+				b[i] = c | 0x20
 			}
 			bitIdx++
 		}
@@ -302,9 +291,6 @@ func isValidHexString(s string) bool {
 	return true
 }
 
-// validateUpstreamResponse enforces strict RFC protocol, Question, 0x20,
-// DNS Cookie, and DNSSEC AD/RRSIG invariants on every upstream reply before
-// it is accepted by the transport layer.
 func (u *Upstream) validateUpstreamResponse(fwd, resp *dns.Msg, checkID bool, check0x20 bool, checkCookie bool) error {
 	if resp == nil {
 		return fmt.Errorf("nil upstream response")
@@ -352,8 +338,6 @@ func (u *Upstream) validateUpstreamResponse(fwd, resp *dns.Msg, checkID bool, ch
 			if !strings.HasPrefix(gotCookie, u.clientCookieHex) {
 				return fmt.Errorf("upstream DNS cookie client-prefix mismatch")
 			}
-			// RFC 7873 §5.2.2: Cookie option must be either 8 bytes (16 hex chars,
-			// Client Cookie only) or 16..40 bytes (32..80 even hex chars, Client + Server Cookie).
 			if (len(gotCookie) != 16 && (len(gotCookie) < 32 || len(gotCookie) > 80)) || !isValidHexString(gotCookie) {
 				return fmt.Errorf("upstream DNS cookie malformed length or hex (%d chars)", len(gotCookie))
 			}
@@ -410,7 +394,7 @@ func injectPassedECS(req *dns.Msg, ecsAddr netip.Addr, ecsPrefix netip.Prefix) {
 		Code:          dns.EDNS0SUBNET,
 		Family:        family,
 		SourceNetmask: uint8(bits),
-		SourceScope:   255, // Internal pre-validated marker (reset to 0 in prepareForwardQuery)
+		SourceScope:   255,
 		Address:       p.Masked().Addr().AsSlice(),
 	})
 }
@@ -626,6 +610,56 @@ func InitUpstreamSweeper() {
 	}()
 }
 
+func (u *Upstream) sweepIdleConns(now time.Time, connsToClose *[]*dns.Conn, doqToClose *[]*doqConnEntry) {
+	if u == nil {
+		return
+	}
+	u.streamMu.Lock()
+	for addr, conns := range u.streamConns {
+		active := conns[:0]
+		for _, entry := range conns {
+			if now.Sub(entry.idleAt) > streamIdleMax {
+				*connsToClose = append(*connsToClose, entry.conn)
+			} else {
+				active = append(active, entry)
+			}
+		}
+
+		for i := len(active); i < len(conns); i++ {
+			conns[i] = nil
+		}
+
+		if len(active) == 0 {
+			delete(u.streamConns, addr)
+		} else {
+			u.streamConns[addr] = active
+		}
+	}
+	u.streamMu.Unlock()
+
+	u.doqMu.Lock()
+	for key, entry := range u.doqConns {
+		if now.Sub(entry.idleAt) > doqIdleMax {
+			*doqToClose = append(*doqToClose, entry)
+			delete(u.doqConns, key)
+		}
+	}
+	u.doqMu.Unlock()
+
+	if u.h2Client != nil {
+		u.h2Client.CloseIdleConnections()
+	}
+	if u.h2ClientNoECH != nil {
+		u.h2ClientNoECH.CloseIdleConnections()
+	}
+	if u.h3Client != nil {
+		u.h3Client.CloseIdleConnections()
+	}
+	if u.h3ClientNoECH != nil {
+		u.h3ClientNoECH.CloseIdleConnections()
+	}
+}
+
 func SweepUpstreamConns() {
 	var connsToClose []*dns.Conn
 	var doqToClose []*doqConnEntry
@@ -634,51 +668,11 @@ func SweepUpstreamConns() {
 
 	for _, group := range routeUpstreams {
 		for _, u := range group.Servers {
-			u.streamMu.Lock()
-			for addr, conns := range u.streamConns {
-				active := conns[:0]
-				for _, entry := range conns {
-					if now.Sub(entry.idleAt) > streamIdleMax {
-						connsToClose = append(connsToClose, entry.conn)
-					} else {
-						active = append(active, entry)
-					}
-				}
-
-				for i := len(active); i < len(conns); i++ {
-					conns[i] = nil
-				}
-
-				if len(active) == 0 {
-					delete(u.streamConns, addr)
-				} else {
-					u.streamConns[addr] = active
-				}
-			}
-			u.streamMu.Unlock()
-
-			u.doqMu.Lock()
-			for key, entry := range u.doqConns {
-				if now.Sub(entry.idleAt) > doqIdleMax {
-					doqToClose = append(doqToClose, entry)
-					delete(u.doqConns, key)
-				}
-			}
-			u.doqMu.Unlock()
-
-			if u.h2Client != nil {
-				u.h2Client.CloseIdleConnections()
-			}
-			if u.h2ClientNoECH != nil {
-				u.h2ClientNoECH.CloseIdleConnections()
-			}
-			if u.h3Client != nil {
-				u.h3Client.CloseIdleConnections()
-			}
-			if u.h3ClientNoECH != nil {
-				u.h3ClientNoECH.CloseIdleConnections()
-			}
+			u.sweepIdleConns(now, &connsToClose, &doqToClose)
 		}
+	}
+	for _, u := range globalBootstrapServers {
+		u.sweepIdleConns(now, &connsToClose, &doqToClose)
 	}
 
 	for _, c := range connsToClose {

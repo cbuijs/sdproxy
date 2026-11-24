@@ -1,51 +1,31 @@
 /*
 File:    process.go
-Version: 3.157.0
-Last Updated: 18-Nov-2026 16:00 CET
+Version: 3.158.0
+Last Updated: 24-Nov-2026 12:56 CET
 
 Description:
   Master orchestrator for the sdproxy per-query DNS resolution pipeline.
 
 Changes:
+  3.158.0 - [FIX] Fixed multi-hop `client_name` route chaining in `ProcessDNS`:
+            when a MAC/IP/CIDR route overrides `client_name`, `ProcessDNS` now
+            explicitly evaluates `clientNameRoutes[clientNameLower]` alongside
+            `resolveClientRoute` (which otherwise re-matched the higher-precedence
+            IP/MAC rule), properly merging or promoting attributes defined on
+            the target `client_name` route.
   3.157.0 - [SECURITY/FIX] Re-evaluated group-specific `rrs:` in Step 1.6
-            (`handleSpoofedRecords`) whenever a global `rrs:` CNAME alias
-            rewrote `qNameTrimmed`, and ensured `ResolveStateKeyAndGroup` is
-            consistent before Step 1.8 (`CheckRules`).
-  3.156.0 - [SECURITY/FIX] Re-evaluated `ResolveStateKeyAndGroup` (`sk`, `clientGroup`)
-            after `handleSpoofedRecords` whenever a global `rrs:` CNAME alias
-            happened to match the initial query and rewrote `qNameTrimmed`, and
-            verified whether the client's parental `clientGroup` has its own
-            group-specific `rrs:` targeting the rewritten domain (up to 4 hops).
-  3.155.0 - [CLEANUP] Removed unreachable dead code in Step 2 (`if routeCtx.clientName != "" && routeCtx.clientName != clientName`).
-            Because the 3-hop `resolveClientRoute` loop prior to Step 1.6 already
-            resolves all `client_name` overrides to a fixed point and passes the
-            resolved `clientName` and `clientRoute` into `determineRouting`,
-            `routeCtx.clientName` is always identical to `clientName` on return.
-  3.154.0 - [SECURITY/FIX] Executed `handleSpoofedRecords` (`hasRRs`) inside
-            Step 1.6 whenever a client route (`resolveClientRoute`) overrides
-            `clientName` and assigns the client to a new parental `clientGroup`
-            with group-specific `rrs:`. Previously, if `determineRouting` did
-            not further change `routeCtx.clientName`, group `rrs:` were only
-            evaluated against the pre-override `clientGroup`.
-  3.153.0 - [SECURITY/FIX] Added `lateForce` and `lateBypassLocal` propagation
-            across multi-hop `resolveClientRoute` loops in `ProcessDNS`.
-  3.152.0 - [SECURITY/FIX] Prevented an unforced `client_name` route (`!crNext.Force`)
-            from overriding `HasRcode`, `BypassLocal`, or `BypassGlobal` on a
-            higher-precedence `force: true` route (`clientRoute.Force == true`)
-            during multi-hop `client_name` resolution in `ProcessDNS`.
-  3.151.0 - [SECURITY/FIX] Re-evaluated `routeCtx.routeName` and `routeCtx.routeIdx`
-            against `domainRoutes` (`walkDomainMaps`) when a late group `rrs:`
-            CNAME rewrite (`lateQNameChanged`) changes `qNameTrimmed` from a
-            domain that previously matched a `domain_routes` entry to an alias
-            that does not match `domain_routes`.
-  3.150.0 - [REFACTOR/FIX] Consolidated multi-hop `client_name` override
-            propagation in `ProcessDNS` into bounded 3-hop resolution loops
-            for both the initial client-route lookup and the post-`determineRouting`
-            late client-route lookup.
-  3.149.0 - [SECURITY/FIX] Added third-hop `ClientName` propagation and
-            `resolveClientRoute` (`crLate3`) lookup inside `ProcessDNS`.
-  3.148.0 - [SECURITY/FIX] Implemented a second-hop `resolveClientRoute` (`crLate2`)
-            pass inside `ProcessDNS`.
+            whenever a global `rrs:` CNAME alias rewrote `qNameTrimmed`.
+  3.156.0 - [SECURITY/FIX] Multi-hop `rrs:` evaluation up to 4 hops.
+  3.155.0 - [CLEANUP] Removed unreachable dead code in Step 2.
+  3.154.0 - [SECURITY/FIX] Executed `handleSpoofedRecords` after `client_name`
+            group overrides.
+  3.153.0 - [SECURITY/FIX] Added `Force` and `BypassLocal` propagation across
+            multi-hop `resolveClientRoute` loops.
+  3.152.0 - [SECURITY/FIX] Prevented unforced `client_name` routes from overriding
+            forced route attributes.
+  3.151.0 - [SECURITY/FIX] Re-evaluated `domainRoutes` on rewritten aliases.
+  3.150.0 - [REFACTOR/FIX] Consolidated multi-hop `client_name` loops.
+  3.149.0 - [SECURITY/FIX] Added third-hop `ClientName` propagation.
 */
 
 package main
@@ -253,31 +233,50 @@ func ProcessDNS(w dns.ResponseWriter, r *dns.Msg, clientIP, protocol, sni, path 
 		clientID = appendClientEDNS(buildClientID(clientIP, clientName, clientAddr), ecsAddr, ecsPrefix, ednsMAC)
 		sk, clientGroup = ResolveStateKeyAndGroup(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientName, clientNameLower, sni, sniLower, path, pathLower, localPort)
 
-		crNext, okNext, origNext := resolveClientRoute(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientNameLower, sniLower, pathLower, localPort)
+		var crNext ParsedRoute
+		var okNext bool
+		var origNext string
+
+		if crFull, okFull, origFull := resolveClientRoute(clientMAC, ednsMAC, clientIP, clientAddr, ecsAddr, ecsPrefix, clientNameLower, sniLower, pathLower, localPort); okFull {
+			if strings.Contains(origFull, "CLIENT-NAME") {
+				crNext, okNext, origNext = crFull, true, origFull
+			}
+		}
+		if !okNext && hasClientNameRoutes {
+			if cnRoute, cnOK := clientNameRoutes[clientNameLower]; cnOK {
+				crNext, okNext, origNext = cnRoute, true, "CLIENT-NAME"
+			}
+		}
 		if !okNext {
 			break
 		}
-		if crNext.Force && (!clientRoute.Force || origNext == "CLIENT-NAME") {
-			if crNext.ClientName == "" {
+
+		if crNext.Force && (!clientRoute.Force || strings.Contains(origNext, "CLIENT-NAME")) {
+			nextName := crNext.ClientName
+			if nextName == "" {
 				crNext.ClientName = clientName
 			}
 			mergeClientRouteAttrs(&crNext, clientRoute)
-			clientRoute, clientRouteMatched, routeOriginType = crNext, okNext, origNext
-		} else {
-			if !clientRoute.Force {
-				mergeClientRouteAttrs(&clientRoute, crNext)
-				if crNext.ClientName != "" && crNext.ClientName != clientName {
-					clientRoute.ClientName = crNext.ClientName
-					bypassGlobal = clientRoute.BypassGlobal
-					continue
-				}
-			} else if clientRoute.Upstream == "" && crNext.Upstream != "" && !clientRoute.HasRcode {
-				clientRoute.Upstream = crNext.Upstream
-			}
+			clientRoute, clientRouteMatched, routeOriginType = crNext, true, origNext
 			bypassGlobal = clientRoute.BypassGlobal
+			if nextName != "" && nextName != clientName {
+				continue
+			}
 			break
 		}
+
+		if !clientRoute.Force {
+			mergeClientRouteAttrs(&clientRoute, crNext)
+			bypassGlobal = clientRoute.BypassGlobal
+			if crNext.ClientName != "" && crNext.ClientName != clientName {
+				clientRoute.ClientName = crNext.ClientName
+				continue
+			}
+		} else if clientRoute.Upstream == "" && crNext.Upstream != "" && !clientRoute.HasRcode {
+			clientRoute.Upstream = crNext.Upstream
+		}
 		bypassGlobal = clientRoute.BypassGlobal
+		break
 	}
 	if clientRouteMatched && clientRoute.Upstream == "" && clientGroup != "" && !clientRoute.HasRcode {
 		if grp, ok := cfg.Groups[clientGroup]; ok {

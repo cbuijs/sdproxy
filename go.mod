@@ -7,7 +7,7 @@ go 1.26.0
 
 require (
 	github.com/miekg/dns v1.1.73
-	github.com/quic-go/quic-go v0.65.0
+	github.com/quic-go/quic-go v0.66.0
 	golang.org/x/net v0.63.0
 	golang.org/x/sync v0.25.0
 	golang.org/x/sys v0.50.0

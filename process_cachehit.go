@@ -1,7 +1,7 @@
 /*
 File:    process_cachehit.go
-Version: 1.38.0 (Split)
-Last Updated: 23-Nov-2026 14:30 CET
+Version: 1.39.0 (Split)
+Last Updated: 24-Nov-2026 12:56 CET
 
 Description:
   Cache-hit serving stage for the sdproxy resolution pipeline.
@@ -9,30 +9,27 @@ Description:
   post-cache policy re-checks, and client response dispatch.
 
 Changes:
+  1.39.0 - [FIX] Recorded `IncrCacheLookup()` in `serveFromCache` whenever
+           `cfg.Cache.Enabled` is active so `GetStats()` (`stats.go`) computes
+           `CacheHitRate` against actual cache lookups (`0%..100%`) rather than
+           `total - blocked`, preventing `>100%` or missing rates when cached
+           synthetic blocks or `LOG`-mode rules fire.
   1.38.0 - [SECURITY/PERF] Consumed `isSynth` directly from `CacheGet`
            (`cache_rw.go` 1.50.0) in `serveFromCache` and `isCachedSynthBlock`.
-           Eliminates redundant `isCachedSyntheticItem` shard locks and TOCTOU
-           races, and ensures passive `for_sale`, `parked`, and `rfc_compliance`
-           checks also run on cached authoritative (`AA=1`) upstream responses.
-  1.37.0 - [SECURITY/FIX] Extended `isCachedSynthBlock` so any cached synthetic
-           `NOERROR` (`len(resp.Answer) == 0`) item (`routeName == ""`) that is
-           not a local-identity `NODATA` response is classified as a synthetic
-           policy block.
+  1.37.0 - [SECURITY/FIX] Extended `isCachedSynthBlock` for cached synthetic
+           `NOERROR` (`len(resp.Answer) == 0`) items.
   1.36.0 - [SECURITY/FIX] Aligned `RRSIG` stripping in `serveFromCache` with
-           `CacheSet` (`cache_rw.go`).
+           `CacheSet`.
   1.35.0 - [SECURITY/FIX] Added `isLocalIdentityPTR` helper in `isCachedSynthBlock`
            and checked `FilterAAAA` ahead of `BlockActionRcode`.
   1.34.0 - [SECURITY/FIX] Excluded cached `Filter AAAA` synthetic NODATA
-           responses from `checkCachedIDNViolation` inside `isCachedSynthBlock`.
+           responses from `checkCachedIDNViolation`.
   1.33.0 - [SECURITY/FIX] Added `isLocalIdentityNODATA` helper in `isCachedSynthBlock`.
-  1.32.0 - [SECURITY/FIX] Excluded cached local-identity `NODATA` responses
-           for non-A/AAAA query types in `isCachedSynthBlock`.
+  1.32.0 - [SECURITY/FIX] Excluded cached local-identity `NODATA` responses.
   1.31.0 - [SECURITY/FIX] Excluded cached local-identity `NULL-IP` responses
-           in `serveFromCache` from triggering `checkCachedIDNViolation`.
-  1.30.0 - [SECURITY/FIX] Extended `isCachedSynthBlock` so cached synthetic
-           `NULL-IP` responses also check `AnalyzeIDNHomograph`.
-  1.29.0 - [SECURITY/FIX] Updated `isCachedSynthBlock` to query the live cache
-           item's `routeName`.
+           from `checkCachedIDNViolation`.
+  1.30.0 - [SECURITY/FIX] Checked `AnalyzeIDNHomograph` on cached synthetic
+           `NULL-IP` responses.
 */
 
 package main
@@ -162,8 +159,6 @@ func (qc *queryCtx) checkCachedIDNViolation() (bool, string) {
 	return false, ""
 }
 
-// isCachedSynthBlock reports whether resp is a cached synthetic policy block
-// (`cache_synthetic: true`) rather than an upstream or local-identity response.
 func (qc *queryCtx) isCachedSynthBlock(resp *dns.Msg, isSynth bool) (isBlock bool, isCustomIP bool, isIDN bool, reason string) {
 	if !isSynth || !cacheSynthFlag || resp == nil || !resp.Authoritative || qc.bypassPolicies || qc.bypassGlobal {
 		return false, false, false, ""
@@ -238,6 +233,12 @@ func (qc *queryCtx) isCachedSynthBlock(resp *dns.Msg, isSynth bool) (isBlock boo
 }
 
 func (qc *queryCtx) serveFromCache() bool {
+	if !cfg.Cache.Enabled {
+		return false
+	}
+
+	IncrCacheLookup()
+
 	poolMsg := msgPool.Get().(*dns.Msg)
 	*poolMsg = dns.Msg{}
 
@@ -248,6 +249,8 @@ func (qc *queryCtx) serveFromCache() bool {
 	}
 
 	defer msgPool.Put(poolMsg)
+
+	IncrCacheHit()
 
 	if !isSynth {
 		if qc.enforceForSaleResponseCheck(poolMsg, true) {
@@ -260,8 +263,6 @@ func (qc *queryCtx) serveFromCache() bool {
 			return true
 		}
 	}
-
-	IncrCacheHit()
 
 	if !qc.doBit {
 		if qc.q.Qtype != dns.TypeRRSIG {

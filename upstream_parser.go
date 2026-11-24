@@ -1,38 +1,32 @@
 /*
 File:    upstream_parser.go
-Version: 2.59.0
-Last Updated: 18-Nov-2026 12:30 CET
+Version: 2.60.0
+Last Updated: 24-Nov-2026 14:30 CET
 
 Description:
   Configuration parsing, initialization, and client allocation for sdproxy upstreams.
-  Extracted from upstream.go to cleanly separate boot-time instantiation from 
-  the hot-path routing execution pipeline.
 
 Changes:
+  2.60.0 - [CRITICAL/SECURITY] Prevented `newDoHHTTP2Client` and `newDoHHTTP3Client`
+           from falling through to OS DNS resolution when explicit `BootstrapIPs`
+           are configured and all bootstrap dials fail, eliminating self-query
+           loopback deadlocks, plaintext DNS leaks, and uncancelable
+           `net.ResolveUDPAddr` blocks in QUIC.
+         - [SECURITY/FIX] Scoped `ech=` and `echdomain=` URL parameter extraction
+           strictly to `?`/`&` query tokens (preventing substring collisions such
+           as `?tech=`), supported `+get`/`+post` before query parameters, and
+           validated manual `ECHConfigList` blobs via `extractECHConfigs`.
   2.59.0 - [SECURITY/FIX] Populated `u.BootstrapIPs` on literal-IP `doh://` and
-           `doh3://` upstream URLs so `initProximityAddrs` (`init_core.go`)
-           includes literal-IP DoH/DoH3 upstreams when probing local outbound
-           source IP addresses, and validated IPv4/IPv6 compatibility on
-           literal-IP `doh://` and `doh3://` URLs at parse time.
+           `doh3://` upstream URLs and validated IPv4/IPv6 compatibility.
   2.58.0 - [FEAT/FIX] Extracted `newDoHHTTP3Client(u)` and routed HTTP/3 QUIC dials
-           for both `doh3://` and upgraded `doh://` upstreams through `u.dialQUIC`
-           with `Allow0RTT: true` initialized on `QUICConfig`, enabling dynamic
-           per-upstream 0-RTT disabling (`u.no0RTT`) when 0-RTT / H3 frame errors
-           occur.
-  2.57.0 - [FEAT/FIX] Extended direct-first ECH/ALPN discovery (`hasDirectIPs`)
-           to also cover literal-IP upstream URLs.
+           through `u.dialQUIC`.
+  2.57.0 - [FEAT/FIX] Extended direct-first ECH/ALPN discovery to literal-IP URLs.
   2.56.0 - [FEAT/SECURITY] Reordered ECH/DDR/ALPN discovery in `ParseUpstream`.
-  2.55.0 - [FEAT] Initialized an HTTP/2 fallback client (`h2Client` / `h2ClientNoECH`)
-           on `doh3://` upstreams.
-  2.54.0 - [CRITICAL/FIX] Configured explicit `ReadIdleTimeout: 10 * time.Second`
-           and `PingTimeout: 5 * time.Second` on `golang.org/x/net/http2.Transport`.
-  2.53.0 - [SECURITY/FEAT] Initialized a cryptographically random 64-bit RFC 7873
-           `clientCookieHex` and `streamConns` pool on `udp://` upstreams.
-  2.52.0 - [FIX] Enabled invalid manual ECH base64 warning in `ParseUpstream` when
-           `logSystem` or `logTLS` is active.
-  2.51.0 - [SECURITY/FIX] Fixed broken ECH injection on `h3Client` (DoH3 and upgraded DoH).
-  2.50.0 - [BUG/FIX] Corrected `quic.EarlyConnection` to `*quic.Conn` for all `http3.Transport.Dial`
-           implementations.
+  2.55.0 - [FEAT] Initialized an HTTP/2 fallback client on `doh3://` upstreams.
+  2.54.0 - [CRITICAL/FIX] Configured `ReadIdleTimeout` and `PingTimeout` on HTTP/2.
+  2.53.0 - [SECURITY/FEAT] Initialized random 64-bit RFC 7873 `clientCookieHex`.
+  2.52.0 - [FIX] Enabled invalid manual ECH base64 warning when `logSystem` or `logTLS`.
+  2.51.0 - [SECURITY/FIX] Fixed ECH injection on `h3Client`.
 */
 
 package main
@@ -57,10 +51,6 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// ---------------------------------------------------------------------------
-// Initialization & Parsing
-// ---------------------------------------------------------------------------
-
 func decodeBase64Flex(s string) ([]byte, error) {
 	if d, err := base64.RawURLEncoding.DecodeString(s); err == nil {
 		return d, nil
@@ -75,6 +65,12 @@ func decodeBase64Flex(s string) ([]byte, error) {
 }
 
 func stripMethodModifier(url string) (stripped string, useGET bool) {
+	if qIdx := strings.IndexByte(url, '?'); qIdx >= 0 {
+		base, get := stripMethodModifier(url[:qIdx])
+		if get || len(base) != qIdx {
+			return base + url[qIdx:], get
+		}
+	}
 	lower := strings.ToLower(url)
 	switch {
 	case strings.HasSuffix(lower, "+get"):
@@ -132,13 +128,19 @@ func newDoHHTTP2Client(u *Upstream) *http.Client {
 		DisableCompression:    true,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if len(u.BootstrapIPs) > 0 {
-				_, port, _ := net.SplitHostPort(addr)
+				_, port, err := net.SplitHostPort(addr)
+				if err != nil || port == "" {
+					port = "443"
+				}
+				var lastErr error
 				for _, ip := range u.BootstrapIPs {
-					conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
-					if err == nil {
+					conn, dErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+					if dErr == nil {
 						return conn, nil
 					}
+					lastErr = dErr
 				}
+				return nil, fmt.Errorf("doh: all bootstrap IPs failed for %s: %w", addr, lastErr)
 			}
 			return dialer.DialContext(ctx, network, addr)
 		},
@@ -160,13 +162,19 @@ func newDoHHTTP3Client(u *Upstream) *http.Client {
 			},
 			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, qCfg *quic.Config) (*quic.Conn, error) {
 				if len(u.BootstrapIPs) > 0 {
-					_, port, _ := net.SplitHostPort(addr)
+					_, port, err := net.SplitHostPort(addr)
+					if err != nil || port == "" {
+						port = "443"
+					}
+					var lastErr error
 					for _, ip := range u.BootstrapIPs {
-						conn, err := u.dialQUIC(ctx, net.JoinHostPort(ip, port), tlsCfg, qCfg)
-						if err == nil {
+						conn, dErr := u.dialQUIC(ctx, net.JoinHostPort(ip, port), tlsCfg, qCfg)
+						if dErr == nil {
 							return conn, nil
 						}
+						lastErr = dErr
 					}
+					return nil, fmt.Errorf("doh3: all bootstrap IPs failed for %s: %w", addr, lastErr)
 				}
 				return u.dialQUIC(ctx, addr, tlsCfg, qCfg)
 			},
@@ -177,33 +185,29 @@ func newDoHHTTP3Client(u *Upstream) *http.Client {
 func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 	u := &Upstream{}
 
-	parts := strings.Split(raw, "#")
+	parts := strings.SplitN(raw, "#", 2)
 	urlPart := parts[0]
 
 	var echBase64, echDomain string
-
-	if idx := strings.Index(urlPart, "echdomain="); idx >= 0 {
-		end := strings.IndexAny(urlPart[idx:], "&")
-		if end < 0 {
-			echDomain = urlPart[idx+10:]
-			urlPart = urlPart[:idx]
-		} else {
-			echDomain = urlPart[idx+10 : idx+end]
-			urlPart = urlPart[:idx] + urlPart[idx+end+1:]
+	if qIdx := strings.IndexByte(urlPart, '?'); qIdx >= 0 {
+		baseURL := urlPart[:qIdx]
+		rawQuery := urlPart[qIdx+1:]
+		var keptParams []string
+		for _, param := range strings.Split(rawQuery, "&") {
+			switch {
+			case strings.HasPrefix(param, "echdomain="):
+				echDomain = strings.TrimSpace(param[len("echdomain="):])
+			case strings.HasPrefix(param, "ech="):
+				echBase64 = strings.TrimSpace(param[len("ech="):])
+			case param != "":
+				keptParams = append(keptParams, param)
+			}
 		}
-		urlPart = strings.TrimRight(urlPart, "?&")
-	}
-
-	if idx := strings.Index(urlPart, "ech="); idx >= 0 {
-		end := strings.IndexAny(urlPart[idx:], "&")
-		if end < 0 {
-			echBase64 = urlPart[idx+4:]
-			urlPart = urlPart[:idx]
+		if len(keptParams) > 0 {
+			urlPart = baseURL + "?" + strings.Join(keptParams, "&")
 		} else {
-			echBase64 = urlPart[idx+4 : idx+end]
-			urlPart = urlPart[:idx] + urlPart[idx+end+1:]
+			urlPart = baseURL
 		}
-		urlPart = strings.TrimRight(urlPart, "?&")
 	}
 
 	u.echDomain = echDomain
@@ -219,13 +223,27 @@ func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 			}
 		} else {
 			decoded, err := decodeBase64Flex(echBase64)
-			if err == nil {
-				u.ECHConfigList = decoded
-				if logTLS {
-					log.Printf("[TLS] [ECH] Upstream %s: Loaded manual ECH config via URL parameter (%d bytes)", urlPart, len(decoded))
+			if err == nil && len(decoded) > 0 {
+				if cfgs, cfgErr := extractECHConfigs(decoded); cfgErr == nil && len(cfgs) > 0 {
+					u.ECHConfigList = decoded
+					if logTLS {
+						log.Printf("[TLS] [ECH] Upstream %s: Loaded manual ECH config via URL parameter (%d bytes)", urlPart, len(decoded))
+					}
+				} else {
+					if useECH == "strict" {
+						return nil, fmt.Errorf("upstream %s: malformed manual ECHConfigList: %v", urlPart, cfgErr)
+					}
+					if logTLS || logSystem {
+						log.Printf("[TLS] [ECH] Upstream %s: WARNING - Malformed manual ECHConfigList ignored: %v", urlPart, cfgErr)
+					}
 				}
-			} else if logTLS || logSystem {
-				log.Printf("[TLS] [ECH] Upstream %s: WARNING - Invalid manual ECH base64 string: %v", urlPart, err)
+			} else {
+				if useECH == "strict" {
+					return nil, fmt.Errorf("upstream %s: invalid manual ECH base64 string: %v", urlPart, err)
+				}
+				if logTLS || logSystem {
+					log.Printf("[TLS] [ECH] Upstream %s: WARNING - Invalid manual ECH base64 string: %v", urlPart, err)
+				}
 			}
 		}
 	}
@@ -235,17 +253,16 @@ func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 		for _, rip := range rawIPs {
 			rip = strings.TrimSpace(rip)
 			if addr, err := netip.ParseAddr(rip); err == nil {
+				addr = addr.Unmap()
 				if ipVersionSupport == "ipv4" && !addr.Is4() {
 					continue
 				}
 				if ipVersionSupport == "ipv6" && !addr.Is6() {
 					continue
 				}
-				u.BootstrapIPs = append(u.BootstrapIPs, rip)
-			} else {
-				if logSystem {
-					log.Printf("[WARN] Invalid bootstrap IP %q ignored for upstream %s", rip, urlPart)
-				}
+				u.BootstrapIPs = append(u.BootstrapIPs, addr.String())
+			} else if rip != "" && logSystem {
+				log.Printf("[WARN] Invalid bootstrap IP %q ignored for upstream %s", rip, urlPart)
 			}
 		}
 	}
@@ -312,6 +329,7 @@ func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 			u.dialHost = host
 		}
 		if addr, err := netip.ParseAddr(host); err == nil {
+			addr = addr.Unmap()
 			if ipVersionSupport == "ipv4" && !addr.Is4() {
 				return nil, fmt.Errorf("upstream %s is IPv6 but support_ip_version is 'ipv4'", host)
 			}
@@ -332,6 +350,9 @@ func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 		rest := strings.TrimPrefix(u.RawURL, "https://")
 		if idx := strings.IndexByte(rest, '/'); idx >= 0 {
 			rest = rest[:idx]
+		}
+		if qIdx := strings.IndexByte(rest, '?'); qIdx >= 0 {
+			rest = rest[:qIdx]
 		}
 		if h, _, err := net.SplitHostPort(rest); err == nil {
 			rest = h
@@ -444,10 +465,8 @@ func ParseUpstream(raw string, bootstrapNodes []*Upstream) (*Upstream, error) {
 		if len(ips) > 0 {
 			u.BootstrapIPs = ips
 
-			if len(hintedIPs) == 0 {
-				if logSystem {
-					log.Printf("[INIT] Bootstrap: %s -> %v", resolveHost, ips)
-				}
+			if len(hintedIPs) == 0 && logSystem {
+				log.Printf("[INIT] Bootstrap: %s -> %v", resolveHost, ips)
 			}
 
 			if u.dialHost != "" {

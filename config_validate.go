@@ -1,16 +1,19 @@
 /*
 File:    config_validate.go
-Version: 1.1.0 (Split)
-Last Updated: 23-Nov-2026 14:00 CET
+Version: 1.2.0 (Split)
+Last Updated: 24-Nov-2026 12:30 CET
 
 Description:
   Strict fail-closed configuration validation and default normalization
   executed at startup and during `--test` CLI runs.
 
-  Extracted from config.go 2.0.0 to isolate validation rules from schema
-  declarations and YAML AST formatting.
-
 Changes:
+  1.2.0 - [SECURITY/FIX] Validated `server.ddr.hostnames` entries as RFC-valid
+          domain names (non-IP, non-wildcard QNAMEs) and rejected negative
+          `identity.poll_interval` values in `validateConfig`.
+        - [SECURITY/FIX] Validated `?ech=<base64>` (via `decodeBase64Flex` and
+          `extractECHConfigs`) and `?echdomain=<domain>` (via `isValidQNAME`) in
+          `validateUpstreamURLSyntax`.
   1.1.0 - [SECURITY/FIX] Failed closed in `validateConfig` when `webui.enabled`
           is true with an empty `webui.password`, or when `groups.<g>.budget`,
           `routes[*].group`, or any `upstream` reference points to a non-existent
@@ -20,8 +23,7 @@ Changes:
           portless bracketed IPv6 bootstrap handling in `validateUpstreamURLSyntax`,
           and validated `doh://` / `https://` / `doh3://` URLs via `url.Parse`.
   1.0.0 - [REFACTOR] Extracted `validateConfig` and validation helpers from
-          `config.go`, and removed dead `proto` assignment in
-          `validateUpstreamURLSyntax`.
+          `config.go`.
 */
 
 package main
@@ -190,7 +192,29 @@ func validateUpstreamURLSyntax(field, raw string, requireBootstrapIP bool) error
 		clean = clean[idx+3:]
 	}
 	if qIdx := strings.IndexByte(clean, '?'); qIdx >= 0 {
+		queryPart := clean[qIdx+1:]
 		clean = clean[:qIdx]
+		for _, param := range strings.Split(queryPart, "&") {
+			if param == "" {
+				continue
+			}
+			switch {
+			case strings.HasPrefix(param, "ech="):
+				echB64 := param[4:]
+				decoded, decErr := decodeBase64Flex(echB64)
+				if decErr != nil || len(decoded) == 0 {
+					return fmt.Errorf("%s: invalid base64 in ?ech= parameter of %q: %v", field, raw, decErr)
+				}
+				if cfgs, cfgErr := extractECHConfigs(decoded); cfgErr != nil || len(cfgs) == 0 {
+					return fmt.Errorf("%s: malformed ECHConfigList in ?ech= parameter of %q: %v", field, raw, cfgErr)
+				}
+			case strings.HasPrefix(param, "echdomain="):
+				echDom := lowerTrimDot(strings.TrimSpace(strings.ReplaceAll(param[10:], "{client-name}", "client")))
+				if echDom == "" || strings.Contains(echDom, "*") || net.ParseIP(echDom) != nil || !isValidQNAME(echDom, dns.TypeHTTPS) {
+					return fmt.Errorf("%s: invalid domain in ?echdomain= parameter of %q", field, raw)
+				}
+			}
+		}
 	}
 	clean, _ = stripMethodModifier(clean)
 
@@ -483,6 +507,12 @@ func validateConfig() error {
 	default:
 		return fmt.Errorf("server.ddr.hostname_source %q must be 'strict', 'tls', or 'both'", cfg.Server.DDR.HostnameSource)
 	}
+	for _, h := range cfg.Server.DDR.Hostnames {
+		clean := lowerTrimDot(strings.TrimSpace(h))
+		if clean == "" || strings.Contains(clean, "*") || net.ParseIP(clean) != nil || !isValidQNAME(clean, dns.TypeA) {
+			return fmt.Errorf("server.ddr.hostnames: invalid resolver hostname %q", h)
+		}
+	}
 	for _, s := range cfg.Server.DDR.IPv4 {
 		a, err := netip.ParseAddr(strings.TrimSpace(s))
 		if err != nil || !a.Unmap().Is4() {
@@ -738,6 +768,9 @@ func validateConfig() error {
 		}
 	}
 
+	if cfg.Identity.PollInterval < 0 {
+		return fmt.Errorf("identity.poll_interval (%d) must not be negative", cfg.Identity.PollInterval)
+	}
 	if err := validateOptionalDuration("identity.asn_poll_interval", cfg.Identity.ASNPollInterval, true); err != nil {
 		return err
 	}

@@ -1,48 +1,35 @@
 /*
 File:    cache_persistence.go
-Version: 2.25.0 (Split)
-Last Updated: 23-Nov-2026 14:00 CET
+Version: 2.26.0 (Split)
+Last Updated: 24-Nov-2026 12:30 CET
 
 Description:
   Disk persistence for the sdproxy cache engine. Serializes and restores the
   live memory cache across router reboots.
 
-  Extracted from cache.go to decouple disk I/O from the DNS hot path.
-
 Changes:
+  2.26.0 - [PERF/FIX] Precomputed shared policy, identity, RRs, custom-rules,
+           and parental digests once per `SaveCache` / `LoadCache` pass via
+           `routeHashMemo`, and memoized synthetic (`routeName == ""`) hashes
+           by `routeIdx` so `SaveCache` never re-sorts policy/identity maps
+           inside `shard.RLock()`.
   2.25.0 - [SECURITY/FIX] Included per-group `IgnoreQnameLabels` in the synthetic
-           route fingerprint (`computeRouteConfigHash`) so persisted synthetic
-           `QNAME Label Bounds` cache entries are invalidated if
-           `ignore_qname_labels` is toggled on that upstream group.
+           route fingerprint (`computeRouteConfigHash`).
   2.24.0 - [SECURITY/FIX] Included `cfg.Cache.CacheUpstreamNegative` in the
-           upstream route fingerprint (`computeRouteConfigHash`) so persisted
-           negative / RCODE-only cache entries are invalidated across restarts
-           if `cache_upstream_negative` is disabled.
-  2.23.0 - [SECURITY/FIX] Included `cfg.Cache.MinTTL`, `cfg.Cache.MaxTTL`, and
-           `cfg.Cache.NegativeTTL` in both the synthetic and upstream route
-           fingerprints (`computeRouteConfigHash`).
-  2.22.0 - [FEAT/SECURITY] Included `cfg.Cache.RcodeTTL`, `cfg.Cache.RcodeMinTTL`,
-           and `cfg.Cache.RcodeMaxTTL` in both the synthetic and upstream route
-           fingerprints in `computeRouteConfigHash`.
-  2.21.0 - [SECURITY/FIX] Added a deterministic cryptographic digest of
-           `catMap` (`computeParentalCategoryDigest`) to the upstream route
-           fingerprint (`computeRouteConfigHash`) when `cfg.Server.FilterIPs`
-           or `cfg.Server.TargetName` is enabled, and included
-           `cfg.Server.SupportIPVersion` (`ipVersionSupport`) in both fingerprints.
-  2.20.0 - [SECURITY/FIX] Included `cfg.Cache.AnswerSort` and post-upstream
-           response policy/transform settings (`RebindingProtection`,
-           `FilterIPs`, `TargetName`, `FlattenCNAME`, `MinimizeAnswer`) in the
            upstream route fingerprint (`computeRouteConfigHash`).
-  2.19.0 - [SECURITY/FIX] Added deterministic digests of compiled `rrs:`
-           (`computeCompiledRRsDigest`) and Web UI Custom Rules
-           (`computeCustomRulesDigest`) to the synthetic cache fingerprint.
-  2.18.0 - [SECURITY/FIX] Replaced rule-count (`len`) metadata in
-           `computeRouteConfigHash` with `computeCompiledPolicyDigest` and
-           `computeLocalIdentityDigest`.
-  2.17.1 - [FIX] Changed `RP` struct field type from `map[string]int` to
-           `map[uint16]int` to match `rtypePolicy` in `computeRouteConfigHash`.
-  2.17.0 - [SECURITY/FIX] Included the contents (`sha256` digest) of external
-           `rtype_policy_files` and `domain_policy_files` in `computeRouteConfigHash`.
+  2.23.0 - [SECURITY/FIX] Included `cfg.Cache.MinTTL`, `cfg.Cache.MaxTTL`, and
+           `cfg.Cache.NegativeTTL` in both route fingerprints.
+  2.22.0 - [FEAT/SECURITY] Included `cfg.Cache.RcodeTTL`, `cfg.Cache.RcodeMinTTL`,
+           and `cfg.Cache.RcodeMaxTTL` in both route fingerprints.
+  2.21.0 - [SECURITY/FIX] Added `computeParentalCategoryDigest` and
+           `ipVersionSupport` to route fingerprints.
+  2.20.0 - [SECURITY/FIX] Included `AnswerSort` and post-upstream transform
+           settings in upstream route fingerprints.
+  2.19.0 - [SECURITY/FIX] Added deterministic digests of compiled `rrs:` and
+           Web UI Custom Rules to the synthetic cache fingerprint.
+  2.18.0 - [SECURITY/FIX] Replaced rule-count metadata with
+           `computeCompiledPolicyDigest` and `computeLocalIdentityDigest`.
+  2.17.1 - [FIX] Changed `RP` struct field type to `map[uint16]int`.
 */
 
 package main
@@ -268,76 +255,128 @@ func computeParentalCategoryDigest() string {
 	return computeConfigHash()
 }
 
-func computeRouteConfigHash(routeName string, routeIdx uint16) string {
-	if routeName == "" {
-		var idxTarget string
-		for name, idx := range routeIdxByName {
-			if idx == routeIdx {
-				idxTarget = name
-				break
-			}
-		}
-		var ignoreLabels bool
-		if grp := effectiveUpstreamGroup(idxTarget); grp != nil {
-			ignoreLabels = grp.IgnoreQnameLabels
-		}
-		mixedScript := true
-		if cfg.Server.IDNHomograph.MixedScript != nil {
-			mixedScript = *cfg.Server.IDNHomograph.MixedScript
-		}
-		asciiLookalikes := true
-		if cfg.Server.IDNHomograph.ASCIILookalikes != nil {
-			asciiLookalikes = *cfg.Server.IDNHomograph.ASCIILookalikes
-		}
-		rtBytes, _ := json.Marshal(struct {
-			RP  map[uint16]int
-			RPF map[string]string
-		}{
-			RP:  rtypePolicy,
-			RPF: cfg.RtypePolicyFiles,
-		})
-		synthDesc := fmt.Sprintf("synth:%s|ipv:%s|cs:%v|cli:%v:%s|sttl:%d|ttl:%d:%d:%d|rttl:%d:%d:%d|boq:%v|qmin:%d|qmax:%d|igl:%v|act:%s|ips:%s|faaaa:%v|sptr:%v|fs:%s|pk:%s|rfc:%s:%v:%s|idn:%s:%v:%v:%v:%s:%s|rt:%s|dp:%s:%s|rrs:%s|cr:%s",
-			idxTarget,
-			ipVersionSupport,
-			cfg.Cache.CacheSynthetic,
-			cfg.Cache.CacheLocalIdentity,
-			computeLocalIdentityDigest(),
-			syntheticTTL,
-			cfg.Cache.MinTTL,
-			cfg.Cache.MaxTTL,
-			cfg.Cache.NegativeTTL,
-			cfg.Cache.RcodeTTL,
-			cfg.Cache.RcodeMinTTL,
-			cfg.Cache.RcodeMaxTTL,
-			cfg.Server.BlockObsoleteQtypes,
-			cfg.Server.QnameMinLabels,
-			cfg.Server.QnameMaxLabels,
-			ignoreLabels,
-			strings.ToUpper(strings.TrimSpace(cfg.Server.BlockAction)),
-			strings.Join(cfg.Server.BlockIPs, ","),
-			cfg.Server.FilterAAAA,
-			cfg.Server.StrictPTR,
-			cfg.Server.ForSale,
-			cfg.Server.Parked,
-			cfg.Server.RFCCompliance.Action,
-			cfg.Server.RFCCompliance.Strict,
-			strings.Join(cfg.Server.RFCCompliance.Checks, ","),
-			cfg.Server.IDNHomograph.Action,
-			cfg.Server.IDNHomograph.BlockAllIDN,
-			mixedScript,
-			asciiLookalikes,
-			strings.Join(cfg.Server.IDNHomograph.Protect, ","),
-			strings.Join(cfg.Server.IDNHomograph.Exempt, ","),
-			string(rtBytes),
-			computePolicyConfigHash(),
-			computeCompiledPolicyDigest(),
-			computeCompiledRRsDigest(),
-			computeCustomRulesDigest(),
-		)
-		h := sha256.Sum256([]byte(synthDesc))
-		return hex.EncodeToString(h[:8])
+type routeHashMemo struct {
+	routeHashes     map[string]string
+	synthHashes     map[uint16]string
+	nameByIdx       map[uint16]string
+	rtJSON          string
+	localIdentHash  string
+	policyCfgHash   string
+	compiledPolHash string
+	compiledRRsHash string
+	customRulesHash string
+	parentalCatHash string
+}
+
+func newRouteHashMemo() *routeHashMemo {
+	rtBytes, _ := json.Marshal(struct {
+		RP  map[uint16]int
+		RPF map[string]string
+	}{
+		RP:  rtypePolicy,
+		RPF: cfg.RtypePolicyFiles,
+	})
+
+	nameByIdx := make(map[uint16]string, len(routeIdxByName))
+	for name, idx := range routeIdxByName {
+		nameByIdx[idx] = name
 	}
 
+	m := &routeHashMemo{
+		routeHashes:     make(map[string]string, len(routeIdxByName)+2),
+		synthHashes:     make(map[uint16]string, len(routeIdxByName)+2),
+		nameByIdx:       nameByIdx,
+		rtJSON:          string(rtBytes),
+		localIdentHash:  computeLocalIdentityDigest(),
+		policyCfgHash:   computePolicyConfigHash(),
+		compiledPolHash: computeCompiledPolicyDigest(),
+		compiledRRsHash: computeCompiledRRsDigest(),
+		customRulesHash: computeCustomRulesDigest(),
+		parentalCatHash: computeParentalCategoryDigest(),
+	}
+
+	for name, idx := range routeIdxByName {
+		m.routeHashes[name] = m.computeUpstreamHash(name)
+		m.synthHashes[idx] = m.computeSynthHash(idx)
+	}
+	return m
+}
+
+func (m *routeHashMemo) synthHash(routeIdx uint16) string {
+	if h, ok := m.synthHashes[routeIdx]; ok {
+		return h
+	}
+	h := m.computeSynthHash(routeIdx)
+	m.synthHashes[routeIdx] = h
+	return h
+}
+
+func (m *routeHashMemo) upstreamHash(routeName string) string {
+	if h, ok := m.routeHashes[routeName]; ok {
+		return h
+	}
+	h := m.computeUpstreamHash(routeName)
+	m.routeHashes[routeName] = h
+	return h
+}
+
+func (m *routeHashMemo) computeSynthHash(routeIdx uint16) string {
+	idxTarget := m.nameByIdx[routeIdx]
+	var ignoreLabels bool
+	if grp := effectiveUpstreamGroup(idxTarget); grp != nil {
+		ignoreLabels = grp.IgnoreQnameLabels
+	}
+	mixedScript := true
+	if cfg.Server.IDNHomograph.MixedScript != nil {
+		mixedScript = *cfg.Server.IDNHomograph.MixedScript
+	}
+	asciiLookalikes := true
+	if cfg.Server.IDNHomograph.ASCIILookalikes != nil {
+		asciiLookalikes = *cfg.Server.IDNHomograph.ASCIILookalikes
+	}
+	synthDesc := fmt.Sprintf("synth:%s|ipv:%s|cs:%v|cli:%v:%s|sttl:%d|ttl:%d:%d:%d|rttl:%d:%d:%d|boq:%v|qmin:%d|qmax:%d|igl:%v|act:%s|ips:%s|faaaa:%v|sptr:%v|fs:%s|pk:%s|rfc:%s:%v:%s|idn:%s:%v:%v:%v:%s:%s|rt:%s|dp:%s:%s|rrs:%s|cr:%s",
+		idxTarget,
+		ipVersionSupport,
+		cfg.Cache.CacheSynthetic,
+		cfg.Cache.CacheLocalIdentity,
+		m.localIdentHash,
+		syntheticTTL,
+		cfg.Cache.MinTTL,
+		cfg.Cache.MaxTTL,
+		cfg.Cache.NegativeTTL,
+		cfg.Cache.RcodeTTL,
+		cfg.Cache.RcodeMinTTL,
+		cfg.Cache.RcodeMaxTTL,
+		cfg.Server.BlockObsoleteQtypes,
+		cfg.Server.QnameMinLabels,
+		cfg.Server.QnameMaxLabels,
+		ignoreLabels,
+		strings.ToUpper(strings.TrimSpace(cfg.Server.BlockAction)),
+		strings.Join(cfg.Server.BlockIPs, ","),
+		cfg.Server.FilterAAAA,
+		cfg.Server.StrictPTR,
+		cfg.Server.ForSale,
+		cfg.Server.Parked,
+		cfg.Server.RFCCompliance.Action,
+		cfg.Server.RFCCompliance.Strict,
+		strings.Join(cfg.Server.RFCCompliance.Checks, ","),
+		cfg.Server.IDNHomograph.Action,
+		cfg.Server.IDNHomograph.BlockAllIDN,
+		mixedScript,
+		asciiLookalikes,
+		strings.Join(cfg.Server.IDNHomograph.Protect, ","),
+		strings.Join(cfg.Server.IDNHomograph.Exempt, ","),
+		m.rtJSON,
+		m.policyCfgHash,
+		m.compiledPolHash,
+		m.compiledRRsHash,
+		m.customRulesHash,
+	)
+	h := sha256.Sum256([]byte(synthDesc))
+	return hex.EncodeToString(h[:8])
+}
+
+func (m *routeHashMemo) computeUpstreamHash(routeName string) string {
 	type routeDescriptor struct {
 		RouteName        string
 		IPVersion        string
@@ -398,18 +437,10 @@ func computeRouteConfigHash(routeName string, routeIdx uint16) string {
 		TargetName:       cfg.Server.TargetName,
 		FlattenCNAME:     cfg.Server.FlattenCNAME,
 		MinimizeAnswer:   cfg.Server.MinimizeAnswer,
-		ParentalCatHash:  computeParentalCategoryDigest(),
+		ParentalCatHash:  m.parentalCatHash,
 	})
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:8])
-}
-
-func buildRouteHashTable() map[string]string {
-	out := make(map[string]string, len(routeIdxByName)+2)
-	for name, idx := range routeIdxByName {
-		out[name] = computeRouteConfigHash(name, idx)
-	}
-	return out
 }
 
 // LoadCache restores the DNS cache from disk.
@@ -427,7 +458,7 @@ func LoadCache() {
 	}
 
 	now := time.Now().UnixNano()
-	routeHashes := buildRouteHashTable()
+	memo := newRouteHashMemo()
 	loaded := 0
 
 	for _, r := range records {
@@ -443,15 +474,14 @@ func LoadCache() {
 			if !ok || idx != r.Key.RouteIdx {
 				continue
 			}
-			if r.RouteHash == "" || r.RouteHash != routeHashes[r.Route] {
+			if r.RouteHash == "" || r.RouteHash != memo.upstreamHash(r.Route) {
 				continue
 			}
 		} else {
 			if !cfg.Cache.CacheSynthetic && !cfg.Cache.CacheLocalIdentity {
 				continue
 			}
-			expectedHash := computeRouteConfigHash("", r.Key.RouteIdx)
-			if r.RouteHash == "" || r.RouteHash != expectedHash {
+			if r.RouteHash == "" || r.RouteHash != memo.synthHash(r.Key.RouteIdx) {
 				continue
 			}
 		}
@@ -478,8 +508,7 @@ func LoadCache() {
 	}
 }
 
-// SaveCache gathers all viable cache records and serializes them to disk without
-// blocking the DNS path for the duration of the write.
+// SaveCache serializes all viable cache records to disk without blocking hot-path shards.
 func SaveCache() {
 	if !cfg.Cache.Enabled || !cfg.Cache.Persist || cfg.Cache.PersistFile == "" {
 		return
@@ -489,7 +518,7 @@ func SaveCache() {
 	defer saveCacheMu.Unlock()
 
 	now := time.Now().UnixNano()
-	routeHashes := buildRouteHashTable()
+	memo := newRouteHashMemo()
 
 	totalEst := 0
 	for i := range shards {
@@ -511,9 +540,11 @@ func SaveCache() {
 				continue
 			}
 			if p := v.packed.Load(); p != nil {
-				rHash := routeHashes[v.routeName]
-				if rHash == "" {
-					rHash = computeRouteConfigHash(v.routeName, k.RouteIdx)
+				var rHash string
+				if v.routeName == "" {
+					rHash = memo.synthHash(k.RouteIdx)
+				} else {
+					rHash = memo.upstreamHash(v.routeName)
 				}
 				records = append(records, cacheDiskRecord{
 					Version:   cacheDiskVersion,
