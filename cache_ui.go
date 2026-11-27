@@ -1,22 +1,21 @@
 /*
 File:    cache_ui.go
-Version: 1.2.0 (Split)
-Last Updated: 04-Nov-2026 20:55 CET
+Version: 1.3.0 (Split)
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   Web UI API structures and introspection routines for the sdproxy Cache.
-  Extracted from cache.go to isolate JSON string allocations away from 
+  Extracted from cache.go to isolate JSON string allocations away from
   high-performance cache interactions.
 
 Changes:
-  1.2.0 - [FIX] Included infinite-stale upstream entries (`serveStaleInfinite && v.routeName != ""`)
-          in `DumpCache()` so the Web UI Cache Inspector matches `CacheEntryCount()` and
-          displays retained emergency fallback entries accurately.
-        - [FIX] Replaced raw `dns.TypeToString` map lookup with `qtypeName(s.Key.Qtype)`
-          so unknown or experimental RR types render as `TYPE<N>` instead of empty strings.
-  1.1.0 - [PERF] Eradicated redundant heap allocations natively within DumpCache. 
-          Removed unnecessary deep-copies of immutable cache byte slices, drastically 
-          neutralizing memory constraints during Web UI cache introspection.
+  1.3.0 - [FEAT/FIX] Rendered `routeLocalTag` as `"local"` (distinct from
+          `"synthetic"`), used `fullMsgRcode(msg)` so cached Extended RCODEs
+          display accurately, and appended `[DO]`, `[CD]`, and `[RD=0]` flags
+          to `Route` so partitioned cache entries are visually distinguishable.
+  1.2.0 - [FIX] Included infinite-stale upstream entries in `DumpCache()` and
+          replaced `dns.TypeToString` with `qtypeName`.
+  1.1.0 - [PERF] Removed unnecessary deep-copies of immutable cache byte slices.
   1.0.0 - Initial extraction mapping structural introspection arrays.
 */
 
@@ -31,8 +30,7 @@ import (
 )
 
 // CacheEntryCount returns the total number of entries currently held across
-// all 32 shards. Acquires each shard's read lock briefly — only called by the
-// /api/stats poller (≤ once per 5 s), never in the DNS hot path.
+// all 32 shards.
 func CacheEntryCount() int {
 	if !cfg.Cache.Enabled {
 		return 0
@@ -50,8 +48,6 @@ func CacheEntryCount() int {
 // Cache Introspection (Web UI)
 // ---------------------------------------------------------------------------
 
-// CacheEntryDump encapsulates a single cache record dynamically extracted 
-// for representation within the Web UI dashboard.
 type CacheEntryDump struct {
 	QName    string `json:"qname"`
 	QType    string `json:"qtype"`
@@ -62,9 +58,6 @@ type CacheEntryDump struct {
 	TimeLeft string `json:"time_left"`
 }
 
-// DumpCache iterates across all internal memory shards, securely locking and 
-// replicating viable arrays to safely build an introspective snapshot of the 
-// active DNS cache without inducing hot-path contention constraints natively.
 func DumpCache() []CacheEntryDump {
 	if !cfg.Cache.Enabled {
 		return nil
@@ -81,12 +74,11 @@ func DumpCache() []CacheEntryDump {
 	}
 	var snaps []snapshot
 
-	// 1. Gather all active memory records natively using Read-Locks to minimize hot-path collision.
 	for i := range shards {
 		shard := shards[i]
 		shard.RLock()
 		for k, v := range shard.items {
-			if now >= v.staleNano && (!serveStaleInfinite || v.routeName == "") {
+			if isEntryDead(v, now) {
 				continue
 			}
 			if p := v.packed.Load(); p != nil {
@@ -101,7 +93,6 @@ func DumpCache() []CacheEntryDump {
 		shard.RUnlock()
 	}
 
-	// 2. Unpack safely isolated from the core Mutexes natively
 	msg := new(dns.Msg)
 	for _, s := range snaps {
 		*msg = dns.Msg{}
@@ -117,8 +108,9 @@ func DumpCache() []CacheEntryDump {
 
 		textValue := strings.Join(answers, "\n")
 		if textValue == "" {
-			if msg.Rcode != dns.RcodeSuccess {
-				textValue = RcodeStr(msg.Rcode)
+			effRcode := fullMsgRcode(msg)
+			if effRcode != dns.RcodeSuccess {
+				textValue = RcodeStr(effRcode)
 			} else {
 				textValue = "NODATA"
 			}
@@ -132,9 +124,14 @@ func DumpCache() []CacheEntryDump {
 
 		cachedAt := time.Unix(0, s.Item.cachedAtNano).Format("2006-01-02 15:04:05")
 
-		route := s.Item.routeName
-		if route == "" {
+		var route string
+		switch s.Item.routeName {
+		case "":
 			route = "synthetic"
+		case routeLocalTag:
+			route = "local"
+		default:
+			route = s.Item.routeName
 		}
 
 		if s.Key.ClientName != "" {
@@ -142,6 +139,17 @@ func DumpCache() []CacheEntryDump {
 		}
 		if s.Key.ECS != "" && s.Key.ECS != "passed-ecs" {
 			route += " [ECS: " + s.Key.ECS + "]"
+		} else if s.Key.ECS == "passed-ecs" {
+			route += " [ECS]"
+		}
+		if s.Key.DoBit {
+			route += " [DO]"
+		}
+		if s.Key.CdBit {
+			route += " [CD]"
+		}
+		if !s.Key.RecursionDesired {
+			route += " [RD=0]"
 		}
 
 		dumps = append(dumps, CacheEntryDump{

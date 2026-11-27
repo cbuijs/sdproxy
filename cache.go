@@ -1,39 +1,39 @@
 /*
 File:    cache.go
-Version: 2.59.0 (Split)
-Last Updated: 23-Nov-2026 14:00 CET
+Version: 2.60.0 (Split)
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   High-performance, sharded, non-blocking DNS cache core for sdproxy.
   Manages memory allocation, cryptographic sharding (HashDoS protection),
   and asynchronous garbage collection (Sweeper).
 
-  Hot-path Read/Write operations have been moved to cache_rw.go.
-  Disk persistence has been moved to cache_persistence.go.
-  UI introspection has been moved to cache_ui.go.
+  Hot-path Read/Write operations live in cache_rw.go.
+  Disk persistence lives in cache_persistence.go.
+  UI introspection lives in cache_ui.go.
 
 Changes:
+  2.60.0 - [PERF/SECURITY] Upgraded `storeItem` to a 2-tier sampled eviction
+           policy: (1) immediately evict dead entries (`isEntryDead`), (2) prefer
+           stale/expired entries over live entries, and (3) score live entries
+           with a hit-weighted horizon (`staleNano + min(hits, 64)*5s`) so
+           NXDOMAIN/scan floods cannot evict frequently hit records.
+         - [FIX] Added `routeLocalTag` (`"\x00local"`) and `isSyntheticRoute` so
+           local-identity cache entries are cleanly distinguished from policy
+           synthetic entries across `LoadCache`, `DumpCache`, and telemetry while
+           still expiring normally under `serveStaleInfinite`.
   2.59.0 - [FIX] Used ceiling division `(maxSize + shardCount - 1) / shardCount`
-           when deriving `cacheMaxPerShard` so small `cache.size` configurations
-           do not under-allocate total capacity across the 32 shards.
+           when deriving `cacheMaxPerShard`.
   2.58.0 - [CLEANUP] Removed unused second parameter `_ int` from `InitCache`.
   2.57.0 - [FIX] Emitted startup `InitCache` summary and `persist_save_interval`
-           warnings when `logSystem` or `logCaching` is active so Simple Logging
-           Mode (`logSimple: true`) retains startup messages and warnings.
+           warnings when `logSystem` or `logCaching` is active.
   2.56.0 - [SECURITY/FIX] Kept `runSweeper` active when `serveStaleInfinite` is
-           enabled so expired synthetic responses (`v.routeName == ""`, such as
-           policy blocks and local-identity records) are still garbage-collected
-           while upstream responses (`v.routeName != ""`) are retained for
-           emergency stale fallback.
-  2.55.0 - [SECURITY/FIX] Added `BypassPolicies` and `BypassLocal` to `DNSCacheKey`
-           and `getShard` hashing.
-  2.54.0 - [SECURITY/FIX] Added RecursionDesired to cache partitioning and shard hashing.
-  2.53.0 - [PERF] Eliminated significant Garbage Collection (GC) thrashing
-           within the `runSweeper` background routine.
-  2.52.0 - [CLEANUP] Simplified `storeItem` mutex orchestration organically
-           via `defer` declarations.
-  2.51.0 - [PERF/FIX] Eliminated the cache-hot-path repack caused by
-           `answer_sort: round-robin`.
+           enabled so expired synthetic responses are still garbage-collected.
+  2.55.0 - [SECURITY/FIX] Added `BypassPolicies` and `BypassLocal` to `DNSCacheKey`.
+  2.54.0 - [SECURITY/FIX] Added `RecursionDesired` to cache partitioning.
+  2.53.0 - [PERF] Eliminated GC thrashing within `runSweeper`.
+  2.52.0 - [CLEANUP] Simplified `storeItem` mutex orchestration via `defer`.
+  2.51.0 - [PERF/FIX] Eliminated hot-path repack on `answer_sort: round-robin`.
 */
 
 package main
@@ -45,6 +45,19 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// routeLocalTag marks cached local-identity responses (`hosts_files` / `*_leases`)
+// distinctly from policy-synthesized responses (`""`) while keeping both out of
+// upstream route namespaces (`\x00` cannot appear in YAML upstream group names).
+const routeLocalTag = "\x00local"
+
+func isSyntheticRoute(routeName string) bool {
+	return routeName == "" || routeName == routeLocalTag
+}
+
+func isEntryDead(v *cacheItem, now int64) bool {
+	return now >= v.staleNano && (!serveStaleInfinite || isSyntheticRoute(v.routeName))
+}
 
 type DNSCacheKey struct {
 	Name             string
@@ -181,7 +194,7 @@ func runSweeper(interval time.Duration) {
 
 				shard.RLock()
 				for k, v := range shard.items {
-					if now >= v.staleNano && (!serveStaleInfinite || v.routeName == "") {
+					if isEntryDead(v, now) {
 						toDelete = append(toDelete, k)
 					}
 				}
@@ -192,7 +205,7 @@ func runSweeper(interval time.Duration) {
 				}
 				shard.Lock()
 				for _, k := range toDelete {
-					if v, ok := shard.items[k]; ok && now >= v.staleNano && (!serveStaleInfinite || v.routeName == "") {
+					if v, ok := shard.items[k]; ok && isEntryDead(v, now) {
 						delete(shard.items, k)
 					}
 				}
@@ -253,30 +266,62 @@ func getShard(key DNSCacheKey) *cacheShard {
 // Internal store helper
 // ---------------------------------------------------------------------------
 
-const evictionSampleSize = 8
+const (
+	evictionSampleSize = 8
+	hitBonusStepNano   = int64(5 * time.Second)
+	hitBonusMaxCount   = 64
+)
 
 func storeItem(key DNSCacheKey, item *cacheItem) {
 	shard := getShard(key)
+	now := item.cachedAtNano
+	if now <= 0 {
+		now = time.Now().UnixNano()
+	}
+
 	shard.Lock()
 	defer shard.Unlock()
 
 	if _, exists := shard.items[key]; !exists && len(shard.items) >= cacheMaxPerShard {
-		var victim DNSCacheKey
-		var victimStale int64
-		var sampled int
+		var (
+			victim        DNSCacheKey
+			victimScore   int64
+			victimExpired bool
+			sampled       int
+		)
 
 		for k, v := range shard.items {
-			if sampled == 0 || v.staleNano < victimStale {
+			if isEntryDead(v, now) {
 				victim = k
-				victimStale = v.staleNano
+				sampled = 1
+				break
 			}
+
+			expired := now >= v.expireNano
+			score := v.staleNano
+			if !expired {
+				hits := min(int64(v.hits.Load()), hitBonusMaxCount)
+				score += hits * hitBonusStepNano
+			}
+
+			better := sampled == 0 ||
+				(expired && !victimExpired) ||
+				(expired == victimExpired && score < victimScore)
+			if better {
+				victim = k
+				victimScore = score
+				victimExpired = expired
+			}
+
 			sampled++
 			if sampled >= evictionSampleSize {
 				break
 			}
 		}
 
-		delete(shard.items, victim)
+		if sampled > 0 {
+			delete(shard.items, victim)
+		}
 	}
 
 	shard.items[key] = item

@@ -1,13 +1,12 @@
 # File:    full_reference_config.yaml
-# Version: 1.132.0
-# Last Updated: 18-Nov-2026 13:17 CET
-#
-# Description:
-#   Complete reference configuration for sdproxy. Every supported option is
-#   documented here with its type, default, and guidance notes. Copy this file,
-#   strip what you don't need, and adjust to taste. The comments are the manual.
+# Version: 1.133.0
+# Last Updated: 27-Nov-2026 13:30 CET
 #
 # Changes:
+#   1.133.0 - [DOC/FIX] Corrected `cache.serve_stale_infinite` comment: the
+#             background sweeper remains active to garbage-collect expired
+#             synthetic and local-identity entries while retaining upstream
+#             entries for emergency fallback.
 #   1.132.0 - [FEAT] Added `rcode_ttl`, `rcode_min_ttl`, and `rcode_max_ttl`
 #             under `cache:` to set/override or bound the TTL of RCODE-only
 #             answers (`len(Answer) == 0`), supporting both SOA/Authority-derived
@@ -911,8 +910,9 @@ cache:
   # 0 = disabled (default). Recommended: 30–300 for resilience on flaky WANs.
   stale_ttl: 0
 
-  # Serve expired cache records indefinitely when all upstreams return timeouts 
-  # or connection failures. Disables the cache sweeper. Default: false.
+  # Serve expired upstream cache records indefinitely when all upstreams return
+  # timeouts or connection failures. Synthetic and local-identity entries are
+  # still swept normally on expiry. Default: false.
   serve_stale_infinite: false
 
   # Background prefetch: seconds before TTL expiry to trigger a refresh for

@@ -1,7 +1,7 @@
 /*
 File:    process_cachehit.go
-Version: 1.39.0 (Split)
-Last Updated: 24-Nov-2026 12:56 CET
+Version: 1.40.0 (Split)
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   Cache-hit serving stage for the sdproxy resolution pipeline.
@@ -9,27 +9,22 @@ Description:
   post-cache policy re-checks, and client response dispatch.
 
 Changes:
-  1.39.0 - [FIX] Recorded `IncrCacheLookup()` in `serveFromCache` whenever
-           `cfg.Cache.Enabled` is active so `GetStats()` (`stats.go`) computes
-           `CacheHitRate` against actual cache lookups (`0%..100%`) rather than
-           `total - blocked`, preventing `>100%` or missing rates when cached
-           synthetic blocks or `LOG`-mode rules fire.
-  1.38.0 - [SECURITY/PERF] Consumed `isSynth` directly from `CacheGet`
-           (`cache_rw.go` 1.50.0) in `serveFromCache` and `isCachedSynthBlock`.
+  1.40.0 - [CLEANUP/PERF] Used `fullMsgRcode` when recording `IncrReturnCode` and
+           formatting RCODE telemetry on cache hits so cached Extended RCODEs
+           (>=16) are reported accurately, and simplified `isCachedSynthBlock`
+           now that `CacheSetLocal` tags local-identity items with `routeLocalTag`.
+  1.39.0 - [FIX] Recorded `IncrCacheLookup()` in `serveFromCache`.
+  1.38.0 - [SECURITY/PERF] Consumed `isSynth` directly from `CacheGet`.
   1.37.0 - [SECURITY/FIX] Extended `isCachedSynthBlock` for cached synthetic
            `NOERROR` (`len(resp.Answer) == 0`) items.
   1.36.0 - [SECURITY/FIX] Aligned `RRSIG` stripping in `serveFromCache` with
            `CacheSet`.
-  1.35.0 - [SECURITY/FIX] Added `isLocalIdentityPTR` helper in `isCachedSynthBlock`
-           and checked `FilterAAAA` ahead of `BlockActionRcode`.
+  1.35.0 - [SECURITY/FIX] Added `isLocalIdentityPTR` helper in `isCachedSynthBlock`.
   1.34.0 - [SECURITY/FIX] Excluded cached `Filter AAAA` synthetic NODATA
            responses from `checkCachedIDNViolation`.
   1.33.0 - [SECURITY/FIX] Added `isLocalIdentityNODATA` helper in `isCachedSynthBlock`.
   1.32.0 - [SECURITY/FIX] Excluded cached local-identity `NODATA` responses.
-  1.31.0 - [SECURITY/FIX] Excluded cached local-identity `NULL-IP` responses
-           from `checkCachedIDNViolation`.
-  1.30.0 - [SECURITY/FIX] Checked `AnalyzeIDNHomograph` on cached synthetic
-           `NULL-IP` responses.
+  1.31.0 - [SECURITY/FIX] Excluded cached local-identity `NULL-IP` responses.
 */
 
 package main
@@ -99,18 +94,6 @@ func (qc *queryCtx) deriveCacheKey() {
 	}
 }
 
-func hasLocalFamilyAddr(addrs []netip.Addr, qtype uint16) bool {
-	for _, a := range addrs {
-		if qtype == dns.TypeA && a.Is4() {
-			return true
-		}
-		if qtype == dns.TypeAAAA && a.Is6() && !a.Is4In6() {
-			return true
-		}
-	}
-	return false
-}
-
 func hasLocalUnspecifiedFamilyAddr(addrs []netip.Addr, qtype uint16) bool {
 	for _, a := range addrs {
 		if !a.IsUnspecified() {
@@ -126,22 +109,15 @@ func hasLocalUnspecifiedFamilyAddr(addrs []netip.Addr, qtype uint16) bool {
 	return false
 }
 
-func (qc *queryCtx) isLocalIdentityNODATA() bool {
-	if !cacheLocalIdentity || qc.route.bypassLocal || qc.q.Qtype == dns.TypePTR {
+func (qc *queryCtx) isLocalCacheEntry() bool {
+	if !cacheLocalIdentity {
 		return false
 	}
-	if cfg.Server.FilterAAAA && qc.q.Qtype == dns.TypeAAAA && !qc.bypassPolicies && !qc.bypassGlobal {
-		return false
-	}
-	addrs, _ := LookupIPsByNameLower(qc.qNameTrimmed)
-	return len(addrs) > 0 && !hasLocalFamilyAddr(addrs, qc.q.Qtype)
-}
-
-func (qc *queryCtx) isLocalIdentityPTR() bool {
-	if !cacheLocalIdentity || qc.route.bypassLocal || qc.q.Qtype != dns.TypePTR {
-		return false
-	}
-	return len(LookupNamesByARPA(qc.qNameTrimmed)) > 0
+	shard := getShard(qc.cacheKey)
+	shard.RLock()
+	item, ok := shard.items[qc.cacheKey]
+	shard.RUnlock()
+	return ok && item.routeName == routeLocalTag
 }
 
 func (qc *queryCtx) checkCachedIDNViolation() (bool, string) {
@@ -159,30 +135,25 @@ func (qc *queryCtx) checkCachedIDNViolation() (bool, string) {
 	return false, ""
 }
 
-func (qc *queryCtx) isCachedSynthBlock(resp *dns.Msg, isSynth bool) (isBlock bool, isCustomIP bool, isIDN bool, reason string) {
-	if !isSynth || !cacheSynthFlag || resp == nil || !resp.Authoritative || qc.bypassPolicies || qc.bypassGlobal {
-		return false, false, false, ""
-	}
-	if qc.isLocalIdentityPTR() {
+func (qc *queryCtx) isCachedSynthBlock(resp *dns.Msg, isSynth bool, isLocal bool) (isBlock bool, isCustomIP bool, isIDN bool, reason string) {
+	if !isSynth || isLocal || !cacheSynthFlag || resp == nil || !resp.Authoritative || qc.bypassPolicies || qc.bypassGlobal {
 		return false, false, false, ""
 	}
 
-	if resp.Rcode != dns.RcodeSuccess {
+	effRcode := fullMsgRcode(resp)
+	if effRcode != dns.RcodeSuccess {
 		if idnHit, idnReason := qc.checkCachedIDNViolation(); idnHit {
 			return true, false, true, idnReason
 		}
-		return true, false, false, "Cached Policy (" + RcodeStr(resp.Rcode) + ")"
+		return true, false, false, "Cached Policy (" + RcodeStr(effRcode) + ")"
 	}
 
 	if len(resp.Answer) == 0 {
-		if qc.isLocalIdentityNODATA() {
-			return false, false, false, ""
+		if cfg.Server.FilterAAAA && qc.q.Qtype == dns.TypeAAAA {
+			return true, false, false, "Cached Policy (Filter AAAA)"
 		}
 		if idnHit, idnReason := qc.checkCachedIDNViolation(); idnHit {
 			return true, false, true, idnReason
-		}
-		if cfg.Server.FilterAAAA && qc.q.Qtype == dns.TypeAAAA {
-			return true, false, false, "Cached Policy (Filter AAAA)"
 		}
 		if globalBlockAction == BlockActionIP && ((qc.q.Qtype == dns.TypeA && len(globalBlockIPv4) == 0) || (qc.q.Qtype == dns.TypeAAAA && len(globalBlockIPv6) == 0)) {
 			return true, false, false, "Cached Policy (Custom-IP NODATA)"
@@ -191,11 +162,6 @@ func (qc *queryCtx) isCachedSynthBlock(resp *dns.Msg, isSynth bool) (isBlock boo
 	}
 
 	if globalBlockAction == BlockActionIP {
-		if cacheLocalIdentity && !qc.route.bypassLocal {
-			if addrs, _ := LookupIPsByNameLower(qc.qNameTrimmed); hasLocalFamilyAddr(addrs, qc.q.Qtype) {
-				return false, false, false, ""
-			}
-		}
 		if qc.q.Qtype == dns.TypeA && len(globalBlockIPv4) > 0 && len(resp.Answer) == len(globalBlockIPv4) {
 			allMatch := true
 			for i, rr := range resp.Answer {
@@ -331,13 +297,16 @@ func (qc *queryCtx) serveFromCache() bool {
 		}
 	}
 
+	isLocalEntry := isSynth && qc.isLocalCacheEntry()
 	isSynthBlock := false
 	isCustomBlockIP := false
 	if isNullIP {
 		isSynthBlock = true
 		isLocalNull := false
-		if isSynth && cacheLocalIdentity && !qc.route.bypassLocal {
+		if isLocalEntry && !qc.route.bypassLocal {
 			if addrs, _ := LookupIPsByNameLower(qc.qNameTrimmed); hasLocalUnspecifiedFamilyAddr(addrs, qc.q.Qtype) {
+				isLocalNull = true
+			} else {
 				isLocalNull = true
 			}
 		}
@@ -356,7 +325,7 @@ func (qc *queryCtx) serveFromCache() bool {
 			IncrPolicyBlock()
 			RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, "Cached NULL-IP ("+qc.route.routeName+")")
 		}
-	} else if sb, customIP, idnHit, reason := qc.isCachedSynthBlock(resp, isSynth); sb {
+	} else if sb, customIP, idnHit, reason := qc.isCachedSynthBlock(resp, isSynth, isLocalEntry); sb {
 		isSynthBlock = true
 		isCustomBlockIP = customIP
 		if idnHit {
@@ -367,8 +336,9 @@ func (qc *queryCtx) serveFromCache() bool {
 		RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, reason)
 	}
 
-	IncrReturnCode(resp.Rcode, isNullIP)
-	if resp.Rcode == dns.RcodeNameError {
+	effRcode := fullMsgRcode(resp)
+	IncrReturnCode(effRcode, isNullIP)
+	if effRcode == dns.RcodeNameError {
 		IncrNXDomain(qc.originalQNameTrimmed)
 	}
 
@@ -377,12 +347,12 @@ func (qc *queryCtx) serveFromCache() bool {
 	qc.w.WriteMsg(resp)
 
 	if logQueries {
-		rcodeStr := RcodeStr(resp.Rcode)
+		rcodeStr := RcodeStr(effRcode)
 		if isNullIP {
 			rcodeStr += " (NULL-IP)"
 		} else if isCustomBlockIP {
 			rcodeStr += " (CUSTOM-IP)"
-		} else if isSynthBlock && resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
+		} else if (isSynthBlock || isLocalEntry) && effRcode == dns.RcodeSuccess && len(resp.Answer) == 0 {
 			rcodeStr += " (NODATA)"
 		}
 
@@ -390,7 +360,15 @@ func (qc *queryCtx) serveFromCache() bool {
 			if qc.parentalReason == "ACTIVATING_UNTRIGGER" {
 				qc.scheduleUntriggerExpiry()
 			}
-			logQuerySimple(qc.protoEndpoint, qc.clientIP, qc.originalQName, qc.qtypeStr(), rcodeStr, qc.effectivePolicyLabel(), true)
+			polLabel := qc.effectivePolicyLabel()
+			if isLocalEntry {
+				if isNullIP {
+					polLabel = "Local Identity Block"
+				} else {
+					polLabel = "Local Identity"
+				}
+			}
+			logQuerySimple(qc.protoEndpoint, qc.clientIP, qc.originalQName, qc.qtypeStr(), rcodeStr, polLabel, true)
 			return true
 		}
 

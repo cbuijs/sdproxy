@@ -1,7 +1,7 @@
 /*
 File:    process_upstream.go
-Version: 1.32.0
-Last Updated: 18-Nov-2026 18:05 CET
+Version: 1.33.0
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   Upstream exchange stage for the sdproxy resolution pipeline — the cache-miss
@@ -10,36 +10,23 @@ Description:
   and the final client write.
 
 Changes:
+  1.33.0 - [FIX] Recorded `IncrCacheHit()` when `upstreamUsed == "stale-fallback"`
+           answers the query (matching `Simple Logging` `Cache: HIT`), and used
+           `fullMsgRcode` for `isRcodeOnly` and `IncrReturnCode` telemetry so
+           Extended RCODEs (>=16) are handled consistently.
   1.32.0 - [SECURITY/FIX] Skipped `applyRcodeOnlyWireTTL(finalResp)` when serving
-           an emergency stale fallback (`upstreamUsed == "stale-fallback"`) so
-           `CacheGetExpired` responses strictly retain their bounded 30-second
-           (or `maxSigTTL`) RFC 8767 stale TTL instead of being raised to
-           `min_ttl` or `rcode_min_ttl`.
-  1.31.0 - [FEAT] Applied `applyRcodeOnlyWireTTL` (`cache_rw.go` 1.36.0) on
-           upstream RCODE-only responses (`len(Answer) == 0`) and broadened the
-           `CacheSet` condition so non-`NXDOMAIN` RCODE-only answers are also
-           submitted to `CacheSet` when `rcode_ttl` or `rcode_min_ttl` is set.
-  1.30.0 - [SECURITY/FIX] Aligned `RRSIG` stripping in `serveFromUpstream` with
-           `CacheSet` (`cache_rw.go`) and `serveFromCache` (`process_cachehit.go`
-           1.36.0) so authority `RRSIG` records (`finalResp.Ns`) are stripped
-           whenever `!qc.doBit`, while answer `RRSIG` records are only preserved
-           when `qc.q.Qtype == dns.TypeRRSIG`.
+           an emergency stale fallback (`upstreamUsed == "stale-fallback"`).
+  1.31.0 - [FEAT] Applied `applyRcodeOnlyWireTTL` on upstream RCODE-only responses.
+  1.30.0 - [SECURITY/FIX] Aligned `RRSIG` stripping in `serveFromUpstream`.
   1.29.0 - [FIX] Passed `cacheHit = false` into `enforceForSaleResponseCheck` and
-           `enforceParkedResponseCheck` after upstream resolution.
-  1.28.0 - [FIX] Emitted Simple Logging Mode (`logSimple: true`) audit log lines
-           in `enforceQnameLabelBounds` when `globalBlockAction == BlockActionLog`.
-  1.27.0 - [FIX] Recorded `IncrPolicyBlock()` and `RecordBlockEvent()` and emitted
-           Simple Logging Mode (`logSimple: true`) audit log lines when a
-           `strategy: "secure"` consensus validation failure occurs in
-           `block_action: "LOG"` mode (`isConsensusLog`).
-  1.26.0 - [FEAT] Added `qc.enforceRFCComplianceResponseCheck(finalResp, false)`
-           after upstream resolution.
-  1.25.0 - [SECURITY/FIX] Supported `block_action: "LOG"` on `strategy: "secure"`
-           consensus validation failures (`upstream_race.go` 2.64.0).
-  1.24.0 - [SECURITY/FIX] Detected synthetic consensus blocks (`strings.HasPrefix(addr, "consensus(")`)
-           in `serveFromUpstream`.
-  1.23.0 - [PERF/FIX] Pre-sorted upstream answers before `CacheSet` inside the
-           `sfGroup.Do` closure when `cfg.Cache.AnswerSort == "ip-sort"`.
+           `enforceParkedResponseCheck`.
+  1.28.0 - [FIX] Emitted Simple Logging Mode audit log lines in
+           `enforceQnameLabelBounds` when `globalBlockAction == BlockActionLog`.
+  1.27.0 - [FIX] Recorded `IncrPolicyBlock()` and `RecordBlockEvent()` in
+           `block_action: "LOG"` consensus failure mode.
+  1.26.0 - [FEAT] Added `qc.enforceRFCComplianceResponseCheck(finalResp, false)`.
+  1.25.0 - [SECURITY/FIX] Supported `block_action: "LOG"` on `strategy: "secure"`.
+  1.24.0 - [SECURITY/FIX] Detected synthetic consensus blocks.
 */
 
 package main
@@ -184,7 +171,7 @@ func (qc *queryCtx) serveFromUpstream() {
 				applyAnswerSort(msg, "ip-sort")
 			}
 
-			isRcodeOnly := len(msg.Answer) == 0 || msg.Rcode != dns.RcodeSuccess
+			isRcodeOnly := len(msg.Answer) == 0 || fullMsgRcode(msg) != dns.RcodeSuccess
 			if !isRcodeOnly || cacheUpstreamNeg {
 				CacheSet(qc.cacheKey, msg, qc.route.routeName)
 			}
@@ -245,6 +232,11 @@ func (qc *queryCtx) serveFromUpstream() {
 		return
 	}
 
+	isStaleFallback := upstreamUsed == "stale-fallback"
+	if isStaleFallback {
+		IncrCacheHit()
+	}
+
 	isConsensusLog := false
 	if strings.HasPrefix(upstreamUsed, "consensus-log(") {
 		isConsensusLog = true
@@ -297,13 +289,13 @@ func (qc *queryCtx) serveFromUpstream() {
 	syncQuestionCasing(finalResp, qc.q.Name)
 
 	// ── Passive For-Sale, Parked & RFC Compliance Response Inspection ─────
-	if qc.enforceForSaleResponseCheck(finalResp, false) {
+	if qc.enforceForSaleResponseCheck(finalResp, isStaleFallback) {
 		return
 	}
-	if qc.enforceParkedResponseCheck(finalResp, false) {
+	if qc.enforceParkedResponseCheck(finalResp, isStaleFallback) {
 		return
 	}
-	if qc.enforceRFCComplianceResponseCheck(finalResp, false) {
+	if qc.enforceRFCComplianceResponseCheck(finalResp, isStaleFallback) {
 		return
 	}
 
@@ -323,7 +315,7 @@ func (qc *queryCtx) serveFromUpstream() {
 	// ── Post-response policy ──────────────────────────────────────────────
 	if checkTargetNames(qc.w, qc.r, finalResp, qc.sk, qc.clientGroup, qc.clientMAC, qc.ednsMAC, qc.clientIP, qc.clientAddr, qc.ecsAddr,
 		qc.clientName, qc.clientNameLower, qc.clientID, qc.protocol, qc.protoEndpoint, qc.sni, qc.sniLower, qc.path, qc.pathLower, qc.localPort,
-		qc.bypassPolicies, qc.bypassGlobal, qc.originalQName, false) {
+		qc.bypassPolicies, qc.bypassGlobal, qc.originalQName, isStaleFallback) {
 		return
 	}
 
@@ -331,16 +323,16 @@ func (qc *queryCtx) serveFromUpstream() {
 
 	if filterResponseIPs(qc.w, qc.r, finalResp, qc.sk, qc.clientGroup, qc.clientMAC, qc.ednsMAC, qc.clientIP, qc.clientAddr, qc.ecsAddr,
 		qc.clientName, qc.clientNameLower, qc.clientID, qc.protocol, qc.protoEndpoint, qc.sni, qc.sniLower, qc.path, qc.pathLower, qc.localPort,
-		qc.bypassPolicies, qc.bypassGlobal, qc.originalQName, qc.originalQNameTrimmed, false) {
+		qc.bypassPolicies, qc.bypassGlobal, qc.originalQName, qc.originalQNameTrimmed, isStaleFallback) {
 		return
 	}
 
 	if filterRebinding(qc.w, qc.r, finalResp, qc.clientIP, qc.clientID,
-		qc.protocol, qc.protoEndpoint, qc.originalQName, qc.originalQNameTrimmed, false) {
+		qc.protocol, qc.protoEndpoint, qc.originalQName, qc.originalQNameTrimmed, isStaleFallback) {
 		return
 	}
 
-	if upstreamUsed != "stale-fallback" {
+	if !isStaleFallback {
 		applyRcodeOnlyWireTTL(finalResp)
 	}
 
@@ -368,6 +360,7 @@ func (qc *queryCtx) serveFromUpstream() {
 		RecordBlockEvent(qc.clientIP, qc.originalQNameTrimmed, "Upstream NULL-IP ("+qc.route.routeName+")")
 	}
 
+	effRcode := fullMsgRcode(finalResp)
 	upstreamSize, clientAdvertised := enforceUDPDefenses(qc.r, finalResp, qc.protocol, qc.clientAddr, qc.group)
 
 	// ── Final reply ───────────────────────────────────────────────────────
@@ -376,8 +369,8 @@ func (qc *queryCtx) serveFromUpstream() {
 	}
 	finalResp.Id = qc.originalID
 
-	IncrReturnCode(finalResp.Rcode, isNullIP)
-	if finalResp.Rcode == dns.RcodeNameError {
+	IncrReturnCode(effRcode, isNullIP)
+	if effRcode == dns.RcodeNameError {
 		IncrNXDomain(qc.originalQNameTrimmed)
 	}
 	if upstreamUsed != "" {
@@ -387,7 +380,7 @@ func (qc *queryCtx) serveFromUpstream() {
 	qc.w.WriteMsg(finalResp)
 
 	if logQueries {
-		rcodeStr := RcodeStr(finalResp.Rcode)
+		rcodeStr := RcodeStr(effRcode)
 		if isNullIP {
 			rcodeStr += " (NULL-IP)"
 		}
@@ -396,8 +389,7 @@ func (qc *queryCtx) serveFromUpstream() {
 			if qc.parentalReason == "ACTIVATING_UNTRIGGER" {
 				qc.scheduleUntriggerExpiry()
 			}
-			isHit := upstreamUsed == "stale-fallback"
-			logQuerySimple(qc.protoEndpoint, qc.clientIP, qc.originalQName, qc.qtypeStr(), rcodeStr, qc.effectivePolicyLabel(), isHit)
+			logQuerySimple(qc.protoEndpoint, qc.clientIP, qc.originalQName, qc.qtypeStr(), rcodeStr, qc.effectivePolicyLabel(), isStaleFallback)
 			return
 		}
 
@@ -417,7 +409,7 @@ func (qc *queryCtx) serveFromUpstream() {
 			}
 		}
 
-		if upstreamUsed == "stale-fallback" {
+		if isStaleFallback {
 			status = "INFINITE STALE FALLBACK | " + status
 		}
 

@@ -1,12 +1,13 @@
 /*
 File:    globals.go
-Version: 1.46.0
-Last Updated: 17-Nov-2026 10:19 CET
+Version: 1.47.0
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   All package-level variables and feature-presence flags for sdproxy.
 
 Changes:
+  1.47.0 - [CLEANUP] Removed unused `routeIdxLocal` variable.
   1.46.0 - [FEAT] Added `hasIDNHomograph` feature-presence flag for IDN homograph,
            Punycode/ACE, and confusable brand impersonation protection.
   1.45.0 - [FEAT] Added `hasRFCCompliance` feature-presence flag for RFC compliance
@@ -22,14 +23,9 @@ Changes:
            to enforce a strict security boundary around client-supplied EDNS0 Option
            65001 (`mac:`) and EDNS0 Client Subnet (`ecs:`) assertions.
   1.39.1 - [FIX] Wrapped atomic pointer state in `domainPolicyState` with helper
-           methods so `globals.go`, `init_policy.go`, `policy.go`, and
-           `process_filters.go` never require generic square-bracket syntax.
-  1.39.0 - [FEAT] Added regex support structures (`spoofRegexRecord`, `dpRegexEntry`,
-           `DpRegexEntryGob`) and runtime tables (`globalRRRegexes`, `groupRRRegexes`,
-           `domainPolicyRegexSnap`) for `rrs:` and `domain_policy:`.
-  1.38.0 - [FEAT] Added `ednsMACRoutes`, `ednsMACWildRoutes`, `hasEDNSMACRoutes`,
-           and `hasEDNSMACWildRoutes` to support EDNS0 Option 65001 (`mac:`) exact
-           and glob matching in `routes:`.
+           methods.
+  1.39.0 - [FEAT] Added regex support structures and runtime tables for `rrs:` and
+           `domain_policy:`.
 */
 
 package main
@@ -244,7 +240,6 @@ const (
 
 var (
 	routeIdxByName  map[string]uint16
-	routeIdxLocal   uint16 = 0
 	routeIdxDefault uint16
 )
 
@@ -266,8 +261,6 @@ var (
 
 // isTrustedProxy reports whether addr is an authorized local forwarder permitted
 // to supply client EDNS0 Option 65001 (MAC) and EDNS0 Client Subnet (ECS) assertions.
-// When `server.trusted_proxies` is not explicitly configured, only loopback
-// addresses (127.0.0.0/8, ::1/128) are trusted.
 func isTrustedProxy(addr netip.Addr) bool {
 	if !addr.IsValid() {
 		return false

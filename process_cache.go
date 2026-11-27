@@ -1,44 +1,27 @@
 /*
 File:    process_cache.go
-Version: 1.36.0
-Last Updated: 19-Nov-2026 17:04 CET
+Version: 1.37.0
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   Background cache revalidation and synthetic message builders.
-  Extracted from process.go to separate background worker logic and 
-  message synthesis from the direct execution pipeline.
 
 Changes:
-  1.36.0 - [FIX] Applied `applyRcodeOnlyWireTTL` (`cache_rw.go`) inside
-           `buildSynthCacheMsg` when `action >= 0` so RCODE-only synthetic
-           messages carry identical wire TTLs whether built by `writePolicyAction`
-           or `buildSynthCacheMsg`.
-  1.35.0 - [FEAT] Broadened `isRcodeOnly` check in `backgroundRevalidate` so
-           RCODE-only responses (`len(Answer) == 0 || msg.Rcode != dns.RcodeSuccess`)
-           are submitted to `CacheSet` when `cacheUpstreamNeg` is enabled.
-  1.34.0 - [SECURITY/FIX] Rejected `consensus-log(...)` responses alongside
-           `consensus(...)` in `backgroundRevalidate` so unverified consensus-failed
-           responses in `block_action: "LOG"` mode never overwrite valid cached
-           records during background refreshes.
-  1.33.0 - [SECURITY/FIX] Rejected synthetic consensus failure responses
-           (`strings.HasPrefix(addr, "consensus(")`) in `backgroundRevalidate`
-           so background cache refreshes never overwrite valid cached records
-           with synthetic consensus block payloads.
+  1.37.0 - [FIX] Used `fullMsgRcode(msg)` in `backgroundRevalidate` for
+           `isRcodeOnly` evaluation and diagnostic logging so Extended RCODEs
+           (>=16) are never misclassified as `NOERROR`.
+  1.36.0 - [FIX] Applied `applyRcodeOnlyWireTTL` inside `buildSynthCacheMsg`.
+  1.35.0 - [FEAT] Broadened `isRcodeOnly` check in `backgroundRevalidate`.
+  1.34.0 - [SECURITY/FIX] Rejected `consensus-log(...)` responses in
+           `backgroundRevalidate`.
+  1.33.0 - [SECURITY/FIX] Rejected synthetic `consensus(...)` responses in
+           `backgroundRevalidate`.
   1.32.0 - [CRITICAL/FIX] Marked `backgroundRevalidate` context with
-           `WithBypassUpstreamThrottle` (`throttle.go` 2.7.0) since background
-           revalidation is already bounded by the 32-slot `revalSem` semaphore
-           and must not contend for client-facing `AcquireUpstream` slots.
-  1.31.0 - [FIX] Replaced raw `dns.TypeToString[key.Qtype]` lookup with `qtypeName(key.Qtype)`
-           in `backgroundRevalidate` log output for consistency on unknown QTYPEs.
-  1.30.0 - [SECURITY/FIX] Marked synthesized `EDNS0_SUBNET` in `backgroundRevalidate`
-           with the internal `SourceScope: 255` marker (sanitized to `0` in
-           `prepareForwardQuery`).
-  1.29.0 - [SECURITY/FIX] Updated `buildSynthCacheMsg` to accept `r *dns.Msg` and
-           preserve `r.RecursionDesired` (alongside `Authoritative = true`) on all
-           synthesized cache messages.
-  1.28.0 - [SECURITY/FIX] Preserved `key.Qclass` in `backgroundRevalidate` instead
-           of hardcoding `dns.ClassINET` via `SetQuestion`.
-  1.27.0 - [SECURITY/FIX] Preserved `key.RecursionDesired` in `backgroundRevalidate`.
+           `WithBypassUpstreamThrottle`.
+  1.31.0 - [FIX] Replaced raw `dns.TypeToString` with `qtypeName`.
+  1.30.0 - [SECURITY/FIX] Marked synthesized `EDNS0_SUBNET` with `SourceScope: 255`.
+  1.29.0 - [SECURITY/FIX] Preserved `r.RecursionDesired` in `buildSynthCacheMsg`.
+  1.28.0 - [SECURITY/FIX] Preserved `key.Qclass` in `backgroundRevalidate`.
 */
 
 package main
@@ -54,13 +37,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ---------------------------------------------------------------------------
-// Synthetic Cache Response Builder
-// ---------------------------------------------------------------------------
-
-// buildSynthCacheMsg generates a fully compliant, self-contained DNS response
-// corresponding to a local policy action (e.g., NULL-IP Blocks, NXDOMAIN),
-// preserving the client's RecursionDesired flag.
 func buildSynthCacheMsg(r *dns.Msg, q dns.Question, action int) *dns.Msg {
 	rd := true
 	if r != nil {
@@ -84,7 +60,13 @@ func buildSynthCacheMsg(r *dns.Msg, q dns.Question, action int) *dns.Msg {
 	msg.Question = []dns.Question{q}
 
 	if action >= 0 {
-		msg.Rcode = action
+		msg.Rcode = action & 0x0F
+		if action > 0x0F {
+			opt := &dns.OPT{Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT}}
+			opt.SetUDPSize(1232)
+			opt.SetExtendedRcode(uint16(action))
+			msg.Extra = []dns.RR{opt}
+		}
 		if action == dns.RcodeNameError || action == dns.RcodeSuccess {
 			SetNegativeSOA(msg, q.Name, syntheticTTL)
 			applyRcodeOnlyWireTTL(msg)
@@ -92,10 +74,6 @@ func buildSynthCacheMsg(r *dns.Msg, q dns.Question, action int) *dns.Msg {
 	}
 	return msg
 }
-
-// ---------------------------------------------------------------------------
-// Background Revalidation
-// ---------------------------------------------------------------------------
 
 func TriggerBackgroundRevalidate(key DNSCacheKey, routeName, clientName string, previousHits uint32, revertGate func()) {
 	select {
@@ -160,7 +138,7 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 					Code:          dns.EDNS0SUBNET,
 					Family:        family,
 					SourceNetmask: uint8(prefix.Bits()),
-					SourceScope:   255, // Internal pre-validated marker (reset to 0 in prepareForwardQuery)
+					SourceScope:   255,
 					Address:       bgAddr.AsSlice(),
 				}
 				opt.Option = append(opt.Option, ecsOpt)
@@ -210,7 +188,7 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 		} else if isConsensusFail {
 			status = "CONSENSUS FAILED"
 		} else if msg != nil {
-			status = RcodeStr(msg.Rcode)
+			status = RcodeStr(fullMsgRcode(msg))
 		}
 
 		log.Printf("[CACHE] [BG-REVAL] %s -> %s %s | ROUTE: %s | UPSTREAM: %s | HITS: %d | %s",
@@ -227,7 +205,7 @@ func backgroundRevalidate(key DNSCacheKey, routeName, clientName string, previou
 		applyAnswerSort(msg, "ip-sort")
 	}
 
-	isRcodeOnly := len(msg.Answer) == 0 || msg.Rcode != dns.RcodeSuccess
+	isRcodeOnly := len(msg.Answer) == 0 || fullMsgRcode(msg) != dns.RcodeSuccess
 	if !isRcodeOnly || cacheUpstreamNeg {
 		CacheSet(key, msg, routeName)
 		success = true

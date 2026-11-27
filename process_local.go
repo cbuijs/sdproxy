@@ -1,38 +1,28 @@
 /*
 File:    process_local.go
-Version: 1.17.0
-Last Updated: 18-Nov-2026 16:50 CET
+Version: 1.18.0
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   Intercepts queries for locally known hosts or DHCP leases and "spoofs"
   responses to serve them directly without upstream forwarding.
-  Extracted from process.go to improve modularity.
 
 Changes:
-  1.17.0 - [FIX] Applied `applyRcodeOnlyWireTTL` (`cache_rw.go` 1.42.0) on
-           positive local identity `A`, `AAAA`, and `PTR` responses before
-           `CacheSetSynth` and client transmission so local identity answers
-           also honor `min_ttl` and `max_ttl` bounds when configured.
-  1.16.0 - [FEAT] Applied `applyRcodeOnlyWireTTL` (`cache_rw.go` 1.36.0) on
-           local identity `NODATA` responses before `CacheSetSynth` and client
-           transmission so local `NODATA` SOA wire TTLs match `CacheSetSynth`
-           when `rcode_ttl`, `rcode_min_ttl`, or `rcode_max_ttl` is configured.
-  1.15.0 - [FIX] Added missing `IncrReturnCode(resp.Rcode, false)` calls on
-           local `NODATA` and `PTR` responses so all local identity answers
-           are accurately counted in `Top Return Codes` telemetry.
-  1.14.0 - [SECURITY/FIX] Enforced UDP truncation and EDNS0 normalization via
-           `enforceUDPDefenses` and used `originalQNameTrimmed` in
-           `RecordBlockEvent` when a local hosts entry resolves to a NULL-IP.
-  1.13.0 - [FEAT] Added `protoEndpoint` and Simple Logging Mode (`logSimple` /
-           `logQuerySimple`) support across all local identity resolution branches.
-  1.12.0 - [SECURITY/FIX] Resolved a msgPool leak when `spoofedAlias` is non-empty
-           and a local hostname has no matching address family.
-  1.11.1 - [SECURITY/FIX] Prevented `handleLocalIdentity` from erroneously hijacking 
-           unsupported queries with a `NODATA` response when an active `spoofedAlias`
-           is present.
+  1.18.0 - [FIX] Switched local-identity caching from `CacheSetSynth` to
+           `CacheSetLocal` (`routeLocalTag`) so `LoadCache`, `DumpCache`, and
+           `serveFromCache` cleanly separate local-identity entries from
+           synthetic policy blocks without re-probing `identSnap` on cache hits.
+  1.17.0 - [FIX] Applied `applyRcodeOnlyWireTTL` on positive local identity
+           `A`, `AAAA`, and `PTR` responses before caching and client write.
+  1.16.0 - [FEAT] Applied `applyRcodeOnlyWireTTL` on local identity `NODATA`.
+  1.15.0 - [FIX] Added `IncrReturnCode` calls on local `NODATA` and `PTR`.
+  1.14.0 - [SECURITY/FIX] Enforced `enforceUDPDefenses` and used
+           `originalQNameTrimmed` in `RecordBlockEvent`.
+  1.13.0 - [FEAT] Added `protoEndpoint` and Simple Logging Mode support.
+  1.12.0 - [SECURITY/FIX] Resolved msgPool leak when `spoofedAlias` is non-empty.
+  1.11.1 - [SECURITY/FIX] Prevented `NODATA` hijack on active `spoofedAlias`.
   1.11.0 - [LOGGING/FIX] Included `matchInfo` within `NODATA` responses.
-  1.10.0 - [PERF] Inlined `responseContainsNullIP` evaluation within `handleLocalIdentity`.
-  1.9.0  - [SECURITY/FIX] Eradicated a critical LAN Privacy Leakage vulnerability natively.
+  1.10.0 - [PERF] Inlined `responseContainsNullIP` evaluation.
 */
 
 package main
@@ -45,9 +35,6 @@ import (
 	"github.com/miekg/dns"
 )
 
-// handleLocalIdentity searches local hostfiles and DHCP leases for the requested
-// domain name and securely builds a synthetic DNS response if a match is found.
-// Returns true if the query was successfully handled locally, natively preventing upstream leaks.
 func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qNameTrimmed, clientID, clientIP, protocol, protoEndpoint, routeName, routeOriginType string, bypassLocal bool, cacheKey DNSCacheKey, parentalForcedTTL uint32, originalQName, spoofedAlias string) bool {
 	if bypassLocal {
 		return false
@@ -82,7 +69,7 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 			if len(resp.Answer) > 0 {
 				applyRcodeOnlyWireTTL(resp)
 				if cacheLocalIdentity {
-					CacheSetSynth(cacheKey, resp)
+					CacheSetLocal(cacheKey, resp)
 				}
 				if parentalForcedTTL > 0 {
 					CapResponseTTL(resp, parentalForcedTTL)
@@ -166,7 +153,7 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 			applyRcodeOnlyWireTTL(resp)
 
 			if cacheLocalIdentity {
-				CacheSetSynth(cacheKey, resp)
+				CacheSetLocal(cacheKey, resp)
 			}
 
 			IncrReturnCode(resp.Rcode, false)
@@ -213,7 +200,7 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 
 			applyRcodeOnlyWireTTL(resp)
 			if cacheLocalIdentity {
-				CacheSetSynth(cacheKey, resp)
+				CacheSetLocal(cacheKey, resp)
 			}
 			if parentalForcedTTL > 0 {
 				CapResponseTTL(resp, parentalForcedTTL)
@@ -251,7 +238,7 @@ func handleLocalIdentity(w dns.ResponseWriter, r *dns.Msg, q dns.Question, qName
 			applyRcodeOnlyWireTTL(resp)
 
 			if cacheLocalIdentity {
-				CacheSetSynth(cacheKey, resp)
+				CacheSetLocal(cacheKey, resp)
 			}
 
 			IncrReturnCode(resp.Rcode, false)

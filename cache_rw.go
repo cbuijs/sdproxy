@@ -1,14 +1,25 @@
 /*
 File:    cache_rw.go
-Version: 1.51.0 (Split)
-Last Updated: 24-Nov-2026 12:30 CET
+Version: 1.52.0 (Split)
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   Hot-path Read/Write operations for the sdproxy cache engine.
-  Handles packing/unpacking dns.Msg structures, TTL rewrites, background
-  revalidation tracking, and strict RFC bailiwick security enforcement.
+  Handles packing/unpacking dns.Msg structures, TTL rewrites, EDNS0 metadata
+  preservation, background revalidation tracking, and strict RFC bailiwick
+  security enforcement.
 
 Changes:
+  1.52.0 - [CRITICAL/RFC 6891] Added `sanitizeExtraForCache` so Extended RCODEs
+           (`>= 16`, stored in `OPT.Hdr.Ttl` upper bits), `EDNS0_EDE` (RFC 8914),
+           and `EDNS0_SUBNET` scope (`RFC 7871` when `key.ECS != ""`) survive
+           `CacheSet` / `CacheSetSynth` instead of being wiped by `Extra = nil`.
+         - [FIX] Fixed `syncQuestionCasing` when `out.Question[0].Name == qName`
+           already holds, ensuring `Answer` and `Ns` owner names still sync to
+           the client's query casing on unsigned responses.
+         - [FIX] Added `CacheSetLocal` (`routeLocalTag`) to separate cached
+           local-identity records from synthetic policy records, incremented
+           `item.hits` in `CacheGetExpired`, and guarded `staleNano >= expireNano`.
   1.51.0 - [SECURITY/FIX] Fixed `CacheSet` authority bailiwick validation so
            parent TLD/eTLD and root `"."` `SOA` / `DS` / `NSEC` / `NSEC3` /
            `RRSIG` authority records on `NXDOMAIN` and negative responses are
@@ -25,14 +36,11 @@ Changes:
   1.48.0 - [SECURITY/FIX] Aligned `applyRcodeOnlyWireTTL` with `CacheSet` and
            `CacheSetSynth` on non-`NOERROR` responses with `Answer` records.
   1.47.0 - [FIX] Clamped `targetTTL` by `minAnsTTL` in `applyRcodeOnlyWireTTL`.
-  1.46.0 - [SECURITY/FIX] Clamped `ttl` on `isRcodeOnlyAfterClean` responses in
-           `CacheSet` by the minimum `Answer` record TTL.
-  1.45.0 - [SECURITY/FIX] Extended `applyRcodeOnlyWireTTL` and `CacheSet` to
-           clamp `Answer` wire TTLs on unsigned non-`NOERROR` responses.
+  1.46.0 - [SECURITY/FIX] Clamped `ttl` on `isRcodeOnlyAfterClean` responses.
+  1.45.0 - [SECURITY/FIX] Extended `applyRcodeOnlyWireTTL` and `CacheSet`.
   1.44.0 - [SECURITY/FIX] Prevented `rcodeTTLBounds` and `computeRcodeOnlyTTL`
            from applying `MinTTL` or `NegativeTTL` to non-negative RCODEs.
   1.43.0 - [SECURITY/FIX] Aligned `CacheSet` positive answer wire-TTL clamping.
-  1.42.0 - [SECURITY/FIX] Aligned `applyRcodeOnlyWireTTL` with `CacheSet`.
 */
 
 package main
@@ -44,6 +52,52 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+// sanitizeExtraForCache strips glue/additional RRs from Extra to prevent
+// out-of-bailiwick cache poisoning while retaining a minimal RFC 6891 OPT RR
+// ONLY when needed to preserve Extended RCODEs (>=16), EDNS0_EDE diagnostics,
+// or upstream EDNS0_SUBNET scope.
+func sanitizeExtraForCache(extra []dns.RR, doBit bool, keepECS bool) []dns.RR {
+	for _, rr := range extra {
+		opt, ok := rr.(*dns.OPT)
+		if !ok {
+			continue
+		}
+		extRcode := uint16(opt.ExtendedRcode())
+		var keptOpts []dns.EDNS0
+		for _, o := range opt.Option {
+			switch v := o.(type) {
+			case *dns.EDNS0_EDE:
+				cp := *v
+				keptOpts = append(keptOpts, &cp)
+			case *dns.EDNS0_SUBNET:
+				if keepECS {
+					cp := *v
+					if v.Address != nil {
+						cp.Address = append([]byte(nil), v.Address...)
+					}
+					keptOpts = append(keptOpts, &cp)
+				}
+			}
+		}
+		if extRcode == 0 && len(keptOpts) == 0 {
+			return nil
+		}
+		cleanOpt := &dns.OPT{
+			Hdr:    dns.RR_Header{Name: ".", Rrtype: dns.TypeOPT},
+			Option: keptOpts,
+		}
+		cleanOpt.SetUDPSize(1232)
+		if doBit {
+			cleanOpt.SetDo()
+		}
+		if extRcode > 0 {
+			cleanOpt.SetExtendedRcode(extRcode)
+		}
+		return []dns.RR{cleanOpt}
+	}
+	return nil
+}
 
 // extractAuthorityTTL derives the RFC 2308 negative/RCODE caching TTL from the
 // Authority (`Ns`) section of msg.
@@ -171,10 +225,22 @@ func rewriteAuthorityTTLInPlace(cp dns.RR, targetTTL uint32, rcode int) {
 	}
 }
 
+func fullMsgRcode(msg *dns.Msg) int {
+	if msg == nil {
+		return 0
+	}
+	rc := msg.Rcode
+	if opt := msg.IsEdns0(); opt != nil {
+		rc |= opt.ExtendedRcode()
+	}
+	return rc
+}
+
 func applyRcodeOnlyWireTTL(msg *dns.Msg) {
 	if msg == nil || hasAnyRRSIG(msg) {
 		return
 	}
+	effRcode := fullMsgRcode(msg)
 	minAnsTTL := ^uint32(0)
 	if len(msg.Answer) > 0 {
 		minFloor := uint32(cfg.Cache.MinTTL)
@@ -200,15 +266,15 @@ func applyRcodeOnlyWireTTL(msg *dns.Msg) {
 				minAnsTTL = nt
 			}
 		}
-		if msg.Rcode == dns.RcodeSuccess {
+		if effRcode == dns.RcodeSuccess {
 			return
 		}
 	}
 	if len(msg.Ns) == 0 {
 		return
 	}
-	switch msg.Rcode {
-	case dns.RcodeFormatError, dns.RcodeBadCookie, dns.RcodeBadSig, dns.RcodeBadKey, dns.RcodeBadTime, dns.RcodeBadMode, dns.RcodeBadName, dns.RcodeBadAlg, dns.RcodeBadTrunc:
+	switch effRcode {
+	case dns.RcodeFormatError, dns.RcodeBadVers, dns.RcodeBadCookie, dns.RcodeBadKey, dns.RcodeBadTime, dns.RcodeBadMode, dns.RcodeBadName, dns.RcodeBadAlg, dns.RcodeBadTrunc:
 		return
 	}
 	hasRcodeConfig := cfg.Cache.RcodeTTL > 0 || cfg.Cache.RcodeMinTTL > 0 || cfg.Cache.RcodeMaxTTL > 0
@@ -235,7 +301,7 @@ func applyRcodeOnlyWireTTL(msg *dns.Msg) {
 		authTTL = syntheticTTL
 		hasAuth = true
 	}
-	targetTTL := computeRcodeOnlyTTL(authTTL, hasAuth, msg.Rcode)
+	targetTTL := computeRcodeOnlyTTL(authTTL, hasAuth, effRcode)
 	if minAnsTTL != ^uint32(0) && (targetTTL == 0 || minAnsTTL < targetTTL) {
 		targetTTL = minAnsTTL
 	}
@@ -244,7 +310,7 @@ func applyRcodeOnlyWireTTL(msg *dns.Msg) {
 	}
 	for i, rr := range msg.Ns {
 		cp := dns.Copy(rr)
-		rewriteAuthorityTTLInPlace(cp, targetTTL, msg.Rcode)
+		rewriteAuthorityTTLInPlace(cp, targetTTL, effRcode)
 		msg.Ns[i] = cp
 	}
 }
@@ -470,13 +536,12 @@ func syncQuestionCasing(out *dns.Msg, qName string) {
 	if qName == "" || len(out.Question) == 0 {
 		return
 	}
-	if out.Question[0].Name == qName {
-		return
+	if out.Question[0].Name != qName {
+		qCopy := make([]dns.Question, len(out.Question))
+		copy(qCopy, out.Question)
+		qCopy[0].Name = qName
+		out.Question = qCopy
 	}
-	qCopy := make([]dns.Question, len(out.Question))
-	copy(qCopy, out.Question)
-	qCopy[0].Name = qName
-	out.Question = qCopy
 
 	for _, rr := range out.Answer {
 		if rr.Header().Rrtype == dns.TypeRRSIG {
@@ -495,24 +560,25 @@ func syncQuestionCasing(out *dns.Msg, qName string) {
 	}
 
 	for _, rr := range out.Answer {
-		if strings.EqualFold(rr.Header().Name, qName) {
+		if rr.Header().Name != qName && strings.EqualFold(rr.Header().Name, qName) {
 			rr.Header().Name = qName
 		}
 	}
 	for _, rr := range out.Ns {
-		if strings.EqualFold(rr.Header().Name, qName) {
+		if rr.Header().Name != qName && strings.EqualFold(rr.Header().Name, qName) {
 			rr.Header().Name = qName
 		}
 	}
 	for _, rr := range out.Extra {
-		if rr.Header().Rrtype != dns.TypeOPT && strings.EqualFold(rr.Header().Name, qName) {
+		if rr.Header().Rrtype != dns.TypeOPT && rr.Header().Name != qName && strings.EqualFold(rr.Header().Name, qName) {
 			rr.Header().Name = qName
 		}
 	}
 }
 
-func inspectRRSIGBounds(msg *dns.Msg, nowUnix uint32) (hasRRSIG bool, maxSigTTL uint32, sigExpired bool) {
+func inspectRRSIGBounds(msg *dns.Msg, nowTime time.Time) (hasRRSIG bool, maxSigTTL uint32, sigExpired bool) {
 	maxSigTTL = ^uint32(0)
+	nowUnix := uint32(nowTime.Unix())
 	checkSection := func(rrs []dns.RR) {
 		for _, rr := range rrs {
 			sig, ok := rr.(*dns.RRSIG)
@@ -520,12 +586,7 @@ func inspectRRSIGBounds(msg *dns.Msg, nowUnix uint32) (hasRRSIG bool, maxSigTTL 
 				continue
 			}
 			hasRRSIG = true
-			if !sig.ValidityPeriod(time.Unix(int64(nowUnix), 0)) {
-				sigExpired = true
-				maxSigTTL = 0
-				return
-			}
-			if sig.Expiration <= nowUnix {
+			if !sig.ValidityPeriod(nowTime) || sig.Expiration <= nowUnix {
 				sigExpired = true
 				maxSigTTL = 0
 				return
@@ -602,7 +663,7 @@ func CacheGet(key DNSCacheKey, qName string, out *dns.Msg) (isStale bool, isPref
 		return false, false, false, false
 	}
 
-	hasRRSIG, maxSigTTL, sigExpired := inspectRRSIGBounds(out, uint32(nowTime.Unix()))
+	hasRRSIG, maxSigTTL, sigExpired := inspectRRSIGBounds(out, nowTime)
 	if hasRRSIG {
 		if sigExpired || maxSigTTL == 0 {
 			return false, false, false, false
@@ -657,7 +718,7 @@ func CacheGet(key DNSCacheKey, qName string, out *dns.Msg) (isStale bool, isPref
 
 	currentHits := item.hits.Add(1)
 
-	isSynthetic := item.routeName == ""
+	isSynthetic := isSyntheticRoute(item.routeName)
 	triggerBG := false
 
 	if !isSynthetic {
@@ -688,7 +749,7 @@ func CacheGetExpired(key DNSCacheKey, qName string, out *dns.Msg) bool {
 	shard.RLock()
 	item, found := shard.items[key]
 	shard.RUnlock()
-	if !found || item.routeName == "" {
+	if !found || isSyntheticRoute(item.routeName) {
 		return false
 	}
 
@@ -700,7 +761,7 @@ func CacheGetExpired(key DNSCacheKey, qName string, out *dns.Msg) bool {
 		return false
 	}
 
-	hasRRSIG, maxSigTTL, sigExpired := inspectRRSIGBounds(out, uint32(time.Now().Unix()))
+	hasRRSIG, maxSigTTL, sigExpired := inspectRRSIGBounds(out, time.Now())
 	if hasRRSIG && (sigExpired || maxSigTTL == 0) {
 		return false
 	}
@@ -735,6 +796,7 @@ func CacheGetExpired(key DNSCacheKey, qName string, out *dns.Msg) bool {
 		rotateAnswersInPlace(out, item.rotation.Add(1))
 	}
 
+	item.hits.Add(1)
 	return true
 }
 
@@ -743,15 +805,16 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 		return
 	}
 
-	isRcodeOnly := len(msg.Answer) == 0 || msg.Rcode != dns.RcodeSuccess
+	effRcode := fullMsgRcode(msg)
+	isRcodeOnly := len(msg.Answer) == 0 || effRcode != dns.RcodeSuccess
 	if isRcodeOnly && !cacheUpstreamNeg {
 		return
 	}
 
 	hasExplicitRcodeTTL := cfg.Cache.RcodeTTL > 0 || cfg.Cache.RcodeMinTTL > 0
-	switch msg.Rcode {
+	switch effRcode {
 	case dns.RcodeSuccess, dns.RcodeNameError:
-	case dns.RcodeFormatError, dns.RcodeBadCookie, dns.RcodeBadSig, dns.RcodeBadKey, dns.RcodeBadTime, dns.RcodeBadMode, dns.RcodeBadName, dns.RcodeBadAlg, dns.RcodeBadTrunc:
+	case dns.RcodeFormatError, dns.RcodeBadVers, dns.RcodeBadCookie, dns.RcodeBadKey, dns.RcodeBadTime, dns.RcodeBadMode, dns.RcodeBadName, dns.RcodeBadAlg, dns.RcodeBadTrunc:
 		return
 	default:
 		if !hasExplicitRcodeTTL {
@@ -789,7 +852,7 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 
 	cacheMsg := *msg
 	cacheMsg.Id = 0
-	cacheMsg.Extra = nil
+	cacheMsg.Extra = sanitizeExtraForCache(msg.Extra, key.DoBit, key.ECS != "")
 	if !key.DoBit {
 		if key.Qtype != dns.TypeRRSIG {
 			cacheMsg.Answer = stripRRSIGRecords(cacheMsg.Answer)
@@ -858,14 +921,15 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 		}
 	}
 
-	isRcodeOnlyAfterClean := len(cacheMsg.Answer) == 0 || cacheMsg.Rcode != dns.RcodeSuccess
+	effCleanRcode := fullMsgRcode(&cacheMsg)
+	isRcodeOnlyAfterClean := len(cacheMsg.Answer) == 0 || effCleanRcode != dns.RcodeSuccess
 	if isRcodeOnlyAfterClean && !cacheUpstreamNeg {
 		return
 	}
 
 	nowTime := time.Now()
 	now := nowTime.UnixNano()
-	hasRRSIG, maxSigTTL, sigExpired := inspectRRSIGBounds(&cacheMsg, uint32(nowTime.Unix()))
+	hasRRSIG, maxSigTTL, sigExpired := inspectRRSIGBounds(&cacheMsg, nowTime)
 	if hasRRSIG && (sigExpired || maxSigTTL == 0) {
 		return
 	}
@@ -899,7 +963,7 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 			authTTL = maxSigTTL
 			hasAuth = true
 		}
-		ttl = computeRcodeOnlyTTL(authTTL, hasAuth, cacheMsg.Rcode)
+		ttl = computeRcodeOnlyTTL(authTTL, hasAuth, effCleanRcode)
 		if hasRRSIG && maxSigTTL < ttl {
 			ttl = maxSigTTL
 		}
@@ -950,7 +1014,7 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 		nsCopy := make([]dns.RR, len(cacheMsg.Ns))
 		for i, rr := range cacheMsg.Ns {
 			cp := dns.Copy(rr)
-			rewriteAuthorityTTLInPlace(cp, ttl, cacheMsg.Rcode)
+			rewriteAuthorityTTLInPlace(cp, ttl, effCleanRcode)
 			nsCopy[i] = cp
 		}
 		cacheMsg.Ns = nsCopy
@@ -969,6 +1033,9 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 			}
 		} else {
 			staleNano = expireNano + staleWindow
+		}
+		if staleNano < expireNano {
+			staleNano = expireNano
 		}
 	}
 
@@ -996,16 +1063,25 @@ func CacheSet(key DNSCacheKey, msg *dns.Msg, routeName string) {
 }
 
 func CacheSetSynth(key DNSCacheKey, msg *dns.Msg) {
+	cacheSetSyntheticTagged(key, msg, "")
+}
+
+func CacheSetLocal(key DNSCacheKey, msg *dns.Msg) {
+	cacheSetSyntheticTagged(key, msg, routeLocalTag)
+}
+
+func cacheSetSyntheticTagged(key DNSCacheKey, msg *dns.Msg, routeTag string) {
 	if !cfg.Cache.Enabled || msg == nil || msg.Truncated {
 		return
 	}
 
 	cacheMsg := *msg
 	cacheMsg.Id = 0
-	cacheMsg.Extra = nil
+	cacheMsg.Extra = sanitizeExtraForCache(msg.Extra, key.DoBit, false)
 
+	effRcode := fullMsgRcode(&cacheMsg)
 	ttl := syntheticTTL
-	isRcodeOnly := len(cacheMsg.Answer) == 0 || cacheMsg.Rcode != dns.RcodeSuccess
+	isRcodeOnly := len(cacheMsg.Answer) == 0 || effRcode != dns.RcodeSuccess
 	minRRTTL := ^uint32(0)
 
 	if len(cacheMsg.Answer) > 0 {
@@ -1044,7 +1120,7 @@ func CacheSetSynth(key DNSCacheKey, msg *dns.Msg) {
 			hasAuth = true
 		}
 		if hasRcodeConfig || cfg.Cache.NegativeTTL > 0 || cfg.Cache.MinTTL > 0 || cfg.Cache.MaxTTL > 0 {
-			if rTTL := computeRcodeOnlyTTL(authTTL, hasAuth, cacheMsg.Rcode); rTTL > 0 {
+			if rTTL := computeRcodeOnlyTTL(authTTL, hasAuth, effRcode); rTTL > 0 {
 				ttl = rTTL
 			}
 		} else if authTTL > 0 {
@@ -1057,7 +1133,7 @@ func CacheSetSynth(key DNSCacheKey, msg *dns.Msg) {
 			nsCopy := make([]dns.RR, len(cacheMsg.Ns))
 			for i, rr := range cacheMsg.Ns {
 				cp := dns.Copy(rr)
-				rewriteAuthorityTTLInPlace(cp, ttl, cacheMsg.Rcode)
+				rewriteAuthorityTTLInPlace(cp, ttl, effRcode)
 				nsCopy[i] = cp
 			}
 			cacheMsg.Ns = nsCopy
@@ -1088,7 +1164,7 @@ func CacheSetSynth(key DNSCacheKey, msg *dns.Msg) {
 		expireNano:   expireNano,
 		staleNano:    expireNano,
 		cachedAtNano: now,
-		routeName:    "",
+		routeName:    routeTag,
 	}
 	ci.packed.Store(&stored)
 	storeItem(key, ci)

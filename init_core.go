@@ -1,18 +1,18 @@
 /*
 File:    init_core.go
-Version: 1.122.0
-Last Updated: 24-Nov-2026 12:46 CET
+Version: 1.123.0
+Last Updated: 27-Nov-2026 13:30 CET
 
 Description:
   High-level initialization orchestrator and general IO helpers for sdproxy.
   Dispatches specific tasks to init_routing, init_policy, and init_upstreams.
 
 Changes:
+  1.123.0 - [CLEANUP] Removed dead `"local": 0` reservation from `initRouteIndex`
+            since local-identity cache items are distinguished by `routeLocalTag`.
   1.122.0 - [FIX] Filtered DDR listener port discovery (`pickDDRPort`) through
-            `filterListeners` so listeners skipped by `support_ip_version` are
-            not advertised in DDR SVCB records, preferred non-loopback listener
-            ports over loopback ports when multiple addresses are configured,
-            and canonicalized `ddrIPv4` / `ddrIPv6` slices.
+            `filterListeners`, preferred non-loopback listener ports, and
+            canonicalized `ddrIPv4` / `ddrIPv6` slices.
   1.121.0 - [PERF] Pre-initialized static `net.IP` block-IP templates
             (`globalBlockIPv4` and `globalBlockIPv6`) in `initBlockAction`.
   1.120.0 - [FEAT] Added `initProximityAddrs` to populate `proximityRefV4` and
@@ -25,8 +25,6 @@ Changes:
   1.115.0 - [FEAT/FIX] Registered `ecsIPRoutes` and `ecsCIDRRoutes` in
             `initRouteIndex`.
   1.114.0 - [SECURITY/FIX] Fixed Cache Persistence route index consistency.
-  1.113.0 - [SECURITY/FIX] Registered `portRoutes` and `compoundRouteMappings`
-            in `initRouteIndex`.
 */
 
 package main
@@ -130,7 +128,6 @@ func initDGA() {
 
 func initRouteIndex() {
 	routeIdxByName = make(map[string]uint16, len(cfg.Upstreams)+4)
-	routeIdxByName["local"] = routeIdxLocal
 	nextIdx := uint16(1)
 
 	var names []string
